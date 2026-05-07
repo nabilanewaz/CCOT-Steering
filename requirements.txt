@@ -4,3 +4,4 @@ transformers
 peft
 pyyaml
 llmlingua
+scikit-learn

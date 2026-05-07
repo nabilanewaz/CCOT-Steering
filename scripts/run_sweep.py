@@ -1,6 +1,6 @@
-"""Phase 1 sweep: offline compression → CoT training → CCoT training → evaluation.
+"""Phase 1 + Phase 2 sweep: compression cache → training → evaluation → vector extraction.
 
-Phase 2 (vector extraction) and α-tuning stubs remain for Phase 2 implementation.
+α-tuning stubs remain for Phase 3 implementation.
 """
 import os
 import torch
@@ -9,6 +9,7 @@ from scripts.build_splits import build_all_splits
 from phase1.compress import build_ccot_cache, load_cache
 from phase1.train import train_cot, train_ccot
 from phase1.evaluate import run_phase1_evaluation, print_comparison_table
+from phase2.run import run_phase2_all_sources
 
 CONFIGS    = ['S1', 'S2', 'S3', 'S4']
 MODEL_TAGS = ['llama32_3b', 'phi2', 'qwen25_3b', 'qwen25_math1.5b']
@@ -22,12 +23,7 @@ MODEL_ID_MAP = {
 }
 
 
-# ── Phase 2 / α-tuning stubs (filled in Phase 2 implementation) ──────────────
-
-def run_phase2(model_tag, D_steer, vectors_dir):
-    os.makedirs(vectors_dir, exist_ok=True)
-    print(f"[PH2] (stub) extract vectors for {model_tag} "
-          f"from {len(D_steer)} examples -> {vectors_dir}")
+# ── α-tuning / steered evaluation stubs (filled in Phase 3) ──────────────────
 
 
 def run_alpha_tuning(model_tag, D_val, vectors_dir):
@@ -109,7 +105,15 @@ def main():
 
             # ── Phase 2: truth vector extraction ─────────────────────────────
             vectors_dir = f"vectors/{cfg_id}/{model_tag}"
-            run_phase2(model_tag, D_steer, vectors_dir)
+            run_phase2_all_sources(
+                model_tag=model_tag,
+                base_model_id=base_model_id,
+                checkpoints_dir=ckpt_dir,
+                D_steer=D_steer,
+                device=device,
+                vectors_dir=vectors_dir,
+                results_dir=results_dir,
+            )
 
             # ── α-tuning + steered evaluation ────────────────────────────────
             alpha_star = run_alpha_tuning(model_tag, D_val, vectors_dir)
