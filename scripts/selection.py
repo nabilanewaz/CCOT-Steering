@@ -16,6 +16,12 @@ def load_json(path: str) -> dict:
         return json.load(f)
 
 
+def _n_items(value) -> int:
+    if isinstance(value, int):
+        return value
+    return len(value)
+
+
 def compute_config_score(results_dir: str, model_tags: list,
                           cfg_id: str) -> dict:
     scores = {}
@@ -80,9 +86,9 @@ def select_best_config(splits: dict, results_dir: str, model_tags: list) -> tupl
         record = {
             'winning_config':   winner,
             'seed':             42,
-            'n_train':          len(splits[winner]['D_train']),
-            'n_steer':          len(splits[winner]['D_steer']),
-            'n_val':            len(splits[winner]['D_val']),
+            'n_train':          _n_items(splits[winner]['D_train']),
+            'n_steer':          _n_items(splits[winner]['D_steer']),
+            'n_val':            _n_items(splits[winner]['D_val']),
             'n_test':           1319,
             'selection_metric': 'mean_wilson_lower_steered_val_accuracy',
             'selection_value':  round(scores[winner]['mean_lower'], 4),
@@ -110,10 +116,10 @@ if __name__ == '__main__':
     else:
         # minimal placeholder: fill counts with expected values
         splits = {
-            'S1': {'D_train': [None]*5231, 'D_steer': [None]*747, 'D_val': [None]*1495},
-            'S2': {'D_train': [None]*4484, 'D_steer': [None]*1495, 'D_val': [None]*1495},
-            'S3': {'D_train': [None]*4484, 'D_steer': [None]*747, 'D_val': [None]*2242},
-            'S4': {'D_train': [None]*3737, 'D_steer': [None]*1495, 'D_val': [None]*2242},
+            'S1': {'D_train': 5231, 'D_steer': 747, 'D_val': 1495},
+            'S2': {'D_train': 4484, 'D_steer': 1495, 'D_val': 1495},
+            'S3': {'D_train': 4484, 'D_steer': 747, 'D_val': 2242},
+            'S4': {'D_train': 3737, 'D_steer': 1495, 'D_val': 2242},
         }
 
     MODEL_TAGS = ['llama32_3b', 'phi2', 'qwen25_3b', 'qwen25_math1.5b']
