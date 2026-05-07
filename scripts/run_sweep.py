@@ -1,6 +1,5 @@
-"""Phase 1 + Phase 2 sweep: compression cache → training → evaluation → vector extraction.
-
-α-tuning stubs remain for Phase 3 implementation.
+"""Phase 1 + Phase 2 + Phase 3 sweep:
+compression cache → training → evaluation → vector extraction → steered eval.
 """
 import os
 import torch
@@ -10,6 +9,8 @@ from phase1.compress import build_ccot_cache, load_cache
 from phase1.train import train_cot, train_ccot
 from phase1.evaluate import run_phase1_evaluation, print_comparison_table
 from phase2.run import run_phase2_all_sources
+from phase3.evaluate import run_phase3_evaluation
+from phase3.select import select_best_steered_config
 
 CONFIGS    = ['S1', 'S2', 'S3', 'S4']
 MODEL_TAGS = ['llama32_3b', 'phi2', 'qwen25_3b', 'qwen25_math1.5b']
@@ -21,21 +22,6 @@ MODEL_ID_MAP = {
     'qwen25_3b':       'Qwen/Qwen2.5-3B',
     'qwen25_math1.5b': 'Qwen/Qwen2.5-Math-1.5B',
 }
-
-
-# ── α-tuning / steered evaluation stubs (filled in Phase 3) ──────────────────
-
-
-def run_alpha_tuning(model_tag, D_val, vectors_dir):
-    print(f"[ALPHA] (stub) tune alpha for {model_tag} "
-          f"on {len(D_val)} examples using {vectors_dir}")
-    return 0.1
-
-
-def run_steered_evaluation(model_tag, D_val, alpha_star, results_dir):
-    os.makedirs(results_dir, exist_ok=True)
-    print(f"[STEER] (stub) steered eval {model_tag} "
-          f"alpha={alpha_star} -> {results_dir}")
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -115,9 +101,17 @@ def main():
                 results_dir=results_dir,
             )
 
-            # ── α-tuning + steered evaluation ────────────────────────────────
-            alpha_star = run_alpha_tuning(model_tag, D_val, vectors_dir)
-            run_steered_evaluation(model_tag, D_val, alpha_star, results_dir)
+            # ── Phase 3: steered evaluation ───────────────────────────────────
+            run_phase3_evaluation(
+                model_tag=model_tag,
+                base_model_id=base_model_id,
+                checkpoints_dir=ckpt_dir,
+                D_val=D_val,
+                vectors_dir=vectors_dir,
+                results_dir=results_dir,
+                device=device,
+            )
+            select_best_steered_config(results_dir, model_tag)
 
 
 if __name__ == '__main__':

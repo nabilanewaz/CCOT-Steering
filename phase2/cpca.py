@@ -227,17 +227,28 @@ def save_subspace(
     r_final: int,
     beta: float,
     vectors_dir: str,
+    layer_scores: dict = None,
 ) -> str:
     os.makedirs(vectors_dir, exist_ok=True)
     path = os.path.join(vectors_dir, f"{source}_cpca_r{r_final}.pt")
+
+    # Sort selected_layers by probe score (desc) so [0] = top probe-score layer
+    if layer_scores:
+        sel = sorted(selected_layers,
+                     key=lambda L: layer_scores.get(L, 0.0), reverse=True)
+    else:
+        sel = selected_layers
+
     torch.save({
         'U_truth':         U_truth,
         'method':          'threshold_cpca_weighted_merge',
-        'selected_layers': selected_layers,
+        'selected_layers': sel,
         'r_final':         r_final,
         'beta':            beta,
         'model_tag':       model_tag,
         'source':          source,
+        'layer_scores':    {str(L): layer_scores.get(L, 0.0)
+                            for L in sel} if layer_scores else {},
     }, path)
     print(f"Saved subspace → {path}  shape={tuple(U_truth.shape)}")
     return path
