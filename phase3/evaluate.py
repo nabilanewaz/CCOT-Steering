@@ -23,6 +23,7 @@ from phase1.inference import (
     run_no_cot,
     run_trimmed_cot,
 )
+from phase2.loaders import find_boundary_idx_base, find_boundary_idx_ccot
 from phase3.alpha import tune_alpha
 from phase3.hooks import (
     get_injection_layer,
@@ -104,16 +105,33 @@ def _eval_one(
     model, tokenizer, item: dict, prompt: str,
     layer_star: Optional[int], hook_factory,
     device: str, max_new_tokens: int,
+    boundary_fn=None,   # find_boundary_idx_ccot | find_boundary_idx_base | None
 ) -> tuple[bool, bool, int, float]:
     """
     Run one example (optionally with a hook).
+    When hook_factory is given and boundary_fn is provided, probe-generates first
+    to find the reasoning/answer boundary (spec §3.8), then steers the real pass.
     Returns (correct, answer_found, n_tok, latency_sec).
     """
     gold = item['answer'].split('####')[1].strip()
     t0   = time.time()
 
     if hook_factory is not None:
-        b_idx   = _boundary_from_prompt(tokenizer, prompt)
+        if boundary_fn is not None:
+            # Spec §3.8: probe-generate (no_grad) to locate the semantic boundary
+            enc = tokenizer(prompt, return_tensors='pt').to(device)
+            with torch.no_grad():
+                probe_ids = model.generate(
+                    **enc, do_sample=False, max_new_tokens=128,
+                    pad_token_id=tokenizer.eos_token_id,
+                )
+            try:
+                b_idx = boundary_fn(probe_ids, tokenizer)
+            except (ValueError, Exception):
+                b_idx = max(0, enc['input_ids'].shape[1] - 1)
+        else:
+            b_idx = _boundary_from_prompt(tokenizer, prompt)
+
         hook_fn = hook_factory(b_idx)
         text    = run_with_hook(model, tokenizer, prompt, layer_star,
                                 hook_fn, device, max_new_tokens)
@@ -209,7 +227,8 @@ def _tune_and_save_alpha(
         model.eval()
 
         alpha_star = tune_alpha(
-            model, tok, D_val, v_dom, L_star, device, ratio=best_ratio_flt
+            model, tok, D_val, v_dom, L_star, device,
+            model_tag=model_tag, ratio=best_ratio_flt,
         )
         torch.save(alpha_star, out_path)
         print(f"  alpha_star={alpha_star.item():.4f}  -> {out_path}")
@@ -389,6 +408,7 @@ def run_phase3_evaluation(
                 ok, fd, nt, lt = _eval_one(
                     ccot_model, tok_ccot, item, ccot_prompt_fn(item),
                     L_star, noise_fac, device, max_new_tokens,
+                    boundary_fn=find_boundary_idx_ccot,
                 )
                 c_list.append(ok); f_list.append(fd)
                 tok_list.append(nt); lat_list.append(lt)
@@ -407,6 +427,7 @@ def run_phase3_evaluation(
                 ok, fd, nt, lt = _eval_one(
                     ccot_model, tok_ccot, item, ccot_prompt_fn(item),
                     L_star, dom_fac, device, max_new_tokens,
+                    boundary_fn=find_boundary_idx_ccot,
                 )
                 c_list.append(ok); f_list.append(fd)
                 tok_list.append(nt); lat_list.append(lt)
@@ -426,6 +447,7 @@ def run_phase3_evaluation(
                     ok, fd, nt, lt = _eval_one(
                         ccot_model, tok_ccot, item, ccot_prompt_fn(item),
                         L_star, cpca_fac, device, max_new_tokens,
+                        boundary_fn=find_boundary_idx_ccot,
                     )
                     c_list.append(ok); f_list.append(fd)
                     tok_list.append(nt); lat_list.append(lt)
@@ -459,6 +481,7 @@ def run_phase3_evaluation(
                 ok, fd, nt, lt = _eval_one(
                     cot_model, tok_cot, item, cot_prompt_fn(item),
                     L_star_base, trim_dom_fac, device, budgets[i],
+                    boundary_fn=find_boundary_idx_base,
                 )
                 c_list.append(ok); f_list.append(fd)
                 tok_list.append(nt); lat_list.append(lt)
@@ -554,6 +577,7 @@ def _run_diagnostic_sweep(
             ok, _, _, _ = _eval_one(
                 model, tok, item, prompt_fn(item),
                 L_star if fac else None, fac, device, 256,
+                boundary_fn=find_boundary_idx_ccot if fac else None,
             )
             c_list.append(ok)
         acc    = sum(c_list) / len(c_list)

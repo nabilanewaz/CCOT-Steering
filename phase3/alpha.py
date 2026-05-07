@@ -4,7 +4,13 @@ import math
 import torch
 import torch.nn as nn
 
-from phase2.loaders import get_transformer_layers
+from phase2.loaders import get_transformer_layers, find_boundary_idx_ccot
+
+# λ_m per backbone (spec §3.4.2): RMSNorm models need stronger magnitude penalty
+_LAMBDA_M = {
+    'phi2': 0.005,         # LayerNorm — more tolerant of large perturbations
+}
+_LAMBDA_M_DEFAULT = 0.01   # Llama, Qwen (RMSNorm)
 
 
 class LearnableAlpha(nn.Module):
@@ -32,9 +38,10 @@ def tune_alpha(
     v_truth: torch.Tensor,      # [d] unit-normalised DoM vector
     layer_star: int,
     device: str,
+    model_tag: str = '',
     ratio: float = 0.7,
     lambda_a: float = 0.1,
-    lambda_m: float = 0.01,
+    lambda_m: float = None,     # None → per-backbone default from _LAMBDA_M
     max_epochs: int = 5,
     es_patience: int = 3,
     lr: float = 5e-2,
@@ -49,6 +56,9 @@ def tune_alpha(
 
     Returns the learned alpha* as a detached scalar tensor.
     """
+    if lambda_m is None:
+        lambda_m = _LAMBDA_M.get(model_tag, _LAMBDA_M_DEFAULT)
+
     for p in model.parameters():
         p.requires_grad = False
     model.eval()
@@ -90,14 +100,18 @@ def tune_alpha(
         q_prompt = (f"Question: {item['question']}\n\n[compress:{ratio}]\n")
         ans_text  = item['answer'].split('####')[1].strip()
 
-        # Probe-generate with current alpha to get steered reasoning
+        # Probe-generate (hook active → steered reasoning) to find boundary
         q_enc = tokenizer(q_prompt, return_tensors='pt').to(device)
-        cache['boundary_idx'] = max(0, q_enc['input_ids'].shape[1] - 1)
         with torch.no_grad():
             gen_ids = model.generate(
                 **q_enc, do_sample=False, max_new_tokens=128,
                 pad_token_id=tokenizer.eos_token_id,
             )
+        # Find boundary in the generated sequence (reasoning/answer separator)
+        try:
+            cache['boundary_idx'] = find_boundary_idx_ccot(gen_ids, tokenizer)
+        except (ValueError, Exception):
+            cache['boundary_idx'] = max(0, q_enc['input_ids'].shape[1] - 1)
 
         # Teacher-forced: [steered reasoning | gold answer]
         a_ids    = tokenizer(ans_text, return_tensors='pt',
