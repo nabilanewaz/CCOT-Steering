@@ -83,6 +83,15 @@ def select_best_config(splits: dict, results_dir: str, model_tags: list) -> tupl
         yaml = None
 
     if yaml is not None:
+        existing = {}
+        selected_path = 'configs/selected.yaml'
+        if os.path.exists(selected_path):
+            try:
+                with open(selected_path) as f:
+                    existing = yaml.safe_load(f) or {}
+            except Exception:
+                existing = {}
+
         record = {
             'winning_config':   winner,
             'seed':             42,
@@ -95,9 +104,11 @@ def select_best_config(splits: dict, results_dir: str, model_tags: list) -> tupl
             'flip_rate':        round(scores[winner]['mean_flip'],  4),
             'probe_accuracy':   round(scores[winner]['mean_probe'], 4),
         }
+        if existing.get('phase3_best'):
+            record['phase3_best'] = existing['phase3_best']
         os.makedirs('configs', exist_ok=True)
-        with open('configs/selected.yaml', 'w') as f:
-            yaml.dump(record, f)
+        with open(selected_path, 'w') as f:
+            yaml.safe_dump(record, f, sort_keys=False)
         print('Winner locked -> configs/selected.yaml')
 
     return winner, scores
