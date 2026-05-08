@@ -1,8 +1,15 @@
-"""Phase 1 + Phase 2 + Phase 3 sweep:
-compression cache → training → evaluation → vector extraction → steered eval.
+"""Phase 1 + Phase 2 + Phase 3 sweep, then Phase 4 final evaluation.
+
+Flow:
+  Phases 1–3: run for each split config (S1–S4) × each backbone.
+  Selection:  scripts/selection.py picks the winning split by mean Wilson CI.
+  Phase 4:    evaluate_final.py runs once on D_test with locked configs.
 """
 import os
+import subprocess
+import sys
 import torch
+import yaml
 
 from scripts.build_splits import build_all_splits
 from phase1.compress import build_ccot_cache, load_cache
@@ -22,6 +29,24 @@ MODEL_ID_MAP = {
     'qwen25_3b':       'Qwen/Qwen2.5-3B',
     'qwen25_math1.5b': 'Qwen/Qwen2.5-Math-1.5B',
 }
+
+
+def _update_selected_phase3_best(model_tag: str, selection: dict) -> None:
+    """Append the locked Phase 3 choice for one backbone into configs/selected.yaml."""
+    selected_path = 'configs/selected.yaml'
+    if os.path.exists(selected_path):
+        with open(selected_path) as f:
+            cfg = yaml.safe_load(f) or {}
+    else:
+        cfg = {}
+
+    phase3_best = dict(cfg.get('phase3_best') or {})
+    phase3_best[model_tag] = selection
+    cfg['phase3_best'] = phase3_best
+
+    os.makedirs('configs', exist_ok=True)
+    with open(selected_path, 'w') as f:
+        yaml.safe_dump(cfg, f, sort_keys=False)
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -111,8 +136,38 @@ def main():
                 results_dir=results_dir,
                 device=device,
             )
-            select_best_steered_config(results_dir, model_tag)
+            selection = select_best_steered_config(results_dir, model_tag)
+            if selection:
+                _update_selected_phase3_best(model_tag, selection)
+
+
+def run_phase4():
+    """
+    Select the winning split config and run the single-pass D_test evaluation.
+    Phase 4 is invoked as a subprocess so that the load_test_set() guard
+    in utils/data.py sees 'evaluate_final.py' as the permitted caller.
+    """
+    from scripts.selection import select_best_config
+    from scripts.build_splits import build_all_splits
+
+    splits = build_all_splits('gsm8k/train.jsonl', seed=42)
+    winner, _ = select_best_config(splits, 'results', MODEL_TAGS)
+
+    if not os.path.exists('configs/selected.yaml'):
+        print("[PH4] configs/selected.yaml missing — selection step failed, skipping Phase 4.")
+        return
+
+    print(f"\n[PH4] Launching evaluate_final.py (winning config = {winner})...")
+    result = subprocess.run(
+        [sys.executable, 'evaluate_final.py'],
+        check=False,
+    )
+    if result.returncode != 0:
+        print(f"[PH4] evaluate_final.py exited with code {result.returncode}")
+    else:
+        print("[PH4] Final evaluation complete.")
 
 
 if __name__ == '__main__':
     main()
+    run_phase4()
