@@ -116,7 +116,7 @@ def run_phase2_source(
 
     save_dom_vector(v_truth, model_tag, source_tag, vectors_dir)
     save_subspace(U_truth, selected_layers, model_tag, source_tag,
-                  r_final, beta, vectors_dir)
+                  r_final, beta, vectors_dir, layer_scores=layer_scores)
 
     return {
         'v_truth':         v_truth,
@@ -228,11 +228,33 @@ def run_phase2_all_sources(
         torch.cuda.empty_cache()
 
     # ── Save metadata ─────────────────────────────────────────────────────────
+    def _pick_layer_star(result: dict) -> int:
+        ls  = result.get('layer_scores', {})
+        sel = result.get('selected_layers', [])
+        candidates = [L for L in sel if L in ls]
+        pool = candidates if candidates else list(ls.keys())
+        return max(pool, key=ls.get) if pool else 0
+
+    ccot_res  = results.get('ccot', {})
+    base_res  = results.get('base', {})
+    ccot_ls   = ccot_res.get('layer_scores', {})
+    base_ls   = base_res.get('layer_scores', {})
+    ccot_r    = ccot_res.get('selected_layers', [])
+
     meta = {
-        'model_tag':          model_tag,
-        'best_ccot_ratio':    ratio_int,
-        'ccot_winner_method': results.get('ccot', {}).get('winner'),
-        'base_winner_method': results.get('base', {}).get('winner'),
+        'model_tag':            model_tag,
+        'best_ccot_ratio':      ratio_int,
+        'ccot_winner_method':   ccot_res.get('winner'),
+        'base_winner_method':   base_res.get('winner'),
+        'ccot_layer_star':      _pick_layer_star(ccot_res),
+        'base_layer_star':      _pick_layer_star(base_res),
+        'ccot_selected_layers': ccot_r,
+        'base_selected_layers': base_res.get('selected_layers', []),
+        'ccot_layer_scores':    {str(L): s for L, s in ccot_ls.items()},
+        'base_layer_scores':    {str(L): s for L, s in base_ls.items()},
+        'ccot_max_probe_score': max(ccot_ls.values()) if ccot_ls else 0.0,
+        'base_max_probe_score': max(base_ls.values()) if base_ls else 0.0,
+        'ccot_r_final':         cfg.get('r_final', 10),
     }
     os.makedirs(vectors_dir, exist_ok=True)
     meta_path = os.path.join(vectors_dir, 'phase2_meta.json')
