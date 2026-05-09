@@ -191,11 +191,17 @@ def _tune_and_save_alpha(
     vectors_dir: str,
     device: str,
     meta: dict,
+    results_dir: str = None,
 ) -> None:
-    """Tune alpha for each source (if not already cached) and save to disk."""
+    """
+    For each source:
+      1. Run λ sweep on a 200-example D_val subset to select (λ_a, λ_m).
+      2. Run full gradient-based α* tuning with the selected lambdas.
+      3. Save alpha_star, training history JSON, and loss-curve PNG.
+    Results are cached per source — rerun is skipped if alpha_star file exists.
+    """
     best_ratio_int = meta['best_ccot_ratio']
     best_ratio_flt = best_ratio_int / 10.0
-    r_final        = meta.get('ccot_r_final', 10)
 
     source_ckpt = {
         'ccot': os.path.join(checkpoints_dir, f'ccot_R{best_ratio_int}'),
@@ -226,12 +232,66 @@ def _tune_and_save_alpha(
             p.requires_grad = False
         model.eval()
 
-        alpha_star = tune_alpha(
+        # ── Step 1: λ sweep on 200-example subset ────────────────────────────
+        sweep_path = os.path.join(vectors_dir, f'{source}_lambda_sweep.json')
+        if os.path.exists(sweep_path):
+            with open(sweep_path) as fp:
+                sweep_sel = json.load(fp)['selected']
+            lambda_a = sweep_sel['lambda_a']
+            lambda_m = sweep_sel['lambda_m']
+            print(f"[PH3] λ sweep cached: λ_a={lambda_a}  λ_m={lambda_m}")
+        else:
+            from phase3.lambda_sweep import sweep_lambda_grid
+            D_sub    = D_val[:min(200, len(D_val))]
+            sweep_sel = sweep_lambda_grid(
+                model, tok, D_sub, v_dom, L_star, device, model_tag,
+                ratio=best_ratio_flt,
+                out_path=sweep_path,
+                max_epochs=2,
+            )
+            lambda_a = sweep_sel['lambda_a']
+            lambda_m = sweep_sel['lambda_m']
+            # Plot heatmap if results_dir provided
+            if results_dir:
+                try:
+                    from phase3.plots import plot_lambda_sweep_heatmap
+                    with open(sweep_path) as fp:
+                        sweep_data = json.load(fp)
+                    plot_lambda_sweep_heatmap(
+                        sweep_data,
+                        os.path.join(results_dir, f'{source}_lambda_heatmap.png'),
+                    )
+                except Exception as e:
+                    print(f"  [plot] {e}")
+
+        # ── Step 2: Full α* tuning with selected lambdas ──────────────────────
+        alpha_star, history = tune_alpha(
             model, tok, D_val, v_dom, L_star, device,
             model_tag=model_tag, ratio=best_ratio_flt,
+            lambda_a=lambda_a, lambda_m=lambda_m,
         )
         torch.save(alpha_star, out_path)
         print(f"  alpha_star={alpha_star.item():.4f}  -> {out_path}")
+
+        # ── Step 3: Persist history and plots ─────────────────────────────────
+        if results_dir:
+            hist_path = os.path.join(results_dir, f'{source}_alpha_history.json')
+            with open(hist_path, 'w') as fp:
+                json.dump({
+                    'model_tag': model_tag,
+                    'source':    source,
+                    'lambda_a':  lambda_a,
+                    'lambda_m':  lambda_m,
+                    'history':   history,
+                }, fp, indent=2)
+            try:
+                from phase3.plots import plot_loss_curves
+                plot_loss_curves(
+                    history,
+                    os.path.join(results_dir, f'{source}_loss_curves.png'),
+                )
+            except Exception as e:
+                print(f"  [plot] {e}")
 
         del model
         if torch.cuda.is_available():
@@ -260,7 +320,7 @@ def run_phase3_evaluation(
 
     # ── Pre-compute alpha per source ──────────────────────────────────────────
     _tune_and_save_alpha(model_tag, checkpoints_dir, D_val,
-                         vectors_dir, device, meta)
+                         vectors_dir, device, meta, results_dir=results_dir)
     alphas = {s: _load_alpha(vectors_dir, s) for s in SOURCES}
     print(f"\n[PH3] Alpha stars: {alphas}")
 
@@ -589,11 +649,21 @@ def _run_diagnostic_sweep(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    payload = {'model_tag': model_tag, 'source': source,
+               'alpha_star': alpha_star, 'sweep': sweep}
     out = os.path.join(results_dir, 'alpha_diagnostic.json')
     with open(out, 'w') as f:
-        json.dump({'model_tag': model_tag, 'source': source,
-                   'alpha_star': alpha_star, 'sweep': sweep}, f, indent=2)
+        json.dump(payload, f, indent=2)
     print(f"  Sweep -> {out}")
+
+    try:
+        from phase3.plots import plot_alpha_diagnostic
+        plot_alpha_diagnostic(
+            payload,
+            os.path.join(results_dir, 'alpha_diagnostic.png'),
+        )
+    except Exception as e:
+        print(f"  [plot] {e}")
 
 
 # ── Printing ───────────────────────────────────────────────────────────────────
