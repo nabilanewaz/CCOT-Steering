@@ -1,0 +1,53 @@
+# ── Data ──────────────────────────────────────────────────────────────────
+seed: 42
+train_pool: gsm8k/train.jsonl
+test_path:  gsm8k/test.jsonl   # never opened outside evaluate_final.py
+
+split_configs:
+  S1: [0.70, 0.10, 0.20]
+  S2: [0.60, 0.20, 0.20]
+  S3: [0.60, 0.10, 0.30]
+  S4: [0.50, 0.20, 0.30]
+
+# ── Models ────────────────────────────────────────────────────────────────
+model_tags:
+  llama32_3b:      meta-llama/Llama-3.2-3B
+  phi2:            microsoft/phi-2
+  qwen25_3b:       Qwen/Qwen2.5-3B
+  qwen25_math1.5b: Qwen/Qwen2.5-Math-1.5B
+
+# ── Phase 1 ───────────────────────────────────────────────────────────────
+compression_ratios: [0.5, 0.6, 0.7, 0.8, 0.9]
+lora_r:        16
+lora_alpha:    32
+lora_dropout:  0.05
+train_epochs:  3
+batch_size:    4
+grad_accum:    4
+learning_rate: 2.0e-4
+max_seq_len:   512
+
+# ── Phase 2 ───────────────────────────────────────────────────────────────
+n_rollouts:          15        # per question in D_steer
+temperature:         1.0
+min_samples:         200       # minimum H+/H- per layer before cPCA
+beta_cpca:           0.5       # contrastive weight
+r_per_layer:         3         # cPCA components per layer
+r_final:             10        # components after weighted merge
+layer_threshold_mul: 0.5       # probe threshold multiplier (mean + k*std)
+contiguity_window:   3
+
+# ── Phase 3 ───────────────────────────────────────────────────────────────
+alpha_max:   50.0
+alpha_init:  1.0
+alpha_lr:    5.0e-2
+lambda_a:    0.1
+lambda_m:    0.01              # use 0.005 for phi2
+max_epochs:  5
+es_patience: 3
+es_fraction: 0.1               # fraction of D_val held out for early stopping
+
+diagnostic_alphas: [0.0, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0]
+
+# ── Phase 4 ───────────────────────────────────────────────────────────────
+output_dir: results/final
