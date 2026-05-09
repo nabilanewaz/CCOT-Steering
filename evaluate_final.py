@@ -39,6 +39,10 @@ from phase3.hooks import (
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
+N_BOOTSTRAP  = 1000    # resamples for all bootstrap CIs
+CI_SEED      = 0       # fixed seed → reproducible CIs across re-runs
+CI_LEVEL     = 0.95    # 95% confidence interval
+
 MODEL_TAGS = ['llama32_3b', 'phi2', 'qwen25_3b', 'qwen25_math1.5b']
 MODEL_ID_MAP = {
     'llama32_3b':      'meta-llama/Llama-3.2-3B',
@@ -85,6 +89,26 @@ class FlipMatrix:
 
 
 @dataclass
+class BootstrapResult:
+    """95% bootstrap CI for a single accuracy estimate or a paired difference."""
+    point:       float   # point estimate (accuracy or Δ-accuracy)
+    lower:       float   # 2.5th percentile
+    upper:       float   # 97.5th percentile
+    significant: bool = False   # True when lower > 0 (difference CIs only)
+
+    @property
+    def half_width(self) -> float:
+        return (self.upper - self.lower) / 2.0
+
+    def fmt(self) -> str:
+        return f"{self.point:.3f}  [{self.lower:.3f}, {self.upper:.3f}]"
+
+    def fmt_diff(self) -> str:
+        sig = "  ✓" if self.significant else ""
+        return f"{self.point:+.3f}  [{self.lower:+.3f}, {self.upper:+.3f}]{sig}"
+
+
+@dataclass
 class ExampleResult:
     correct: bool
     answer_found: bool
@@ -116,6 +140,9 @@ class FinalMetrics:
     answer_found_rate: float
     trajectory_coherence: float = 0.0
     truth_alignment: float = 0.0
+    # Populated after model evaluation via compute_condition_cis — zero until then
+    ci_lower_95: float = 0.0
+    ci_upper_95: float = 0.0
 
 
 # ── Latent metric functions ────────────────────────────────────────────────────
@@ -148,6 +175,132 @@ def truth_alignment(latent_states: list, v_hat: torch.Tensor) -> float:
         ).item()
         sims.append(cos)
     return float(np.mean(sims)) if sims else 0.0
+
+
+# ── Bootstrap CI ──────────────────────────────────────────────────────────────
+
+def bootstrap_ci(
+    correct_array: list,
+    n_bootstrap: int = N_BOOTSTRAP,
+    confidence: float = CI_LEVEL,
+    seed: int = CI_SEED,
+) -> tuple[float, float, float]:
+    """
+    Percentile bootstrap CI for a single accuracy estimate.
+    The model is run exactly once; the 1,000 resamples are pure numpy.
+
+    Parameters
+    ----------
+    correct_array : list of int/bool  (1 = correct, 0 = wrong), length = n_test
+    Returns (point_estimate, lower_bound, upper_bound).
+    """
+    rng = np.random.default_rng(seed)
+    arr = np.asarray(correct_array, dtype=float)
+    n   = len(arr)
+    point = float(arr.mean())
+
+    boot = np.empty(n_bootstrap)
+    for i in range(n_bootstrap):
+        idx       = rng.integers(0, n, size=n)
+        boot[i]   = arr[idx].mean()
+
+    alpha = 1.0 - confidence
+    lower = float(np.percentile(boot, 100.0 * alpha / 2.0))
+    upper = float(np.percentile(boot, 100.0 * (1.0 - alpha / 2.0)))
+    return point, lower, upper
+
+
+def bootstrap_ci_difference(
+    results_a: list,
+    results_b: list,
+    n_bootstrap: int = N_BOOTSTRAP,
+    confidence: float = CI_LEVEL,
+    seed: int = CI_SEED,
+) -> tuple[float, float, float, bool]:
+    """
+    Paired percentile bootstrap CI on (accuracy_b − accuracy_a).
+    Paired = same resampled indices for A and B, which accounts for the
+    question-level correlation when both conditions see the same test items.
+
+    Returns (point, lower, upper, significant) where
+    significant = True iff the CI excludes 0 (i.e. lower > 0).
+    """
+    rng = np.random.default_rng(seed)
+    a   = np.asarray(results_a, dtype=float)
+    b   = np.asarray(results_b, dtype=float)
+    n   = len(a)
+    point = float(b.mean() - a.mean())
+
+    boot = np.empty(n_bootstrap)
+    for i in range(n_bootstrap):
+        idx     = rng.integers(0, n, size=n)
+        boot[i] = b[idx].mean() - a[idx].mean()
+
+    alpha = 1.0 - confidence
+    lower = float(np.percentile(boot, 100.0 * alpha / 2.0))
+    upper = float(np.percentile(boot, 100.0 * (1.0 - alpha / 2.0)))
+    return point, lower, upper, bool(lower > 0.0)
+
+
+# ── CI aggregation ─────────────────────────────────────────────────────────────
+
+def compute_condition_cis(
+    all_preds: dict,
+    n_bootstrap: int = N_BOOTSTRAP,
+    seed: int = CI_SEED,
+) -> dict:
+    """Per-condition bootstrap CI. Returns {condition_name: BootstrapResult}."""
+    cis = {}
+    for cond, preds in all_preds.items():
+        pt, lo, hi = bootstrap_ci(preds, n_bootstrap=n_bootstrap, seed=seed)
+        cis[cond]  = BootstrapResult(point=pt, lower=lo, upper=hi)
+    return cis
+
+
+def compute_paired_cis(
+    all_preds: dict,
+    ratio_int: int,
+    source: str,
+    n_bootstrap: int = N_BOOTSTRAP,
+    seed: int = CI_SEED,
+) -> dict:
+    """
+    Paired bootstrap CIs on (acc_b − acc_a) for the key comparisons needed
+    to support causal claims. Significant = 95% CI excludes 0.
+
+    Covers:
+      - steered vs unsteered (primary claim)
+      - steered vs random noise (direction specificity)
+      - steered vs full CoT   (efficiency claim)
+      - ccot vs full CoT      (compression cost)
+      - trimmed vs ccot       (mechanism baseline)
+    """
+    ccot_cond  = f'ccot_R{ratio_int}'
+    dom_cond   = f'dom_R{ratio_int}_{source}'
+    cpca_cond  = f'cpca_R{ratio_int}_{source}'
+    noise_cond = f'noise_R{ratio_int}_{source}'
+    trim_cond  = f'trimmed_R{ratio_int}'
+
+    pairs = [
+        ('dom_vs_ccot',        ccot_cond,   dom_cond),
+        ('cpca_vs_ccot',       ccot_cond,   cpca_cond),
+        ('dom_vs_noise',       noise_cond,  dom_cond),
+        ('dom_vs_full_cot',    'full_cot',  dom_cond),
+        ('ccot_vs_full_cot',   'full_cot',  ccot_cond),
+        ('noise_vs_ccot',      ccot_cond,   noise_cond),
+        ('trimmed_vs_full_cot','full_cot',  trim_cond),
+    ]
+
+    cis: dict = {}
+    for name, cond_a, cond_b in pairs:
+        if cond_a not in all_preds or cond_b not in all_preds:
+            continue
+        pt, lo, hi, sig = bootstrap_ci_difference(
+            all_preds[cond_a], all_preds[cond_b],
+            n_bootstrap=n_bootstrap, seed=seed,
+        )
+        cis[name] = BootstrapResult(point=pt, lower=lo, upper=hi, significant=sig)
+    return cis
 
 
 # ── Small helpers ──────────────────────────────────────────────────────────────
@@ -378,6 +531,33 @@ def _build_summary(all_results: dict, n_test: int) -> dict:
                                           if _metric_by_prefix(metrics, 'cpca') else 0.0),
         }
         summary['flip_grids'][model_tag] = data['flip_grid']
+
+    # ── Confidence intervals ───────────────────────────────────────────────────
+    summary['confidence_intervals'] = {
+        model_tag: {
+            'n_bootstrap':  N_BOOTSTRAP,
+            'ci_level':     CI_LEVEL,
+            'condition_cis': {
+                _display_condition_name(k): {
+                    'accuracy':   v.point,
+                    'ci_lower':   v.lower,
+                    'ci_upper':   v.upper,
+                    'half_width': v.half_width,
+                }
+                for k, v in data.get('condition_cis', {}).items()
+            },
+            'paired_cis': {
+                k: {
+                    'delta':       v.point,
+                    'ci_lower':    v.lower,
+                    'ci_upper':    v.upper,
+                    'significant': v.significant,
+                }
+                for k, v in data.get('paired_cis', {}).items()
+            },
+        }
+        for model_tag, data in all_results.items()
+    }
 
     return summary
 
@@ -663,13 +843,19 @@ def run_alpha_sweep_test(
 # ── Reporting tables ───────────────────────────────────────────────────────────
 
 def print_accuracy_table(metrics: dict):
-    w = 80
+    w = 100
     print("\n" + "=" * w)
-    print(f"{'Condition':<36} {'Acc':>7} {'N':>5} {'AnswFnd%':>9} {'ActRatio':>9}")
+    print(f"{'Condition':<36} {'Acc':>7} {'95% CI':^22} {'N':>5} "
+          f"{'AnswFnd%':>9} {'ActRatio':>9}")
     print("-" * w)
     for cond, m in sorted(metrics.items()):
+        if m.ci_upper_95 > 0:
+            ci_str = f"[{m.ci_lower_95:.3f}, {m.ci_upper_95:.3f}]"
+        else:
+            ci_str = "  (not computed)  "
         print(
-            f"{_display_condition_name(cond):<36} {m.accuracy:>7.3f} {m.n_total:>5} "
+            f"{_display_condition_name(cond):<36} {m.accuracy:>7.3f} "
+            f"{ci_str:^22} {m.n_total:>5} "
             f"{m.answer_found_rate:>9.3f} {m.actual_ratio_mean:>9.3f}"
         )
     print("=" * w)
@@ -756,6 +942,40 @@ def print_efficiency_table(metrics: dict):
     print("=" * w)
 
 
+def print_ci_table(cis: dict):
+    """Per-condition 95% bootstrap CIs, sorted by accuracy descending."""
+    if not cis:
+        return
+    w = 82
+    print(f"\n{'═' * w}")
+    print(f"  Bootstrap 95% CIs  "
+          f"(n={N_BOOTSTRAP} resamples · paired resampling · seed={CI_SEED})")
+    print(f"{'Condition':<34} {'Acc':>6}  {'95% CI':^22}  {'±HW':>6}")
+    print(f"{'─' * w}")
+    for cond, br in sorted(cis.items(), key=lambda x: -x[1].point):
+        print(f"  {_display_condition_name(cond):<32} {br.point:>6.3f}  "
+              f"[{br.lower:.3f}, {br.upper:.3f}]  {br.half_width:>6.3f}")
+    print(f"{'═' * w}")
+
+
+def print_paired_ci_table(paired_cis: dict):
+    """Paired bootstrap CIs on accuracy difference; marks statistically significant gains."""
+    if not paired_cis:
+        return
+    w = 82
+    print(f"\n{'═' * w}")
+    print(f"  Paired bootstrap CIs on accuracy difference  "
+          f"(n={N_BOOTSTRAP} resamples)")
+    print(f"  Significant (✓) = 95% CI excludes 0")
+    print(f"{'Comparison':<34} {'Δ':>7}  {'95% CI':^22}  {'Sig':>4}")
+    print(f"{'─' * w}")
+    for name, br in paired_cis.items():
+        sig = "✓" if br.significant else "—"
+        print(f"  {name:<32} {br.point:>+7.3f}  "
+              f"[{br.lower:+.3f}, {br.upper:+.3f}]  {sig:>4}")
+    print(f"{'═' * w}")
+
+
 # ── Persistence ────────────────────────────────────────────────────────────────
 
 def save_final_results(all_results: dict, out_dir: str):
@@ -763,16 +983,27 @@ def save_final_results(all_results: dict, out_dir: str):
     summary = _build_summary(all_results, next(iter(all_results.values()))['metrics']['full_cot'].n_total if all_results else 0)
     for model_tag, data in all_results.items():
         out_path = os.path.join(out_dir, f"{model_tag}_test.json")
+        def _ser_br(br) -> dict:
+            return {'point': br.point, 'lower': br.lower,
+                    'upper': br.upper, 'significant': br.significant,
+                    'half_width': br.half_width}
+
         serializable = {
-            'model_tag':     model_tag,
-            'metrics':       {k: asdict(v) for k, v in data['metrics'].items()},
-            'flip_matrices': [
+            'model_tag':      model_tag,
+            'metrics':        {k: asdict(v) for k, v in data['metrics'].items()},
+            'flip_matrices':  [
                 _serialize_flip_matrix(fm)
                 for fm in data['flip_matrices']
             ],
-            'flip_grid':     data.get('flip_grid', {}),
-            'alpha_sweep':   data.get('alpha_sweep', []),
-            'locked_config': data.get('locked_config', {}),
+            'flip_grid':      data.get('flip_grid', {}),
+            'alpha_sweep':    data.get('alpha_sweep', []),
+            'locked_config':  data.get('locked_config', {}),
+            'condition_cis':  {
+                k: _ser_br(v) for k, v in data.get('condition_cis', {}).items()
+            },
+            'paired_cis':     {
+                k: _ser_br(v) for k, v in data.get('paired_cis', {}).items()
+            },
         }
         with open(out_path, 'w') as f:
             json.dump(serializable, f, indent=2)
@@ -1085,6 +1316,17 @@ def run_final_evaluation(
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+        # ── Bootstrap CIs (pure numpy, no model) ──────────────────────────────
+        print(f"\n[PH4] Computing bootstrap CIs ({N_BOOTSTRAP} resamples)...")
+        condition_cis = compute_condition_cis(all_preds, seed=CI_SEED)
+        paired_cis    = compute_paired_cis(all_preds, ratio_int, source, seed=CI_SEED)
+
+        # Attach per-condition CIs back to FinalMetrics for inline display
+        for cond, br in condition_cis.items():
+            if cond in all_metrics:
+                all_metrics[cond].ci_lower_95 = br.lower
+                all_metrics[cond].ci_upper_95 = br.upper
+
         # ── Compute flip matrices and grid ─────────────────────────────────────
         flip_matrices = compute_all_flip_matrices(
             all_preds, golds, model_tag, ratio_int, source
@@ -1097,6 +1339,8 @@ def run_final_evaluation(
         noise_c = f'noise_R{ratio_int}_{source}'
 
         print_accuracy_table(all_metrics)
+        print_ci_table(condition_cis)
+        print_paired_ci_table(paired_cis)
         print_latent_metrics_table(all_metrics)
         print_primary_flip_summary(flip_matrices)
         print_mechanism_gain_table(all_metrics, baseline_cond=ccot_c)
@@ -1104,11 +1348,13 @@ def run_final_evaluation(
         print_efficiency_table(all_metrics)
 
         all_results[model_tag] = {
-            'metrics':       all_metrics,
-            'flip_matrices': flip_matrices,
-            'flip_grid':     flip_grid,
-            'alpha_sweep':   sweep,
-            'locked_config': best_cfg,
+            'metrics':        all_metrics,
+            'flip_matrices':  flip_matrices,
+            'flip_grid':      flip_grid,
+            'alpha_sweep':    sweep,
+            'locked_config':  best_cfg,
+            'condition_cis':  condition_cis,
+            'paired_cis':     paired_cis,
         }
 
     return all_results
