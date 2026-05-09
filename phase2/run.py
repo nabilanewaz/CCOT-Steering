@@ -28,6 +28,8 @@ from phase2.cpca import (
     run_cpca_sweep,
     weighted_subspace_merge,
     save_subspace,
+    compute_shuffled_cpca,
+    save_shuffled_subspace,
 )
 from phase2.compare import compare_methods, select_best_source_method
 
@@ -127,6 +129,16 @@ def run_phase2_source(
     save_subspace(U_truth, selected_layers, model_tag, source_tag,
                   r_final, beta, vectors_dir,
                   layer_scores=layer_scores, sweep_meta=sweep_meta)
+
+    # ── Control: Shuffled-Label cPCA ──────────────────────────────────────────
+    print("\n--- Control: Shuffled-Label cPCA ---")
+    U_shuffled_cpca = compute_shuffled_cpca(
+        H_pos, H_neg, selected_layers, cpca_fn,
+        dom_vectors, layer_scores, v_truth, r_final,
+    )
+    if U_shuffled_cpca is not None:
+        save_shuffled_subspace(U_shuffled_cpca, model_tag, source_tag,
+                               r_final, vectors_dir)
 
     return {
         'v_truth':         v_truth,

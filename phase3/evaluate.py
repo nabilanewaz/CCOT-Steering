@@ -91,6 +91,32 @@ def _load_vector(vectors_dir: str, source: str, method: str,
     return torch.load(files[-1], map_location='cpu')['U_truth']
 
 
+def _load_shuffled_vector(
+    vectors_dir: str,
+    source: str,
+    method: str,
+    r_final: Optional[int] = None,
+) -> torch.Tensor:
+    """Load shuffled-label control vector (v_shuffled or U_shuffled)."""
+    if method == 'dom':
+        path = os.path.join(vectors_dir, f'{source}_shuffled_dom.pt')
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Shuffled DoM missing: {path}")
+        return torch.load(path, map_location='cpu')['v_shuffled']
+    # cPCA
+    if r_final:
+        candidates = [os.path.join(vectors_dir, f'{source}_shuffled_cpca_r{r_final}.pt')]
+    else:
+        candidates = sorted(
+            _glob.glob(os.path.join(vectors_dir, f'{source}_shuffled_cpca_r*.pt'))
+        )
+    if not candidates or not os.path.exists(candidates[-1]):
+        raise FileNotFoundError(
+            f"Shuffled cPCA missing for source={source} in {vectors_dir}"
+        )
+    return torch.load(candidates[-1], map_location='cpu')['U_shuffled']
+
+
 def _alpha_path(vectors_dir: str, source: str) -> str:
     return os.path.join(vectors_dir, f'{source}_alpha_star.pt')
 
@@ -517,6 +543,101 @@ def run_phase3_evaluation(
                 ))
                 print(f"    cpca_{rtag}_{source}: acc={results[-1].accuracy:.3f}  "
                       f"flip={results[-1].flip_rate:.3f}")
+
+            # ── Controls ──────────────────────────────────────────────────────
+
+            # Control A: Shuffled-label DoM vector at α*
+            # Rules out: "the extraction procedure itself creates a useful artifact"
+            try:
+                v_shuf = _load_shuffled_vector(vectors_dir, source, 'dom')
+                print(f"  Evaluating: Shuffled-label DoM (R={ratio}, src={source})")
+                c_list, f_list, tok_list, lat_list = [], [], [], []
+                shuf_dom_fac = lambda b, v=v_shuf, a=alpha: make_dom_hook(b, v, a, device)
+                for item in D_val:
+                    ok, fd, nt, lt = _eval_one(
+                        ccot_model, tok_ccot, item, ccot_prompt_fn(item),
+                        L_star, shuf_dom_fac, device, max_new_tokens,
+                        boundary_fn=find_boundary_idx_ccot,
+                    )
+                    c_list.append(ok); f_list.append(fd)
+                    tok_list.append(nt); lat_list.append(lt)
+                results.append(_build_result(
+                    f'shuf_dom_{rtag}_{source}', model_tag, ratio,
+                    source, 'shuf_dom', alpha,
+                    c_list, f_list, tok_list, lat_list, ccot_correct, full_cot_mean_tokens,
+                ))
+                print(f"    shuf_dom_{rtag}_{source}: acc={results[-1].accuracy:.3f}")
+            except FileNotFoundError:
+                print(f"  [SKIP] Shuffled DoM vector missing for source={source}")
+
+            # Control B: Negative DoM direction at α*
+            # Injects −v_truth; should degrade accuracy if the direction is meaningful
+            print(f"  Evaluating: Negative DoM (R={ratio}, src={source})")
+            c_list, f_list, tok_list, lat_list = [], [], [], []
+            neg_dom_fac = lambda b, v=v_dom, a=alpha: make_dom_hook(b, v, -a, device)
+            for item in D_val:
+                ok, fd, nt, lt = _eval_one(
+                    ccot_model, tok_ccot, item, ccot_prompt_fn(item),
+                    L_star, neg_dom_fac, device, max_new_tokens,
+                    boundary_fn=find_boundary_idx_ccot,
+                )
+                c_list.append(ok); f_list.append(fd)
+                tok_list.append(nt); lat_list.append(lt)
+            results.append(_build_result(
+                f'neg_dom_{rtag}_{source}', model_tag, ratio,
+                source, 'neg_dom', alpha,
+                c_list, f_list, tok_list, lat_list, ccot_correct, full_cot_mean_tokens,
+            ))
+            print(f"    neg_dom_{rtag}_{source}: acc={results[-1].accuracy:.3f}  "
+                  f"flip={results[-1].flip_rate:.3f}")
+
+            if has_cpca:
+                # Control C: Negative cPCA — subtract subspace projection at α*
+                # h' = h − α·σ·U·Uᵀ·ĥ; should degrade if subspace is meaningful
+                print(f"  Evaluating: Negative cPCA (R={ratio}, src={source})")
+                c_list, f_list, tok_list, lat_list = [], [], [], []
+                neg_cpca_fac = lambda b, U=U_cpca, a=alpha: make_cpca_hook(b, U, -a, device)
+                for item in D_val:
+                    ok, fd, nt, lt = _eval_one(
+                        ccot_model, tok_ccot, item, ccot_prompt_fn(item),
+                        L_star, neg_cpca_fac, device, max_new_tokens,
+                        boundary_fn=find_boundary_idx_ccot,
+                    )
+                    c_list.append(ok); f_list.append(fd)
+                    tok_list.append(nt); lat_list.append(lt)
+                results.append(_build_result(
+                    f'neg_cpca_{rtag}_{source}', model_tag, ratio,
+                    source, 'neg_cpca', alpha,
+                    c_list, f_list, tok_list, lat_list, ccot_correct, full_cot_mean_tokens,
+                ))
+                print(f"    neg_cpca_{rtag}_{source}: acc={results[-1].accuracy:.3f}  "
+                      f"flip={results[-1].flip_rate:.3f}")
+
+                # Control D: Shuffled cPCA subspace at α*
+                # Subspace-level analogue of shuffled-label DoM
+                try:
+                    U_shuf_cpca = _load_shuffled_vector(vectors_dir, source, 'cpca', r_final)
+                    print(f"  Evaluating: Shuffled cPCA (R={ratio}, src={source})")
+                    c_list, f_list, tok_list, lat_list = [], [], [], []
+                    shuf_cpca_fac = lambda b, U=U_shuf_cpca, a=alpha: (
+                        make_cpca_hook(b, U, a, device)
+                    )
+                    for item in D_val:
+                        ok, fd, nt, lt = _eval_one(
+                            ccot_model, tok_ccot, item, ccot_prompt_fn(item),
+                            L_star, shuf_cpca_fac, device, max_new_tokens,
+                            boundary_fn=find_boundary_idx_ccot,
+                        )
+                        c_list.append(ok); f_list.append(fd)
+                        tok_list.append(nt); lat_list.append(lt)
+                    results.append(_build_result(
+                        f'shuf_cpca_{rtag}_{source}', model_tag, ratio,
+                        source, 'shuf_cpca', alpha,
+                        c_list, f_list, tok_list, lat_list, ccot_correct, full_cot_mean_tokens,
+                    ))
+                    print(f"    shuf_cpca_{rtag}_{source}: acc={results[-1].accuracy:.3f}")
+                except FileNotFoundError:
+                    print(f"  [SKIP] Shuffled cPCA missing for source={source}")
 
         # Condition 8: Trimmed + DoM (best source = 'base' by convention)
         try:
