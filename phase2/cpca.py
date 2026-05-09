@@ -306,6 +306,90 @@ def weighted_subspace_merge(
     return U_truth_final
 
 
+# ── Shuffled-label cPCA control ───────────────────────────────────────────────
+
+def compute_shuffled_cpca(
+    H_pos: dict,
+    H_neg: dict,
+    selected_layers: list,
+    cpca_fn,
+    dom_vectors: dict,
+    layer_scores: dict,
+    v_truth: torch.Tensor,
+    r_final: int,
+    seed: int = 42,
+) -> 'torch.Tensor | None':
+    """
+    Shuffled-label cPCA control: at each selected layer, pool H+/H− and apply
+    a random per-layer permutation (preserving class sizes), then recompute cPCA
+    and merge subspaces with the real probe-accuracy weights.
+
+    Used as a Phase 3 control baseline — the resulting subspace should be no
+    more useful than random noise if the true cPCA captures a meaningful direction.
+    Per-layer seeds: seed + L (deterministic, reproducible).
+    """
+    H_shuf_pos: dict = {}
+    H_shuf_neg: dict = {}
+
+    for L in selected_layers:
+        if L not in H_pos or L not in H_neg:
+            continue
+        H_all = torch.cat([H_pos[L], H_neg[L]])   # [n_pos + n_neg, d]
+        n_pos = H_pos[L].shape[0]
+
+        g = torch.Generator()
+        g.manual_seed(seed + L)
+        perm = torch.randperm(H_all.shape[0], generator=g)
+        H_all = H_all[perm]
+
+        H_shuf_pos[L] = H_all[:n_pos]
+        H_shuf_neg[L] = H_all[n_pos:]
+
+    if not H_shuf_pos:
+        return None
+
+    shuf_results = run_cpca_sweep(H_shuf_pos, H_shuf_neg, selected_layers, cpca_fn)
+    if not shuf_results:
+        return None
+
+    subspaces_shuf = {L: (U, lam) for L, (U, lam, _, _) in shuf_results.items()}
+    U_shuffled = weighted_subspace_merge(
+        subspaces_shuf, layer_scores, dom_vectors, v_truth, r_final
+    )
+
+    cos_vals = []
+    for L, (U_L, _) in subspaces_shuf.items():
+        if L in dom_vectors:
+            cos = (dom_vectors[L].unsqueeze(0) @ U_L).norm().item()
+            cos_vals.append(cos)
+    if cos_vals:
+        print(f"\n  Shuffled cPCA: mean |v·U_col| = "
+              f"{sum(cos_vals) / len(cos_vals):.4f}  "
+              f"(near-zero expected for random labels)")
+
+    return U_shuffled
+
+
+def save_shuffled_subspace(
+    U_shuffled: torch.Tensor,
+    model_tag: str,
+    source: str,
+    r_final: int,
+    vectors_dir: str,
+) -> str:
+    os.makedirs(vectors_dir, exist_ok=True)
+    path = os.path.join(vectors_dir, f'{source}_shuffled_cpca_r{r_final}.pt')
+    torch.save({
+        'U_shuffled': U_shuffled,
+        'method':     'shuffled_label_cpca',
+        'model_tag':  model_tag,
+        'source':     source,
+        'r_final':    r_final,
+    }, path)
+    print(f"Saved shuffled cPCA -> {path}  shape={tuple(U_shuffled.shape)}")
+    return path
+
+
 # ── Steering hook ─────────────────────────────────────────────────────────────
 
 def make_subspace_hook(boundary_idx: int, U_truth: torch.Tensor,
