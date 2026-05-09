@@ -2,7 +2,7 @@
 
 MODEL_PHASE2_CONFIG = {
     'llama32_3b': {
-        'N': 15,
+        'N': 20,
         'cpca_variant':         'randomized',
         'r_per_layer':          3,
         'r_final':              10,
@@ -11,7 +11,7 @@ MODEL_PHASE2_CONFIG = {
         'min_samples':          200,
     },
     'phi2': {
-        'N': 15,
+        'N': 20,
         'cpca_variant':         'full',
         'r_per_layer':          3,
         'r_final':              10,
@@ -20,7 +20,7 @@ MODEL_PHASE2_CONFIG = {
         'min_samples':          200,
     },
     'qwen25_3b': {
-        'N': 15,
+        'N': 20,
         'cpca_variant':         'full',
         'r_per_layer':          3,
         'r_final':              10,
@@ -40,7 +40,7 @@ MODEL_PHASE2_CONFIG = {
 }
 
 _DEFAULT_CONFIG = {
-    'N': 15,
+    'N': 20,
     'cpca_variant':         'full',
     'r_per_layer':          3,
     'r_final':              10,
