@@ -12,23 +12,17 @@ def build_all_splits(pool_path: str, seed: int = 42, out_dir: str = None) -> Dic
     random.shuffle(pool)
     n = len(pool)
 
-    ratios = {
-        'S1': (0.70, 0.10, 0.20),
-        'S2': (0.60, 0.20, 0.20),
-        'S3': (0.60, 0.10, 0.30),
-        'S4': (0.50, 0.20, 0.30),
-    }
-
-    splits = {}
-    for cfg_id, (tr, st, va) in ratios.items():
-        n_tr = round(n * tr)
-        n_st = round(n * st)
-        splits[cfg_id] = {
+    # Fixed split: 60% train / 20% steer / 20% val
+    n_tr = round(n * 0.60)
+    n_st = round(n * 0.20)
+    splits = {
+        'S2': {
             'D_train': pool[:n_tr],
             'D_steer': pool[n_tr : n_tr + n_st],
             'D_val':   pool[n_tr + n_st:],
         }
-        print(f"{cfg_id}: train={n_tr}  steer={n_st}  val={len(splits[cfg_id]['D_val'])}")
+    }
+    print(f"S2: train={n_tr}  steer={n_st}  val={len(splits['S2']['D_val'])}")
 
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)

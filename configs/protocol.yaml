@@ -3,11 +3,8 @@ seed: 42
 train_pool: gsm8k/train.jsonl
 test_path:  gsm8k/test.jsonl   # never opened outside evaluate_final.py
 
-split_configs:
-  S1: [0.70, 0.10, 0.20]
-  S2: [0.60, 0.20, 0.20]
-  S3: [0.60, 0.10, 0.30]
-  S4: [0.50, 0.20, 0.30]
+split: S2          # fixed 60% train / 20% steer / 20% val
+split_ratios: [0.60, 0.20, 0.20]
 
 # ── Models ────────────────────────────────────────────────────────────────
 model_tags:
@@ -28,7 +25,7 @@ learning_rate: 2.0e-4
 max_seq_len:   512
 
 # ── Phase 2 ───────────────────────────────────────────────────────────────
-n_rollouts:          15        # per question in D_steer
+n_rollouts:          20        # per question in D_steer
 temperature:         1.0
 min_samples:         200       # minimum H+/H- per layer before cPCA
 beta_cpca:           0.5       # contrastive weight
