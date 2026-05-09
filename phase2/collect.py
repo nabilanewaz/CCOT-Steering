@@ -5,6 +5,10 @@ import torch
 
 from phase1.inference import extract_answer, normalize_answer
 from phase2.loaders import get_transformer_layers
+from phase2.balance import (
+    stratified_balance, check_balance,
+    difficulty_bucket, IMBALANCE_THRESHOLD,
+)
 
 
 def _register_all_hooks(model) -> tuple[list, dict]:
@@ -58,16 +62,26 @@ def collect_hidden_states(
 
     H_plus_raw: dict = defaultdict(list)
     H_minus_raw: dict = defaultdict(list)
+    bucket_pos:  dict = defaultdict(list)   # difficulty bucket per H+ sample
+    bucket_neg:  dict = defaultdict(list)   # difficulty bucket per H- sample
 
     handles, captured = _register_all_hooks(model)
 
     if prompt_fn is None:
         prompt_fn = lambda item: item['question']
 
+    n_used = n_skipped = 0
+
     for item_idx, item in enumerate(D_steer):
         prompt = prompt_fn(item)
         input_enc = tokenizer(prompt, return_tensors='pt').to(device)
         gold = normalize_answer(item['answer'].split('####')[1].strip())
+
+        # Per-question local buffers — only merged into the global pool if
+        # this question produces contrast (at least one correct AND one incorrect rollout).
+        item_h_pos: dict = defaultdict(list)
+        item_h_neg: dict = defaultdict(list)
+        item_n_pos = item_n_neg = 0
 
         for _ in range(N):
             # Clear state from the previous rollout
@@ -99,23 +113,54 @@ def collect_hidden_states(
             )
             is_correct = (normalize_answer(pred) == gold) if pred is not None else False
 
+            if is_correct:
+                item_n_pos += 1
+            else:
+                item_n_neg += 1
+
             for L in range(num_layers):
                 if L in captured:
                     h = captured[L].squeeze(0)  # [d]
                     if is_correct:
-                        H_plus_raw[L].append(h)
+                        item_h_pos[L].append(h)
                     else:
-                        H_minus_raw[L].append(h)
+                        item_h_neg[L].append(h)
+
+        # Skip questions with no contrast (always right or always wrong)
+        if item_n_pos == 0 or item_n_neg == 0:
+            n_skipped += 1
+            continue
+
+        n_used += 1
+        bkt = difficulty_bucket(item_n_pos / (item_n_pos + item_n_neg))
+        for L in range(num_layers):
+            H_plus_raw[L].extend(item_h_pos[L])
+            H_minus_raw[L].extend(item_h_neg[L])
+            bucket_pos[L].extend([bkt] * len(item_h_pos[L]))
+            bucket_neg[L].extend([bkt] * len(item_h_neg[L]))
 
         if (item_idx + 1) % 50 == 0:
             n_pos = len(H_plus_raw[0]) if 0 in H_plus_raw else 0
             n_neg = len(H_minus_raw[0]) if 0 in H_minus_raw else 0
             print(f"  [{item_idx+1}/{len(D_steer)}]  "
+                  f"used={n_used}  skipped={n_skipped}  "
                   f"H+ per layer ~{n_pos}  H- per layer ~{n_neg}")
 
     for h in handles:
         h.remove()
 
+    # ── Class balance check and stratified undersampling ─────────────────────
+    ratio, n_pos_total, n_neg_total = check_balance(H_plus_raw, H_minus_raw)
+    print(f"\nClass balance  [source: {source_tag}]  "
+          f"H+={n_pos_total}  H-={n_neg_total}  ratio={ratio:.2f}x")
+    if ratio > IMBALANCE_THRESHOLD:
+        print(f"  Imbalance > {IMBALANCE_THRESHOLD}x "
+              f"— stratified undersampling of H-")
+        H_plus_raw, H_minus_raw = stratified_balance(
+            H_plus_raw, H_minus_raw, bucket_pos, bucket_neg,
+        )
+
+    # ── Stack tensors and apply min_samples filter ────────────────────────────
     H_pos, H_neg = {}, {}
     for L in range(num_layers):
         n_pos = len(H_plus_raw[L])
@@ -128,5 +173,6 @@ def collect_hidden_states(
                   f"(H+={n_pos}, H-={n_neg}, min={min_samples})")
 
     print(f"\nCollected hidden states from {len(H_pos)} / {num_layers} layers  "
-          f"[source: {source_tag}]")
+          f"[source: {source_tag}]  "
+          f"questions used={n_used}  skipped={n_skipped} (no contrast)")
     return H_pos, H_neg

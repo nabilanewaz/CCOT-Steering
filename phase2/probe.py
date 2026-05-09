@@ -5,9 +5,22 @@ from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
+PROBE_GATE = 0.65   # minimum per-layer accuracy required in at least one layer
 
-def score_all_layers(H_pos: dict, H_neg: dict) -> dict[int, float]:
-    """Fit a logistic probe per layer; return dict[layer -> val accuracy]."""
+
+def score_all_layers(
+    H_pos: dict,
+    H_neg: dict,
+    gate: float = PROBE_GATE,
+) -> dict[int, float]:
+    """
+    Fit a stratified 80/20 logistic probe on each layer's hidden states.
+    Returns dict[layer -> held-out accuracy].
+
+    Raises RuntimeError if no layer exceeds `gate` (default 65%) — this
+    indicates the collected states carry no linear separability signal and
+    downstream DoM/cPCA vectors would be meaningless.
+    """
     layer_scores: dict[int, float] = {}
 
     for L in sorted(H_pos.keys()):
@@ -25,9 +38,28 @@ def score_all_layers(H_pos: dict, H_neg: dict) -> dict[int, float]:
         probe.fit(X_tr, y_tr)
         layer_scores[L] = float(accuracy_score(y_te, probe.predict(X_te)))
 
-    print("\nPer-layer probe accuracy:")
-    for L, acc in sorted(layer_scores.items()):
-        bar = '█' * int(acc * 40)
-        print(f"  Layer {L:02d}: {acc:.3f}  {bar}")
-
+    _report(layer_scores, gate)
+    _gate_check(layer_scores, gate)
     return layer_scores
+
+
+def _report(layer_scores: dict[int, float], gate: float) -> None:
+    best = max(layer_scores.values()) if layer_scores else 0.0
+    print(f"\nPer-layer probe accuracy  (gate={gate:.0%}  best={best:.3f}):")
+    for L, acc in sorted(layer_scores.items()):
+        bar    = '█' * int(acc * 40)
+        marker = '  ✓' if acc > gate else ''
+        print(f"  Layer {L:02d}: {acc:.3f}  {bar}{marker}")
+
+
+def _gate_check(layer_scores: dict[int, float], gate: float) -> None:
+    passing = [L for L, acc in layer_scores.items() if acc > gate]
+    if not passing:
+        best_L   = max(layer_scores, key=layer_scores.get)
+        best_acc = layer_scores[best_L]
+        raise RuntimeError(
+            f"Probe gate failed: no layer exceeded {gate:.0%}. "
+            f"Best was layer {best_L} at {best_acc:.3f}. "
+            "Check hidden-state quality or increase D_steer size."
+        )
+    print(f"Gate PASSED: {len(passing)} layer(s) > {gate:.0%}  -> {passing}")

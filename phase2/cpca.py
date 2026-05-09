@@ -3,7 +3,14 @@ import os
 import numpy as np
 import torch
 from sklearn.covariance import LedoitWolf
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 from sklearn.utils.extmath import randomized_svd as rsvd
+
+K_SWEEP    = [1, 2, 5, 10]     # per-layer rank candidates
+BETA_SWEEP = [0.3, 0.5, 0.7]   # contrastive weight candidates
 
 
 # ── Layer selection ───────────────────────────────────────────────────────────
@@ -106,6 +113,7 @@ def cpca_randomized(
     H_pos_L: torch.Tensor,
     H_neg_L: torch.Tensor,
     r: int,
+    beta: float = 0.5,
     beta_rank: int = None,
     **_,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -113,9 +121,13 @@ def cpca_randomized(
     Approximate cPCA via randomized SVD. Use for d >= 3072 (Llama 3.2-3B).
     Projects out dominant H- directions from H+ instead of forming d×d matrices.
     Returns (U_L [d, r], lam_L [r] singular values).
+
+    beta controls how many H- directions are projected out:
+        beta_rank = max(r, round(r * 4 * beta))
+        β=0.3 → ~1.2r (weak suppression)  β=0.7 → ~2.8r (strong suppression)
     """
     if beta_rank is None:
-        beta_rank = r * 2
+        beta_rank = max(r, round(r * 4 * beta))
 
     mu_pos, mu_neg = H_pos_L.mean(0), H_neg_L.mean(0)
     H_pos_c = (H_pos_L - mu_pos).numpy().astype(np.float32)
@@ -150,6 +162,105 @@ def analyze_eigenspectrum(lam_L: torch.Tensor, layer_idx: int, r_max: int = 10):
         cumulative += pct
         bar = '▓' * int(pct / 2)
         print(f"  PC{i+1}: {pct:5.1f}%  cumul {cumulative:5.1f}%  {bar}")
+
+
+# ── cPCA sweep (k × β grid) ──────────────────────────────────────────────────
+
+def sweep_cpca_layer(
+    H_pos_L: torch.Tensor,
+    H_neg_L: torch.Tensor,
+    cpca_fn,
+    k_vals: list = K_SWEEP,
+    beta_vals: list = BETA_SWEEP,
+) -> dict:
+    """
+    Run cPCA for every (k, β) in k_vals × beta_vals at a single layer.
+    Returns {(k, beta): (U [d,k], lam [k])}.
+    """
+    results = {}
+    for beta in beta_vals:
+        for k in k_vals:
+            try:
+                U, lam = cpca_fn(H_pos_L, H_neg_L, r=k, beta=beta)
+                results[(k, beta)] = (U, lam)
+            except Exception as exc:
+                print(f"      k={k}  β={beta:.1f}: failed ({exc})")
+    return results
+
+
+def select_best_cpca(
+    sweep_results: dict,
+    H_pos_L: torch.Tensor,
+    H_neg_L: torch.Tensor,
+    seed: int = 42,
+) -> tuple[torch.Tensor, torch.Tensor, int, float]:
+    """
+    Evaluate each (k, β) by stratified 80/20 held-out probe accuracy on the
+    projected space. Returns (U_best [d,k], lam_best [k], best_k, best_beta).
+    """
+    X = torch.cat([H_pos_L, H_neg_L]).numpy().astype(np.float32)
+    y = np.array([1] * len(H_pos_L) + [0] * len(H_neg_L))
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X, y, test_size=0.2, random_state=seed, stratify=y
+    )
+
+    scores = {}
+    for (k, beta), (U, _) in sweep_results.items():
+        U_np = U.numpy()
+        sc   = StandardScaler()
+        pr_tr = sc.fit_transform(X_tr @ U_np)
+        pr_te = sc.transform(X_te @ U_np)
+        probe = LogisticRegression(max_iter=500, C=1.0)
+        probe.fit(pr_tr, y_tr)
+        scores[(k, beta)] = float(accuracy_score(y_te, probe.predict(pr_te)))
+
+    best_key = max(scores, key=scores.get)
+
+    print(f"\n    {'k':>4}  {'β':>5}  {'probe_acc':>10}")
+    print(f"    {'─' * 24}")
+    for k in K_SWEEP:
+        for beta in BETA_SWEEP:
+            if (k, beta) not in scores:
+                continue
+            mark = ' *' if (k, beta) == best_key else ''
+            print(f"    {k:>4}  {beta:>5.1f}  {scores[(k, beta)]:>10.3f}{mark}")
+
+    best_k, best_beta = best_key
+    U_best, lam_best  = sweep_results[best_key]
+    print(f"    Best: k={best_k}  β={best_beta:.1f}  "
+          f"acc={scores[best_key]:.3f}")
+    return U_best, lam_best, best_k, best_beta
+
+
+def run_cpca_sweep(
+    H_pos: dict,
+    H_neg: dict,
+    selected_layers: list[int],
+    cpca_fn,
+    k_vals: list = K_SWEEP,
+    beta_vals: list = BETA_SWEEP,
+) -> dict:
+    """
+    Run the (k, β) grid sweep at every selected layer, pick the best per layer.
+    Returns {L: (U_best [d, best_k], lam_best [best_k], best_k, best_beta)}.
+    """
+    layer_results = {}
+    for L in selected_layers:
+        if L not in H_pos:
+            continue
+        n_pos = H_pos[L].shape[0]
+        n_neg = H_neg[L].shape[0] if L in H_neg else 0
+        print(f"\n  cPCA sweep at layer {L}  (H+={n_pos}  H-={n_neg})")
+        sweep = sweep_cpca_layer(H_pos[L], H_neg[L], cpca_fn, k_vals, beta_vals)
+        if not sweep:
+            print(f"    All (k, β) combinations failed — skipping layer {L}.")
+            continue
+        U_best, lam_best, best_k, best_beta = select_best_cpca(
+            sweep, H_pos[L], H_neg[L],
+        )
+        analyze_eigenspectrum(lam_best, L)
+        layer_results[L] = (U_best, lam_best, best_k, best_beta)
+    return layer_results
 
 
 # ── Subspace merge ────────────────────────────────────────────────────────────
@@ -228,18 +339,22 @@ def save_subspace(
     beta: float,
     vectors_dir: str,
     layer_scores: dict = None,
+    sweep_meta: dict = None,
 ) -> str:
+    """
+    sweep_meta: optional {L: {'k': int, 'beta': float}} from run_cpca_sweep,
+                storing the best (k, β) chosen per layer.
+    """
     os.makedirs(vectors_dir, exist_ok=True)
     path = os.path.join(vectors_dir, f"{source}_cpca_r{r_final}.pt")
 
-    # Sort selected_layers by probe score (desc) so [0] = top probe-score layer
     if layer_scores:
         sel = sorted(selected_layers,
                      key=lambda L: layer_scores.get(L, 0.0), reverse=True)
     else:
         sel = selected_layers
 
-    torch.save({
+    payload = {
         'U_truth':         U_truth,
         'method':          'threshold_cpca_weighted_merge',
         'selected_layers': sel,
@@ -249,6 +364,10 @@ def save_subspace(
         'source':          source,
         'layer_scores':    {str(L): layer_scores.get(L, 0.0)
                             for L in sel} if layer_scores else {},
-    }, path)
-    print(f"Saved subspace → {path}  shape={tuple(U_truth.shape)}")
+    }
+    if sweep_meta:
+        payload['sweep_meta'] = {str(L): m for L, m in sweep_meta.items()}
+
+    torch.save(payload, path)
+    print(f"Saved subspace -> {path}  shape={tuple(U_truth.shape)}")
     return path
