@@ -19,7 +19,7 @@ from phase2.run import run_phase2_all_sources
 from phase3.evaluate import run_phase3_evaluation
 from phase3.select import select_best_steered_config
 
-CONFIGS    = ['S1', 'S2', 'S3', 'S4']
+CFG_ID     = 'S2'   # fixed 60/20/20 split
 MODEL_TAGS = ['llama32_3b', 'phi2', 'qwen25_3b', 'qwen25_math1.5b']
 RATIOS     = [0.5, 0.6, 0.7, 0.8, 0.9]
 
@@ -55,31 +55,29 @@ def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Device: {device}")
 
-    splits = build_all_splits('gsm8k/train.jsonl', seed=42)
+    splits    = build_all_splits('gsm8k/train.jsonl', seed=42)
+    D_train   = splits[CFG_ID]['D_train']
+    D_steer   = splits[CFG_ID]['D_steer']
+    D_val     = splits[CFG_ID]['D_val']
+    cache_dir = f"cache/{CFG_ID}"
 
-    for cfg_id in CONFIGS:
-        D_train = splits[cfg_id]['D_train']
-        D_steer = splits[cfg_id]['D_steer']
-        D_val   = splits[cfg_id]['D_val']
-        cache_dir = f"cache/{cfg_id}"
+    # ── Offline compression (once, shared across backbones) ──────────────────
+    try:
+        from llmlingua import PromptCompressor
+        compressor = PromptCompressor(
+            model_name="microsoft/llmlingua-2-xlm-roberta-large-meetingbank",
+            use_llmlingua2=True,
+            device_map="cuda" if torch.cuda.is_available() else "cpu",
+        )
+        build_ccot_cache(D_train, RATIOS, cache_dir, compressor)
+    except ImportError:
+        print("llmlingua not installed — skipping compression cache build. "
+              "Ensure cache files exist before running CCoT training.")
 
-        # ── Offline compression (once per config, shared across backbones) ────
-        try:
-            from llmlingua import PromptCompressor
-            compressor = PromptCompressor(
-                model_name="microsoft/llmlingua-2-xlm-roberta-large-meetingbank",
-                use_llmlingua2=True,
-                device_map="cuda" if torch.cuda.is_available() else "cpu",
-            )
-            build_ccot_cache(D_train, RATIOS, cache_dir, compressor)
-        except ImportError:
-            print("llmlingua not installed — skipping compression cache build. "
-                  "Ensure cache files exist before running CCoT training.")
-
-        for model_tag in MODEL_TAGS:
+    for model_tag in MODEL_TAGS:
             base_model_id = MODEL_ID_MAP[model_tag]
-            ckpt_dir      = f"checkpoints/{cfg_id}/{model_tag}"
-            results_dir   = f"results/{cfg_id}/{model_tag}"
+            ckpt_dir      = f"checkpoints/{CFG_ID}/{model_tag}"
+            results_dir   = f"results/{CFG_ID}/{model_tag}"
 
             # ── Phase 1 training ──────────────────────────────────────────────
             cot_out = os.path.join(ckpt_dir, 'cot')
@@ -115,7 +113,7 @@ def main():
             print_comparison_table(phase1_results)
 
             # ── Phase 2: truth vector extraction ─────────────────────────────
-            vectors_dir = f"vectors/{cfg_id}/{model_tag}"
+            vectors_dir = f"vectors/{CFG_ID}/{model_tag}"
             run_phase2_all_sources(
                 model_tag=model_tag,
                 base_model_id=base_model_id,
@@ -143,21 +141,15 @@ def main():
 
 def run_phase4():
     """
-    Select the winning split config and run the single-pass D_test evaluation.
+    Run the single-pass D_test evaluation using the locked configs in selected.yaml.
     Phase 4 is invoked as a subprocess so that the load_test_set() guard
     in utils/data.py sees 'evaluate_final.py' as the permitted caller.
     """
-    from scripts.selection import select_best_config
-    from scripts.build_splits import build_all_splits
-
-    splits = build_all_splits('gsm8k/train.jsonl', seed=42)
-    winner, _ = select_best_config(splits, 'results', MODEL_TAGS)
-
     if not os.path.exists('configs/selected.yaml'):
-        print("[PH4] configs/selected.yaml missing — selection step failed, skipping Phase 4.")
+        print("[PH4] configs/selected.yaml missing — Phase 3 selection incomplete, skipping Phase 4.")
         return
 
-    print(f"\n[PH4] Launching evaluate_final.py (winning config = {winner})...")
+    print(f"\n[PH4] Launching evaluate_final.py (split={CFG_ID})...")
     result = subprocess.run(
         [sys.executable, 'evaluate_final.py'],
         check=False,
