@@ -14,7 +14,6 @@ import json
 import os
 
 RATIOS = [0.5, 0.6, 0.7, 0.8, 0.9]
-TRAIN_POOL = "gsm8k/train.jsonl"
 
 
 def _build_cache(D_train: list, cache_dir: str, compressor):
@@ -57,8 +56,10 @@ def main():
                      help="Single split config to build cache for (default: S1)")
     grp.add_argument("--all", action="store_true",
                      help="Build cache for all four split configs")
-    parser.add_argument("--pool", default=TRAIN_POOL,
-                        help="Path to GSM8K train pool JSONL")
+    parser.add_argument("--pool", default=None,
+                        help="Path to train pool JSONL (default: active dataset)")
+    parser.add_argument("--dataset", default=None, choices=("gsm8k", "svamp", "prontoqa"),
+                        help="Active dataset id when --pool is omitted")
     args = parser.parse_args()
 
     try:
@@ -78,8 +79,14 @@ def main():
         device_map=device,
     )
 
+    import sys
+
     from scripts.build_splits import build_all_splits
-    splits = build_all_splits(args.pool, seed=42)
+    from utils.dataset_paths import get_train_pool_path, init_project_dataset
+
+    init_project_dataset(args.dataset, interactive=sys.stdin.isatty())
+    pool = args.pool or get_train_pool_path()
+    splits = build_all_splits(pool, seed=42)
 
     configs = list(splits.keys()) if args.all else [args.config]
     for cfg_id in configs:

@@ -2,10 +2,16 @@
 
 D_test is loaded exactly once. This file is run exactly once.
 No hyperparameter is changed after Phase 3. No result inspires a rerun.
+
+Phase 5 (SVAMP transfer): use ``--dataset svamp`` and ``--results-dir`` (e.g.
+``results/final_svamp_transfer``) so GSM8K final JSON is not overwritten; vectors
+and checkpoints still come from ``vectors/{winner}/<model>/`` (GSM8K pipeline).
 """
+import argparse
 import glob as _glob
 import json
 import os
+import sys
 import time
 from dataclasses import asdict, dataclass
 from typing import Optional
@@ -15,6 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from utils.data import load_test_set
+from utils.dataset_paths import get_active_dataset_id, init_project_dataset
 from phase1.inference import (
     extract_answer,
     extract_reasoning_span,
@@ -978,9 +985,15 @@ def print_paired_ci_table(paired_cis: dict):
 
 # ── Persistence ────────────────────────────────────────────────────────────────
 
-def save_final_results(all_results: dict, out_dir: str):
+def save_final_results(
+    all_results: dict,
+    out_dir: str,
+    provenance: Optional[dict] = None,
+):
     os.makedirs(out_dir, exist_ok=True)
     summary = _build_summary(all_results, next(iter(all_results.values()))['metrics']['full_cot'].n_total if all_results else 0)
+    if provenance:
+        summary = {'provenance': provenance, **summary}
     for model_tag, data in all_results.items():
         out_path = os.path.join(out_dir, f"{model_tag}_test.json")
         def _ser_br(br) -> dict:
@@ -1005,6 +1018,15 @@ def save_final_results(all_results: dict, out_dir: str):
                 k: _ser_br(v) for k, v in data.get('paired_cis', {}).items()
             },
         }
+        if provenance:
+            wc = provenance['winning_config']
+            vb = provenance.get('vectors_base', 'vectors')
+            cb = provenance.get('checkpoints_base', 'checkpoints')
+            serializable['provenance'] = {
+                **provenance,
+                'vectors_dir': os.path.join(vb, wc, model_tag),
+                'checkpoints_dir': os.path.join(cb, wc, model_tag),
+            }
         with open(out_path, 'w') as f:
             json.dump(serializable, f, indent=2)
         print(f"  Saved: {out_path}")
@@ -1362,7 +1384,31 @@ def run_final_evaluation(
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
+def _print_transfer_artifact_banner(winning_config: str) -> None:
+    bar = '=' * 72
+    print(f"\n{bar}")
+    print('  NON-GSM8K D_TEST: vectors and checkpoints are NOT dataset-suffixed.')
+    print(f'  They load from vectors/{winning_config}/<model>/ and checkpoints/{winning_config}/<model>/')
+    print('  For Phase 5 transfer, those directories MUST be from your GSM8K pipeline run')
+    print('  (no SVAMP re-tuning of v_truth or alpha_star).')
+    print(f"{bar}\n")
+
+
 def main():
+    parser = argparse.ArgumentParser(description='Phase 4 final evaluation on D_test.')
+    parser.add_argument(
+        '--dataset', default=None, choices=('gsm8k', 'svamp', 'prontoqa'),
+        help='Dataset id (default: CCOT_DATASET env, configs/active_dataset.txt, or prompt)',
+    )
+    parser.add_argument(
+        '--results-dir',
+        default='results/final',
+        help='Directory for summary_test.json and <model>_test.json (default: results/final)',
+    )
+    args, _unknown = parser.parse_known_args()
+
+    init_project_dataset(args.dataset, interactive=sys.stdin.isatty())
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"[PH4] Device: {device}")
 
@@ -1370,14 +1416,25 @@ def main():
     np.random.seed(0)
 
     cfg = _load_selected_yaml('configs/selected.yaml')
-    print(f"[PH4] Winning config: {cfg['winning_config']}")
+    winning = cfg['winning_config']
+    print(f"[PH4] Winning config: {winning}")
 
-    D_test = load_test_set('gsm8k/test.jsonl')
+    if get_active_dataset_id() != 'gsm8k':
+        _print_transfer_artifact_banner(winning)
+
+    D_test = load_test_set()
     print(f"[PH4] Loaded D_test: {len(D_test)} examples")
 
     all_results = run_final_evaluation(D_test, cfg, device)
-    save_final_results(all_results, 'results/final')
-    print(f"\n[PH4] Done. Results saved to results/final/")
+    provenance = {
+        'eval_dataset': get_active_dataset_id(),
+        'steering_artifact_policy': 'frozen_from_gsm8k_pipeline',
+        'winning_config': winning,
+        'vectors_base': 'vectors',
+        'checkpoints_base': 'checkpoints',
+    }
+    save_final_results(all_results, args.results_dir, provenance=provenance)
+    print(f"\n[PH4] Done. Results saved to {args.results_dir}/")
 
 
 if __name__ == '__main__':

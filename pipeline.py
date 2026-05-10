@@ -8,6 +8,7 @@ Usage
   python pipeline.py --phase 2 --config S2
   python pipeline.py --phase 3
   python pipeline.py --phase 4                       # delegates to evaluate_final.py
+  python pipeline.py --phase 5                       # SVAMP transfer eval (frozen GSM8K steering)
 
 Checkpoint resume: every step checks whether its output file already exists and
 skips if so — safe to re-run after interruption.
@@ -22,6 +23,13 @@ import yaml
 
 from scripts.build_splits import build_all_splits
 from scripts.selection import select_best_config
+from utils.dataset_paths import (
+    get_active_dataset_id,
+    get_test_path,
+    get_train_pool_path,
+    init_project_dataset,
+    phase4_subprocess_env,
+)
 from phase1.compress import build_ccot_cache, load_cache
 from phase1.train import train_cot, train_ccot
 from phase1.evaluate import run_phase1_evaluation, print_comparison_table
@@ -214,11 +222,45 @@ def _run_phase4():
         print("[PH4] configs/selected.yaml missing — run split selection first.")
         sys.exit(1)
     print("Delegating to evaluate_final.py (the only script that may open test.jsonl).")
-    result = subprocess.run([sys.executable, 'evaluate_final.py'], check=False)
+    result = subprocess.run(
+        [sys.executable, 'evaluate_final.py'],
+        check=False,
+        env=phase4_subprocess_env(),
+    )
     if result.returncode != 0:
         print(f"[PH4] evaluate_final.py exited with code {result.returncode}")
         sys.exit(result.returncode)
     print("[PH4] Final evaluation complete.")
+
+
+def _run_phase5():
+    print("\n" + "=" * 70)
+    print("PHASE 5: SVAMP transfer evaluation (GSM8K-frozen v_truth, alpha_star)")
+    print("=" * 70)
+    if not _done("configs/selected.yaml"):
+        print("[PH5] configs/selected.yaml missing — run split selection / Phase 3 first.")
+        sys.exit(1)
+    print(
+        "Delegating to evaluate_final.py: D_test=SVAMP, same vectors/checkpoints as Phase 4."
+    )
+    env = os.environ.copy()
+    env["CCOT_DATASET"] = "svamp"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "evaluate_final.py",
+            "--dataset",
+            "svamp",
+            "--results-dir",
+            "results/final_svamp_transfer",
+        ],
+        check=False,
+        env=env,
+    )
+    if result.returncode != 0:
+        print(f"[PH5] evaluate_final.py exited with code {result.returncode}")
+        sys.exit(result.returncode)
+    print("[PH5] Transfer evaluation complete.")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -231,7 +273,7 @@ def main():
     )
     parser.add_argument(
         '--phase', type=int, default=0,
-        help='0=all  1=train+eval  2=vectors  3=steer  4=test',
+        help='0=all  1=train+eval  2=vectors  3=steer  4=test  5=svamp_transfer',
     )
     parser.add_argument(
         '--config', type=str, default='all',
@@ -245,7 +287,22 @@ def main():
         '--device', type=str,
         default='cuda' if torch.cuda.is_available() else 'cpu',
     )
+    parser.add_argument(
+        '--dataset', type=str, default=None,
+        choices=('gsm8k', 'svamp', 'prontoqa'),
+        help='Dataset id (omit to prompt interactively on a TTY, or set CCOT_DATASET)',
+    )
     args = parser.parse_args()
+
+    if args.phase == 5:
+        _run_phase5()
+        return
+
+    init_project_dataset(args.dataset, interactive=sys.stdin.isatty())
+    print(
+        f"Dataset: {get_active_dataset_id()}  "
+        f"train_pool={get_train_pool_path()}  D_test={get_test_path()}"
+    )
 
     configs_to_run = CONFIGS if args.config == 'all' else args.config.split(',')
     models_to_run  = MODEL_TAGS if args.model == 'all' else args.model.split(',')
@@ -261,7 +318,7 @@ def main():
     print(f"Configs: {configs_to_run}")
     print(f"Models:  {models_to_run}")
 
-    splits = build_all_splits('gsm8k/train.jsonl', seed=42)
+    splits = build_all_splits(get_train_pool_path(), seed=42)
 
     if args.phase in (0, 1):
         _run_phase1(configs_to_run, models_to_run, splits, args.device)

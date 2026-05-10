@@ -42,9 +42,17 @@ def build_all_splits(pool_path: str, seed: int = 42, out_dir: str = None) -> Dic
 
 if __name__ == '__main__':
     import argparse
+    import sys
+
+    from utils.dataset_paths import get_train_pool_path, init_project_dataset
+
     p = argparse.ArgumentParser()
-    p.add_argument('--pool', default='gsm8k/train.jsonl')
+    p.add_argument('--pool', default=None, help='Train pool JSONL (default: active dataset train.jsonl)')
+    p.add_argument('--dataset', default=None, choices=('gsm8k', 'svamp', 'prontoqa'),
+                   help='Active dataset id (used when --pool is omitted)')
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--out', default='configs/splits')
     args = p.parse_args()
-    build_all_splits(args.pool, seed=args.seed, out_dir=args.out)
+    init_project_dataset(args.dataset, interactive=sys.stdin.isatty())
+    pool = args.pool or get_train_pool_path()
+    build_all_splits(pool, seed=args.seed, out_dir=args.out)

@@ -1,4 +1,5 @@
 # ── Data ──────────────────────────────────────────────────────────────────
+# Runtime paths come from utils/dataset_paths (CCOT_DATASET, configs/active_dataset.txt, or prompt).
 seed: 42
 train_pool: gsm8k/train.jsonl
 test_path:  gsm8k/test.jsonl   # never opened outside evaluate_final.py

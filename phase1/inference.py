@@ -11,10 +11,13 @@ from peft import PeftModel
 # ── Answer extraction ─────────────────────────────────────────────────────────
 
 def extract_answer(text: str) -> str | None:
-    """Return the numeric answer string from model output, or None."""
+    """Return the final answer string from model output (number, bool word, or #### suffix), or None."""
     text = text.strip()
     if '####' in text:
         return text.split('####')[1].strip()
+    m_bool = re.search(r'\b(true|false)\b', text, flags=re.I)
+    if m_bool:
+        return m_bool.group(1).lower()
     # Match integers and decimals, including comma-separated thousands
     numbers = re.findall(r'-?\d+(?:,\d{3})*(?:\.\d+)?', text)
     if numbers:

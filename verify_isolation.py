@@ -13,21 +13,22 @@ import json
 import sys
 
 
-TRAIN_POOL = "gsm8k/train.jsonl"
-TEST_PATH  = "gsm8k/test.jsonl"
-
-
 def main():
     from scripts.build_splits import build_all_splits
+    from utils.dataset_paths import get_test_path, get_train_pool_path, init_project_dataset
 
-    splits = build_all_splits(TRAIN_POOL, seed=42)
+    init_project_dataset(None, interactive=sys.stdin.isatty())
+    train_pool = get_train_pool_path()
+    test_path = get_test_path()
+
+    splits = build_all_splits(train_pool, seed=42)
 
     # Load test IDs
     try:
-        with open(TEST_PATH, encoding="utf-8") as f:
+        with open(test_path, encoding="utf-8") as f:
             test_ids = {json.loads(l)["id"] for l in f}
     except FileNotFoundError:
-        print(f"[warn] Test file not found: {TEST_PATH}  (skipping D_test checks)")
+        print(f"[warn] Test file not found: {test_path}  (skipping D_test checks)")
         test_ids = set()
 
     failures = []

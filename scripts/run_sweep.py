@@ -5,6 +5,7 @@ Flow:
   Selection:  scripts/selection.py picks the winning split by mean Wilson CI.
   Phase 4:    evaluate_final.py runs once on D_test with locked configs.
 """
+import argparse
 import os
 import subprocess
 import sys
@@ -12,6 +13,13 @@ import torch
 import yaml
 
 from scripts.build_splits import build_all_splits
+from utils.dataset_paths import (
+    get_active_dataset_id,
+    get_test_path,
+    get_train_pool_path,
+    init_project_dataset,
+    phase4_subprocess_env,
+)
 from phase1.compress import build_ccot_cache, load_cache
 from phase1.train import train_cot, train_ccot
 from phase1.evaluate import run_phase1_evaluation, print_comparison_table
@@ -52,10 +60,22 @@ def _update_selected_phase3_best(model_tag: str, selection: dict) -> None:
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument(
+        '--dataset', default=None, choices=('gsm8k', 'svamp', 'prontoqa'),
+        help='Dataset id (omit to prompt on a TTY or use CCOT_DATASET / configs/active_dataset.txt)',
+    )
+    args, _rest = ap.parse_known_args()
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Device: {device}")
 
-    splits    = build_all_splits('gsm8k/train.jsonl', seed=42)
+    init_project_dataset(args.dataset, interactive=sys.stdin.isatty())
+    print(
+        f"Dataset: {get_active_dataset_id()}  "
+        f"train_pool={get_train_pool_path()}  D_test={get_test_path()}"
+    )
+    splits    = build_all_splits(get_train_pool_path(), seed=42)
     D_train   = splits[CFG_ID]['D_train']
     D_steer   = splits[CFG_ID]['D_steer']
     D_val     = splits[CFG_ID]['D_val']
@@ -153,6 +173,7 @@ def run_phase4():
     result = subprocess.run(
         [sys.executable, 'evaluate_final.py'],
         check=False,
+        env=phase4_subprocess_env(),
     )
     if result.returncode != 0:
         print(f"[PH4] evaluate_final.py exited with code {result.returncode}")
