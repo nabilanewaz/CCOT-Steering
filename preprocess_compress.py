@@ -1,13 +1,11 @@
 """Build the offline compression cache for CCoT training.
 
 Run once before Phase 1 training.  Compresses every reasoning trace in D_train
-(largest split S1 — all smaller splits are subsets) at each ratio and writes
-JSONL files to cache/{cfg_id}/compressed_R*.jsonl.
+at each ratio and writes JSONL files to cache/S2/compressed_R*.jsonl.
 
 Usage:
-    python preprocess_compress.py              # uses S1 (largest D_train)
-    python preprocess_compress.py --config S2  # single split config
-    python preprocess_compress.py --all        # all four split configs
+    python preprocess_compress.py              # uses S2 (default)
+    python preprocess_compress.py --all        # all split configs (also just S2)
 """
 import argparse
 import json
@@ -52,8 +50,8 @@ def _build_cache(D_train: list, cache_dir: str, compressor):
 def main():
     parser = argparse.ArgumentParser(description="Build CCoT compression cache.")
     grp = parser.add_mutually_exclusive_group()
-    grp.add_argument("--config", type=str, default="S1",
-                     help="Single split config to build cache for (default: S1)")
+    grp.add_argument("--config", type=str, default="S2",
+                     help="Single split config to build cache for (default: S2)")
     grp.add_argument("--all", action="store_true",
                      help="Build cache for all four split configs")
     parser.add_argument("--pool", default=None,
