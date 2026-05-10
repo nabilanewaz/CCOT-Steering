@@ -38,7 +38,7 @@ from phase3.evaluate import run_phase3_evaluation
 from phase3.select import select_best_steered_config
 
 
-CONFIGS = ['S1', 'S2', 'S3', 'S4']
+CONFIGS = ['S2']
 MODEL_TAGS = ['llama32_3b', 'phi2', 'qwen25_3b', 'qwen25_math1.5b']
 RATIOS = [0.5, 0.6, 0.7, 0.8, 0.9]
 
@@ -66,6 +66,7 @@ def _update_selected_phase3_best(model_tag: str, selection: dict) -> None:
     phase3_best = dict(cfg.get('phase3_best') or {})
     phase3_best[model_tag] = selection
     cfg['phase3_best'] = phase3_best
+    cfg['winning_config'] = 'S2'
     os.makedirs('configs', exist_ok=True)
     with open(path, 'w') as f:
         yaml.safe_dump(cfg, f, sort_keys=False)

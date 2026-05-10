@@ -1,8 +1,8 @@
 # ── Data ──────────────────────────────────────────────────────────────────
 # Runtime paths come from utils/dataset_paths (CCOT_DATASET, configs/active_dataset.txt, or prompt).
 seed: 42
-train_pool: gsm8k/train.jsonl
-test_path:  gsm8k/test.jsonl   # never opened outside evaluate_final.py
+train_pool: null   # resolved at runtime via utils/dataset_paths (CCOT_DATASET / configs/active_dataset.txt)
+test_path:  null   # resolved at runtime; never opened outside evaluate_final.py
 
 split: S2          # fixed 60% train / 20% steer / 20% val
 split_ratios: [0.60, 0.20, 0.20]

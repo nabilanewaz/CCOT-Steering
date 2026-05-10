@@ -1146,7 +1146,7 @@ def run_final_evaluation(
             try:
                 L_star_base = get_injection_layer(vectors_dir, 'base')
             except FileNotFoundError:
-                L_star_base = meta.get('base_layer_star', meta.get('ccot_layer_star', 14))
+                L_star_base = meta.get('base_best_layer', meta.get('ccot_best_layer', 14))
             try:
                 alpha_base = _load_alpha_file(vectors_dir, 'base')
             except FileNotFoundError:
@@ -1242,7 +1242,7 @@ def run_final_evaluation(
                 try:
                     L_star = get_injection_layer(vectors_dir, source)
                 except FileNotFoundError:
-                    L_star = meta.get(f'{source}_layer_star', meta.get('ccot_layer_star', 14))
+                    L_star = meta.get(f'{source}_best_layer', meta.get('ccot_best_layer', 14))
 
                 # Helper: probe-generate boundary, create hook, run + collect
                 def _make_steered_examples(hook_factory, boundary_fn, cond_name):
