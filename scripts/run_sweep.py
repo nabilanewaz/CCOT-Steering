@@ -51,6 +51,7 @@ def _update_selected_phase3_best(model_tag: str, selection: dict) -> None:
     phase3_best = dict(cfg.get('phase3_best') or {})
     phase3_best[model_tag] = selection
     cfg['phase3_best'] = phase3_best
+    cfg['winning_config'] = 'S2'
 
     os.makedirs('configs', exist_ok=True)
     with open(selected_path, 'w') as f:

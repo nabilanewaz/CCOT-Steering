@@ -234,8 +234,8 @@ def _tune_and_save_alpha(
         'base': os.path.join(checkpoints_dir, 'cot'),
     }
     source_L_star = {
-        'ccot': meta.get('ccot_layer_star'),
-        'base': meta.get('base_layer_star'),
+        'ccot': meta.get('ccot_best_layer'),
+        'base': meta.get('base_best_layer'),
     }
 
     for source in SOURCES:
@@ -250,7 +250,7 @@ def _tune_and_save_alpha(
             try:
                 L_star = get_injection_layer(vectors_dir, source)
             except FileNotFoundError:
-                L_star = meta.get('ccot_layer_star', 14)
+                L_star = meta.get('ccot_best_layer', 14)
 
         print(f"\n[PH3] Tuning alpha  source={source}  L*={L_star}")
         model, tok = load_finetuned(source_ckpt[source], device)
@@ -470,8 +470,8 @@ def run_phase3_evaluation(
             try:
                 L_star = get_injection_layer(vectors_dir, source)
             except FileNotFoundError:
-                L_star = meta.get(f'{source}_layer_star',
-                                  meta.get('ccot_layer_star', 14))
+                L_star = meta.get(f'{source}_best_layer',
+                                  meta.get('ccot_best_layer', 14))
 
             try:
                 v_dom = _load_vector(vectors_dir, source, 'dom')
@@ -646,8 +646,8 @@ def run_phase3_evaluation(
             try:
                 L_star_base = get_injection_layer(vectors_dir, 'base')
             except FileNotFoundError:
-                L_star_base = meta.get('base_layer_star',
-                                       meta.get('ccot_layer_star', 14))
+                L_star_base = meta.get('base_best_layer',
+                                       meta.get('ccot_best_layer', 14))
 
             print(f"  Evaluating: Trimmed + DoM (R={ratio})")
             c_list, f_list, tok_list, lat_list = [], [], [], []
