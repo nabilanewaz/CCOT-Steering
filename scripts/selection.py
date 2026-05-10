@@ -68,7 +68,7 @@ def print_selection_table(scores: dict):
 def select_best_config(splits: dict, results_dir: str, model_tags: list) -> tuple:
     scores = {
         cfg: compute_config_score(results_dir, model_tags, cfg)
-        for cfg in ['S1', 'S2', 'S3', 'S4']
+        for cfg in splits.keys()
     }
 
     print_selection_table(scores)
@@ -98,7 +98,7 @@ def select_best_config(splits: dict, results_dir: str, model_tags: list) -> tupl
             'n_train':          _n_items(splits[winner]['D_train']),
             'n_steer':          _n_items(splits[winner]['D_steer']),
             'n_val':            _n_items(splits[winner]['D_val']),
-            'n_test':           1319,
+            'n_test':           None,
             'selection_metric': 'mean_wilson_lower_steered_val_accuracy',
             'selection_value':  round(scores[winner]['mean_lower'], 4),
             'flip_rate':        round(scores[winner]['mean_flip'],  4),
@@ -125,12 +125,8 @@ if __name__ == '__main__':
         with open(args.splits) as f:
             splits = json.load(f)
     else:
-        # minimal placeholder: fill counts with expected values
         splits = {
-            'S1': {'D_train': 5231, 'D_steer': 747, 'D_val': 1495},
             'S2': {'D_train': 4484, 'D_steer': 1495, 'D_val': 1495},
-            'S3': {'D_train': 4484, 'D_steer': 747, 'D_val': 2242},
-            'S4': {'D_train': 3737, 'D_steer': 1495, 'D_val': 2242},
         }
 
     MODEL_TAGS = ['llama32_3b', 'phi2', 'qwen25_3b', 'qwen25_math1.5b']
