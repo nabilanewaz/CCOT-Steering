@@ -64,6 +64,10 @@ python download_dataset.py --dataset gsm8k
 
 Expected output: `gsm8k/train.jsonl` and `gsm8k/test.jsonl`
 
+> If you downloaded the dataset before 2026-05-15, re-run this step — the IDs were changed
+> from plain integers to namespaced strings (`train_0`, `test_0`, …) to fix a false
+> isolation-check failure. Delete `gsm8k/` first: `rm -rf gsm8k/`
+
 ---
 
 ## 2. Verify Data Isolation
