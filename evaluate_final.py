@@ -1526,6 +1526,7 @@ def run_final_evaluation(
     checkpoints_base: str = 'checkpoints',
     max_new_tokens: int = 256,
     out_dir: str = 'results/final',
+    models: Optional[list] = None,
 ) -> dict:
     """
     Single-pass D_test evaluation using locked Phase 3 configs.
@@ -1537,6 +1538,7 @@ def run_final_evaluation(
     t_phase        = time.time()
     winning_config = cfg['winning_config']
     phase3_best    = _load_phase3_best_configs(cfg, winning_config, results_base)
+    active_models  = [m for m in MODEL_TAGS if models is None or m in models]
     n_test         = len(D_test)
     all_results:   dict = {}
     golds = [item['answer'].split('####')[1].strip() for item in D_test]
@@ -1547,14 +1549,14 @@ def run_final_evaluation(
     print(f"  Phase 4 Final Evaluation")
     print(f"  winning_config  : {winning_config}")
     print(f"  D_test          : {n_test} examples")
-    print(f"  Models          : {MODEL_TAGS}")
+    print(f"  Models          : {active_models}")
     print(f"  Device          : {device}")
     print(f"  out_dir         : {out_dir}")
     print(f"  Bootstrap CIs   : N={N_BOOTSTRAP}  level={CI_LEVEL}  seed={CI_SEED}")
     print(f"  max_new_tokens  : {max_new_tokens}")
     print(bar)
 
-    for m_idx, model_tag in enumerate(MODEL_TAGS, 1):
+    for m_idx, model_tag in enumerate(active_models, 1):
         base_model_id = MODEL_ID_MAP[model_tag]
         results_dir   = os.path.join(results_base, winning_config, model_tag)
         vectors_dir   = os.path.join(vectors_base, winning_config, model_tag)
@@ -2043,6 +2045,12 @@ def main():
         '--max-new-tokens', type=int, default=256,
         help='Max tokens to generate per example (default: 256)',
     )
+    parser.add_argument(
+        '--models', default=None,
+        help='Comma-separated subset of models to evaluate, e.g. '
+             '"qwen25_math1.5b" or "llama32_3b,phi2". '
+             'Default: all four backbones.',
+    )
     args, _unknown = parser.parse_known_args()
 
     # ── Startup banner ────────────────────────────────────────────────────────
@@ -2078,6 +2086,7 @@ def main():
         D_test, cfg, device,
         max_new_tokens=args.max_new_tokens,
         out_dir=args.results_dir,
+        models=args.models.split(',') if args.models else None,
     )
     provenance = {
         'eval_dataset':              get_active_dataset_id(),
