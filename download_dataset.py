@@ -38,7 +38,13 @@ def download_gsm8k(out_dir: str = "gsm8k") -> None:
         raise SystemExit("Install `datasets` (pip install datasets)") from e
 
     os.makedirs(out_dir, exist_ok=True)
-    ds = load_dataset("gsm8k", "main")
+    # Prefer the fully-qualified hub id to avoid collisions with a local
+    # folder named "gsm8k" in the current working directory.
+    try:
+        ds = load_dataset("openai/gsm8k", "main")
+    except Exception:
+        # Backward-compatible fallback for older environments.
+        ds = load_dataset("gsm8k", "main")
     train_path = os.path.join(out_dir, "train.jsonl")
     test_path = os.path.join(out_dir, "test.jsonl")
     n_train = 0
