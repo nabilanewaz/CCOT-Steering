@@ -1211,7 +1211,10 @@ def run_final_evaluation(
 
         # ── Phase C: CCoT model (locked ratio) ────────────────────────────────
         ccot_ckpt = os.path.join(ckpt_dir, f'ccot_R{ratio_int}')
-        if not os.path.exists(os.path.join(ccot_ckpt, 'adapter_config.json')):
+        if not (
+            os.path.exists(os.path.join(ccot_ckpt, 'adapter_config.json'))
+            or os.path.exists(os.path.join(ccot_ckpt, 'config.json'))
+        ):
             print(f"[PH4] CCoT checkpoint missing: {ccot_ckpt} — skipping CCoT conditions")
         else:
             ccot_model, tok_ccot = load_finetuned(ccot_ckpt, device)

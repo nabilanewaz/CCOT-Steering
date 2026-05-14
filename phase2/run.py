@@ -212,7 +212,7 @@ def run_phase2_all_sources(
 
     ccot_prompt_fn = (
         lambda item, ri=ratio_int:
-        f"Question: {item['question']}\n\n[compress:0.{ri}]\n"
+        f"{item['question']}\n<|start-latent|>{'<|latent|>' * ri}<|end-latent|>\n"
     )
     results['ccot'] = run_phase2_source(
         ccot_model, tok_a, D_steer, model_tag,
@@ -238,7 +238,7 @@ def run_phase2_all_sources(
     cot_model.eval()
 
     cot_prompt_fn = (
-        lambda item: f"Question: {item['question']}\n\nReasoning:"
+        lambda item: f"{item['question']}\n<|start-latent|><|latent|><|latent|><|end-latent|>\n"
     )
     results['base'] = run_phase2_source(
         cot_model, tok_b, D_steer, model_tag,

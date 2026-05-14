@@ -36,6 +36,9 @@ from phase3.hooks import (
 RATIOS   = [0.5, 0.6, 0.7, 0.8, 0.9]
 SOURCES  = ('ccot', 'base')
 
+def _checkpoint_ready(path: str) -> bool:
+    return os.path.exists(os.path.join(path, 'adapter_config.json')) or os.path.exists(os.path.join(path, 'config.json'))
+
 
 # ── Data types ─────────────────────────────────────────────────────────────────
 
@@ -436,7 +439,7 @@ def run_phase3_evaluation(
 
         # Load CCoT model for this ratio
         ccot_ckpt  = os.path.join(checkpoints_dir, f'ccot_{rtag}')
-        if not os.path.exists(os.path.join(ccot_ckpt, 'adapter_config.json')):
+        if not _checkpoint_ready(ccot_ckpt):
             print(f"  [SKIP] CCoT checkpoint missing: {ccot_ckpt}")
             continue
         ccot_model, tok_ccot = load_finetuned(ccot_ckpt, device)
@@ -734,7 +737,7 @@ def _run_diagnostic_sweep(
         return
 
     ckpt   = os.path.join(checkpoints_dir, f'ccot_R{ratio_int}')
-    if not os.path.exists(os.path.join(ckpt, 'adapter_config.json')):
+    if not _checkpoint_ready(ckpt):
         print("  [sweep skip] CCoT checkpoint missing.")
         return
 

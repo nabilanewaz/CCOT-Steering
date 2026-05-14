@@ -1,0 +1,3 @@
+[submodule "Coconut-Steering"]
+	path = Coconut-Steering
+	url = https://github.com/CrypticFate/Coconut-Steering.git

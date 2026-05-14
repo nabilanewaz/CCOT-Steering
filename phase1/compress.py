@@ -3,6 +3,8 @@ import os
 
 
 def compress_reasoning(reasoning: str, ratio: float, compressor) -> str:
+    if compressor is None:
+        return reasoning
     result = compressor.compress_prompt(
         reasoning,
         rate=ratio,
@@ -12,8 +14,14 @@ def compress_reasoning(reasoning: str, ratio: float, compressor) -> str:
     return result['compressed_prompt']
 
 
-def build_ccot_cache(D_train: list, ratios: list, cache_dir: str, compressor) -> None:
-    """Offline: compress every D_train reasoning trace at each ratio and save to JSONL."""
+def build_ccot_cache(D_train: list, ratios: list, cache_dir: str, compressor=None) -> None:
+    """
+    Build phase1 cache files used by pipeline contract.
+
+    In Coconut phase1, ratio-specific textual compression is not used for training,
+    but phase orchestration still expects cache/<cfg>/compressed_R*.jsonl files.
+    We therefore emit deterministic placeholder records preserving the old schema.
+    """
     os.makedirs(cache_dir, exist_ok=True)
     for ratio in ratios:
         cache_path = os.path.join(cache_dir, f"compressed_R{int(ratio * 10)}.jsonl")

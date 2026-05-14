@@ -8,4 +8,4 @@ scipy
 scikit-learn
 pyyaml
 tqdm
-llmlingua
+matplotlib

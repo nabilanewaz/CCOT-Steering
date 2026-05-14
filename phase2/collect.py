@@ -2,6 +2,7 @@ from collections import defaultdict
 from typing import Callable
 
 import torch
+from tqdm.auto import tqdm
 
 from phase1.inference import extract_answer, normalize_answer
 from phase2.loaders import get_transformer_layers
@@ -27,8 +28,12 @@ def _register_all_hooks(model) -> tuple[list, dict]:
                 return
             bidx = captured['boundary_idx']
             h = output[0]
-            if bidx < h.shape[1]:
-                captured[L] = h[:, bidx, :].detach().cpu()
+            # Decoder layers may return (B, S, D) or (S, D) depending on transformers version.
+            if h.dim() == 3:
+                if bidx < h.shape[1]:
+                    captured[L] = h[:, bidx, :].detach().cpu()
+            elif h.dim() == 2 and bidx < h.shape[0]:
+                captured[L] = h[bidx, :].detach().cpu()
         return hook
 
     for L, layer in enumerate(layers):
@@ -71,8 +76,21 @@ def collect_hidden_states(
         prompt_fn = lambda item: item['question']
 
     n_used = n_skipped = 0
+    n_questions = len(D_steer)
+    print(
+        f"  Collecting [{source_tag}]: {n_questions} steer questions × {N} rollouts "
+        f"(each rollout: generate + full forward for hooks). Progress updates every question.",
+        flush=True,
+    )
 
-    for item_idx, item in enumerate(D_steer):
+    pbar = tqdm(
+        enumerate(D_steer),
+        total=n_questions,
+        desc=f"collect[{source_tag}]",
+        unit="q",
+        dynamic_ncols=True,
+    )
+    for item_idx, item in pbar:
         prompt = prompt_fn(item)
         input_enc = tokenizer(prompt, return_tensors='pt').to(device)
         gold = normalize_answer(item['answer'].split('####')[1].strip())
@@ -83,11 +101,18 @@ def collect_hidden_states(
         item_h_neg: dict = defaultdict(list)
         item_n_pos = item_n_neg = 0
 
-        for _ in range(N):
+        for r_idx in range(N):
             # Clear state from the previous rollout
             captured.pop('boundary_idx', None)
             for L in range(num_layers):
                 captured.pop(L, None)
+
+            pbar.set_postfix(
+                roll=f"{r_idx + 1}/{N}",
+                used=n_used,
+                skip=n_skipped,
+                refresh=True,
+            )
 
             # Sampling rollout — hooks are no-ops here (boundary_idx not set)
             with torch.no_grad():
@@ -96,6 +121,7 @@ def collect_hidden_states(
                     do_sample=True,
                     temperature=1.0,
                     max_new_tokens=256,
+                    pad_token_id=tokenizer.pad_token_id,
                 )
 
             try:
@@ -129,6 +155,9 @@ def collect_hidden_states(
         # Skip questions with no contrast (always right or always wrong)
         if item_n_pos == 0 or item_n_neg == 0:
             n_skipped += 1
+            n_pos = len(H_plus_raw[0]) if 0 in H_plus_raw else 0
+            n_neg = len(H_minus_raw[0]) if 0 in H_minus_raw else 0
+            pbar.set_postfix(used=n_used, skip=n_skipped, Hp=n_pos, Hm=n_neg, refresh=True)
             continue
 
         n_used += 1
@@ -139,12 +168,9 @@ def collect_hidden_states(
             bucket_pos[L].extend([bkt] * len(item_h_pos[L]))
             bucket_neg[L].extend([bkt] * len(item_h_neg[L]))
 
-        if (item_idx + 1) % 50 == 0:
-            n_pos = len(H_plus_raw[0]) if 0 in H_plus_raw else 0
-            n_neg = len(H_minus_raw[0]) if 0 in H_minus_raw else 0
-            print(f"  [{item_idx+1}/{len(D_steer)}]  "
-                  f"used={n_used}  skipped={n_skipped}  "
-                  f"H+ per layer ~{n_pos}  H- per layer ~{n_neg}")
+        n_pos = len(H_plus_raw[0]) if 0 in H_plus_raw else 0
+        n_neg = len(H_minus_raw[0]) if 0 in H_minus_raw else 0
+        pbar.set_postfix(used=n_used, skip=n_skipped, Hp=n_pos, Hm=n_neg, refresh=True)
 
     for h in handles:
         h.remove()

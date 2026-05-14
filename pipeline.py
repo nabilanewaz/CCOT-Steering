@@ -30,8 +30,8 @@ from utils.dataset_paths import (
     init_project_dataset,
     phase4_subprocess_env,
 )
-from phase1.compress import build_ccot_cache, load_cache
-from phase1.train import train_cot, train_ccot
+from phase1.compress import build_ccot_cache
+from phase1.train import train_coconut_phase1
 from phase1.evaluate import run_phase1_evaluation, print_comparison_table
 from phase2.run import run_phase2_all_sources
 from phase3.evaluate import run_phase3_evaluation
@@ -54,6 +54,9 @@ MODEL_ID_MAP = {
 
 def _done(path: str) -> bool:
     return os.path.exists(path)
+
+def _checkpoint_ready(path: str) -> bool:
+    return _done(os.path.join(path, "adapter_config.json")) or _done(os.path.join(path, "config.json"))
 
 
 def _update_selected_phase3_best(model_tag: str, selection: dict) -> None:
@@ -84,49 +87,31 @@ def _run_phase1(configs_to_run, models_to_run, splits, device):
         D_val     = splits[cfg_id]['D_val']
         cache_dir = f"cache/{cfg_id}"
 
-        # Build compression cache once per split config
-        try:
-            from llmlingua import PromptCompressor
-            compressor = PromptCompressor(
-                model_name="microsoft/llmlingua-2-xlm-roberta-large-meetingbank",
-                use_llmlingua2=True,
-                device_map="cuda" if torch.cuda.is_available() else "cpu",
-            )
-            build_ccot_cache(D_train, RATIOS, cache_dir, compressor)
-        except ImportError:
-            print("[warn] llmlingua not installed — skipping cache build. "
-                  "Ensure cache/*.jsonl files exist before CCoT training.")
+        # In Coconut phase1, this creates compatibility cache files for pipeline contracts.
+        build_ccot_cache(D_train, RATIOS, cache_dir, compressor=None)
 
         for model_tag in models_to_run:
             base_id  = MODEL_ID_MAP[model_tag]
             ckpt_dir = f"checkpoints/{cfg_id}/{model_tag}"
             res_dir  = f"results/{cfg_id}/{model_tag}"
 
-            # Stage 1: CoT
             cot_out = os.path.join(ckpt_dir, 'cot')
-            if not _done(os.path.join(cot_out, 'adapter_config.json')):
-                print(f"\n[{cfg_id}][{model_tag}] Stage 1: CoT fine-tuning")
-                train_cot(base_id, D_train, cot_out, model_tag)
+            all_ccot_ready = all(
+                _checkpoint_ready(os.path.join(ckpt_dir, f"ccot_R{int(r * 10)}"))
+                for r in RATIOS
+            )
+            if not (_checkpoint_ready(cot_out) and all_ccot_ready):
+                print(f"\n[{cfg_id}][{model_tag}] Coconut phase1 single-run (50 epochs) + compat export")
+                train_coconut_phase1(
+                    base_model_id=base_id,
+                    D_train=D_train,
+                    checkpoints_dir=ckpt_dir,
+                    results_dir=res_dir,
+                    model_tag=model_tag,
+                    ratios=RATIOS,
+                )
             else:
-                print(f"[{cfg_id}][{model_tag}] CoT checkpoint exists — skipping")
-
-            # Stage 2: CCoT per ratio
-            for ratio in RATIOS:
-                rtag     = f"R{int(ratio * 10)}"
-                ccot_out = os.path.join(ckpt_dir, f"ccot_{rtag}")
-                if _done(os.path.join(ccot_out, 'adapter_config.json')):
-                    print(f"[{cfg_id}][{model_tag}] CCoT {rtag} exists — skipping")
-                    continue
-                cache_path = os.path.join(cache_dir, f"compressed_{rtag}.jsonl")
-                if not _done(cache_path):
-                    raise FileNotFoundError(
-                        f"Compression cache missing: {cache_path}\n"
-                        "Run:  python preprocess_compress.py"
-                    )
-                compressed_cache = load_cache(cache_path)
-                print(f"\n[{cfg_id}][{model_tag}] Stage 2: CCoT R={ratio}")
-                train_ccot(base_id, D_train, compressed_cache,
-                           ratio, ccot_out, model_tag)
+                print(f"[{cfg_id}][{model_tag}] Coconut canonical + compat checkpoints exist — skipping")
 
             # Phase 1 evaluation
             out_path = os.path.join(res_dir, 'phase1_val.json')

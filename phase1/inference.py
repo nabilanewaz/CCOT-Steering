@@ -5,7 +5,7 @@ import re
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft import PeftModel
+from utils.torch_compat import patch_transformers_custom_op_registration
 
 
 # ── Answer extraction ─────────────────────────────────────────────────────────
@@ -52,6 +52,7 @@ def _trust(model_id: str) -> bool:
 
 def load_base_frozen(base_model_id: str, device: str):
     """Load the untuned base model (no LoRA)."""
+    patch_transformers_custom_op_registration()
     trust = _trust(base_model_id)
     tokenizer = AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=trust)
     if tokenizer.pad_token is None:
@@ -65,12 +66,20 @@ def load_base_frozen(base_model_id: str, device: str):
 
 def load_finetuned(checkpoint_dir: str, device: str):
     """Load a LoRA-fine-tuned model from a directory saved by PeftModel.save_pretrained."""
+    patch_transformers_custom_op_registration()
     tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     adapter_cfg_path = os.path.join(checkpoint_dir, 'adapter_config.json')
     if os.path.exists(adapter_cfg_path):
+        try:
+            from peft import PeftModel
+        except Exception as e:
+            raise RuntimeError(
+                f"Checkpoint at {checkpoint_dir} is a LoRA adapter but `peft` failed to import. "
+                "Install compatible `peft`/`transformers` versions or use a full-model checkpoint."
+            ) from e
         with open(adapter_cfg_path) as f:
             adapter_cfg = json.load(f)
         base_id = adapter_cfg.get('base_model_name_or_path', checkpoint_dir)
@@ -107,7 +116,7 @@ def run_no_cot(model, tokenizer, item: dict, device: str) -> tuple[str | None, s
 
 def run_cot(model, tokenizer, item: dict, device: str) -> tuple[str | None, str]:
     enc = tokenizer(
-        f"Question: {item['question']}\n\nReasoning:",
+        f"{item['question']}\n<|start-latent|><|latent|><|latent|><|end-latent|>\n",
         return_tensors='pt',
     ).to(device)
     with torch.no_grad():
@@ -115,16 +124,18 @@ def run_cot(model, tokenizer, item: dict, device: str) -> tuple[str | None, str]
     generated = tokenizer.decode(
         out[0][enc['input_ids'].shape[1]:], skip_special_tokens=True
     )
-    parts = generated.split('\n\nAnswer:')
+    parts = generated.split('####')
     reasoning = parts[0].strip()
-    raw_answer = parts[1].strip() if len(parts) > 1 else ''
+    raw_answer = parts[1].strip() if len(parts) > 1 else generated
     return extract_answer(raw_answer), reasoning
 
 
 def run_ccot(model, tokenizer, item: dict, ratio: float,
              device: str) -> tuple[str | None, str]:
+    n_latents = max(1, int(round(6 * ratio)))
+    latent_span = "<|latent|>" * n_latents
     enc = tokenizer(
-        f"Question: {item['question']}\n\n[compress:{ratio}]\n",
+        f"{item['question']}\n<|start-latent|>{latent_span}<|end-latent|>\n",
         return_tensors='pt',
     ).to(device)
     with torch.no_grad():
@@ -133,8 +144,8 @@ def run_ccot(model, tokenizer, item: dict, ratio: float,
         out[0][enc['input_ids'].shape[1]:], skip_special_tokens=True
     )
     reasoning = extract_reasoning_span(generated)
-    parts = generated.split('\n\nAnswer:')
-    raw_answer = parts[1].strip() if len(parts) > 1 else ''
+    parts = generated.split('####')
+    raw_answer = parts[1].strip() if len(parts) > 1 else generated
     return extract_answer(raw_answer), reasoning
 
 
@@ -149,7 +160,7 @@ def run_trimmed_cot(cot_model, tokenizer, item: dict, token_budget: int,
 
     # Stage 1 — truncated reasoning
     reasoning_enc = tokenizer(
-        f"Question: {item['question']}\n\nReasoning:",
+        f"{item['question']}\n<|start-latent|><|latent|><|latent|><|end-latent|>\n",
         return_tensors='pt',
     ).to(device)
     with torch.no_grad():
@@ -164,12 +175,7 @@ def run_trimmed_cot(cot_model, tokenizer, item: dict, token_budget: int,
     ).strip()
 
     # Stage 2 — answer from truncated context
-    answer_enc = tokenizer(
-        f"Question: {item['question']}\n\n"
-        f"Reasoning: {reasoning_text}\n\n"
-        f"Answer:",
-        return_tensors='pt',
-    ).to(device)
+    answer_enc = tokenizer(reasoning_text + "\n#### ", return_tensors='pt').to(device)
     with torch.no_grad():
         answer_ids = cot_model.generate(
             **answer_enc,
@@ -196,7 +202,7 @@ def compute_per_example_budgets(cot_model, tokenizer, dataset: list,
     cot_model.eval()
     for item in dataset:
         enc = tokenizer(
-            f"Question: {item['question']}\n\nReasoning:",
+            f"{item['question']}\n<|start-latent|><|latent|><|latent|><|end-latent|>\n",
             return_tensors='pt',
         ).to(device)
         with torch.no_grad():

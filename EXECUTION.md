@@ -12,14 +12,6 @@ GPU is assumed (`cuda`). Append `--device cpu` to any `pipeline.py` command if n
 pip install -r requirements.txt
 ```
 
-If `llmlingua` is needed separately:
-
-```bash
-pip install llmlingua
-```
-
----
-
 ## 1. Download Dataset
 
 Downloads the raw dataset and writes `gsm8k/train.jsonl` and `gsm8k/test.jsonl`.  
@@ -49,10 +41,10 @@ python verify_isolation.py
 
 ---
 
-## 3. Build Offline Compression Cache
+## 3. Build Phase 1 Compatibility Cache
 
-Compresses D\_train reasoning traces at all five ratios (0.5–0.9) using LLMLingua-2.  
-Writes `cache/S2/compressed_R5.jsonl` … `cache/S2/compressed_R9.jsonl`.  
+Creates `cache/S2/compressed_R5.jsonl` … `cache/S2/compressed_R9.jsonl` for
+pipeline compatibility. Coconut phase1 no longer depends on LLMLingua.
 Run once. Safe to re-run — already-built files are skipped.
 
 ```bash
@@ -67,10 +59,14 @@ python preprocess_compress.py --dataset gsm8k
 
 ---
 
-## 4. Phase 1 — Fine-tuning (CoT + CCoT) and Evaluation
+## 4. Phase 1 — Coconut Training and Evaluation
 
-Trains one CoT checkpoint and five CCoT checkpoints (one per ratio) per backbone.  
+Runs Coconut latent curriculum training and exports compatible checkpoints to
+`cot/` and `ccot_R{5..9}/` paths per backbone.  
 Evaluates all on D\_val and writes `results/S2/<model>/phase1_val.json`.
+
+This phase is now a **single 50-epoch Coconut run per model** with full stage
+progression (`0-5`, `6-8`, `9-11`, `12-14`, `15-49`) and monitoring outputs.
 
 **All four backbones (recommended):**
 
@@ -87,7 +83,13 @@ python pipeline.py --phase 1 --model qwen25_3b
 python pipeline.py --phase 1 --model qwen25_math1.5b
 ```
 
-Checkpoint output: `checkpoints/S2/<model>/cot/` and `checkpoints/S2/<model>/ccot_R{5..9}/`
+Checkpoint output: `checkpoints/S2/<model>/cot/` and `checkpoints/S2/<model>/ccot_R{5..9}/` (full-model format)
+
+Monitoring output:
+- `results/S2/<model>/phase1_training_metrics.json`
+- `plots/S2/<model>/phase1/stage_loss_curve.png`
+- `plots/S2/<model>/phase1/embedding_drift.png`
+- `plots/S2/<model>/phase1/val_accuracy.png`
 
 ---
 
@@ -246,7 +248,7 @@ python verify_isolation.py
 1. python download_dataset.py --dataset gsm8k
 2. python verify_isolation.py
 3. python preprocess_compress.py
-4. python pipeline.py --phase 1        # train CoT + CCoT, eval on D_val
+4. python pipeline.py --phase 1        # single Coconut 50-epoch train + compatibility export + eval on D_val
 5. python pipeline.py --phase 2        # extract truth vectors
 6. python pipeline.py --phase 3        # tune alpha, steered eval on D_val
 7. python verify_isolation.py          # confirm isolation before opening D_test

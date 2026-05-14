@@ -19,11 +19,11 @@ python download_gsm8k.py
 python verify_isolation.py
 ```
 
-### 1. Pre-process: Build Compression Cache
+### 1. Pre-process: Build Phase 1 Compatibility Cache
 
 ```bash
-# Pre-compute TokenSkip compression at ratios [0.5, 0.6, 0.7, 0.8, 0.9]
-# Runs once, outputs to cache/compressed/R{5,6,7,8,9}.jsonl
+# Build compatibility cache files for ratio-conditioned pipeline interfaces.
+# Coconut phase1 does not depend on LLMLingua compression.
 python preprocess_compress.py
 ```
 
@@ -69,7 +69,7 @@ project/
 ├── cache/compressed/           # pre-computed TokenSkip traces
 │   ├── R5.jsonl  ├── R6.jsonl  ├── R7.jsonl  ├── R8.jsonl  └── R9.jsonl
 ├── checkpoints/{S1,S2,S3,S4}/{model}/
-│   ├── cot/                    # Stage 1: CoT LoRA adapter
+│   ├── cot/                    # Coconut compatibility export (shared weights)
 │   ├── ccot_R5/ ├── ccot_R6/ ├── ccot_R7/ ├── ccot_R8/ └── ccot_R9/
 ├── vectors/{S1,S2,S3,S4}/{model}/
 │   ├── ccot_dom.pt             # Source A: DoM vector
@@ -89,7 +89,7 @@ project/
 │       ├── qwen25_3b_test.json
 │       ├── qwen25_math1.5b_test.json
 │       └── summary_test.json
-├── phase1/                     # training: CoT + CCoT
+├── phase1/                     # Coconut phase1 training + compatibility export
 ├── phase2/                     # extraction: hidden states → vectors
 ├── phase3/                     # tuning: LearnableAlpha + steered eval
 ├── scripts/                    # build_splits, selection, run_sweep
@@ -108,30 +108,34 @@ project/
 
 ## Phase Breakdown
 
-### Phase 1: Training Baselines (Stages 1 & 2)
+### Phase 1: Coconut Training Baselines
 
-**Stage 1: CoT Fine-Tuning**
-
-Train base model to generate full reasoning chains on D_train.
+Phase 1 now uses Coconut latent curriculum training (native full-model fine-tuning),
+with full 50-epoch stage schedule and internal monitoring.
+To preserve the rest of the pipeline, checkpoints are still exported to:
+`checkpoints/{config}/{model}/cot/` and `checkpoints/{config}/{model}/ccot_R{5,6,7,8,9}/`.
 
 ```bash
 # Called automatically by pipeline.py or scripts/run_sweep.py
 # Manual: python -m phase1 --stage cot --config S1 --model llama32_3b
 ```
 
-- Adapter saved → `checkpoints/{config}/{model}/cot/`
+- Full-model checkpoint saved → `checkpoints/{config}/{model}/cot/`
 - Time: ~2h per model (A100)
 
-**Stage 2: CCoT Fine-Tuning (per ratio)**
+**Compatibility Export for CCoT Ratio Paths**
 
-Train base model on compressed reasoning (via pre-computed TokenSkip traces) for each ratio.
+For downstream compatibility, a single trained checkpoint is exported under each
+ratio directory expected by phase2/phase3:
 
 ```bash
 # Called automatically; manual:
 # python -m phase1 --stage ccot --config S1 --model llama32_3b --ratio 0.7
 ```
 
-- Adapters saved → `checkpoints/{config}/{model}/ccot_R{5,6,7,8,9}/`
+- Full-model checkpoints saved → `checkpoints/{config}/{model}/ccot_R{5,6,7,8,9}/`
+- Training metrics → `results/{config}/{model}/phase1_training_metrics.json`
+- Monitoring plots → `plots/{config}/{model}/phase1/{stage_loss_curve,embedding_drift,val_accuracy}.png`
 - Time: ~8h for all 5 ratios (A100)
 
 **Phase 1 Evaluation**
@@ -260,7 +264,7 @@ Master configuration file. Sets:
 - Train/steer/val split ratios (S1–S4)
 - Compression ratios [0.5, 0.6, 0.7, 0.8, 0.9]
 - Model IDs (Llama, Phi-2, Qwen)
-- Phase 1: LoRA, training epochs, batch size
+- Phase 1: Coconut full-model schedule, training epochs, batch size
 - Phase 2: n_rollouts, layer threshold, cPCA rank
 - Phase 3: α_max, α_lr, λ_a (alignment loss weight), λ_m (magnitude penalty)
 - Phase 4: output directory
@@ -295,8 +299,8 @@ python pipeline.py --phase 1 --config S2 --model llama32_3b
 
 | Task | Per Model | All 4 Models |
 |------|-----------|--------------|
-| Phase 1: CoT training | 2h | 8h |
-| Phase 1: CCoT training (5 ratios) | 8h | 32h |
+| Phase 1: Coconut training (single run) | 10h | 40h |
+| Phase 1: Compatibility export (cot + ccot_R5..R9) | <5m | <20m |
 | Phase 1: Eval (D_val) | 1h | 4h |
 | Phase 2: Extraction (2 sources) | 3h | 12h |
 | Phase 3: α-tuning + steered eval | 3h | 12h |
@@ -373,7 +377,7 @@ Models are loaded and frozen for each phase. Consider caching across phases (adv
 After Phase 1 training, verify:
 
 ```bash
-find checkpoints/ -name "adapter_config.json"
+find checkpoints/ -name "config.json"
 ```
 
 Each should exist for every config × model × stage combination.

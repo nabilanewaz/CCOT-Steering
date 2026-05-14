@@ -20,8 +20,8 @@ from utils.dataset_paths import (
     init_project_dataset,
     phase4_subprocess_env,
 )
-from phase1.compress import build_ccot_cache, load_cache
-from phase1.train import train_cot, train_ccot
+from phase1.compress import build_ccot_cache
+from phase1.train import train_coconut_phase1
 from phase1.evaluate import run_phase1_evaluation, print_comparison_table
 from phase2.run import run_phase2_all_sources
 from phase3.evaluate import run_phase3_evaluation
@@ -37,6 +37,9 @@ MODEL_ID_MAP = {
     'qwen25_3b':       'Qwen/Qwen2.5-3B',
     'qwen25_math1.5b': 'Qwen/Qwen2.5-Math-1.5B',
 }
+
+def _checkpoint_ready(path: str) -> bool:
+    return os.path.exists(os.path.join(path, "adapter_config.json")) or os.path.exists(os.path.join(path, "config.json"))
 
 
 def _update_selected_phase3_best(model_tag: str, selection: dict) -> None:
@@ -82,45 +85,31 @@ def main():
     D_val     = splits[CFG_ID]['D_val']
     cache_dir = f"cache/{CFG_ID}"
 
-    # ── Offline compression (once, shared across backbones) ──────────────────
-    try:
-        from llmlingua import PromptCompressor
-        compressor = PromptCompressor(
-            model_name="microsoft/llmlingua-2-xlm-roberta-large-meetingbank",
-            use_llmlingua2=True,
-            device_map="cuda" if torch.cuda.is_available() else "cpu",
-        )
-        build_ccot_cache(D_train, RATIOS, cache_dir, compressor)
-    except ImportError:
-        print("llmlingua not installed — skipping compression cache build. "
-              "Ensure cache files exist before running CCoT training.")
+    # In Coconut phase1, this creates compatibility cache files for pipeline contracts.
+    build_ccot_cache(D_train, RATIOS, cache_dir, compressor=None)
 
     for model_tag in MODEL_TAGS:
             base_model_id = MODEL_ID_MAP[model_tag]
             ckpt_dir      = f"checkpoints/{CFG_ID}/{model_tag}"
             results_dir   = f"results/{CFG_ID}/{model_tag}"
 
-            # ── Phase 1 training ──────────────────────────────────────────────
+            # ── Phase 1 training (single Coconut run + compat export) ────────
             cot_out = os.path.join(ckpt_dir, 'cot')
-            if not os.path.exists(os.path.join(cot_out, 'adapter_config.json')):
-                train_cot(base_model_id, D_train, cot_out, model_tag)
+            all_ccot_ready = all(
+                _checkpoint_ready(os.path.join(ckpt_dir, f"ccot_R{int(r * 10)}"))
+                for r in RATIOS
+            )
+            if not (_checkpoint_ready(cot_out) and all_ccot_ready):
+                train_coconut_phase1(
+                    base_model_id=base_model_id,
+                    D_train=D_train,
+                    checkpoints_dir=ckpt_dir,
+                    results_dir=results_dir,
+                    model_tag=model_tag,
+                    ratios=RATIOS,
+                )
             else:
-                print(f"[PH1] CoT checkpoint exists, skipping: {cot_out}")
-
-            for ratio in RATIOS:
-                ccot_out = os.path.join(ckpt_dir, f"ccot_R{int(ratio * 10)}")
-                if os.path.exists(os.path.join(ccot_out, 'adapter_config.json')):
-                    print(f"[PH1] CCoT R={ratio} checkpoint exists, skipping: {ccot_out}")
-                    continue
-                cache_path = os.path.join(cache_dir, f"compressed_R{int(ratio * 10)}.jsonl")
-                if not os.path.exists(cache_path):
-                    raise FileNotFoundError(
-                        f"Compression cache missing: {cache_path}\n"
-                        "Run build_ccot_cache() first."
-                    )
-                compressed_cache = load_cache(cache_path)
-                train_ccot(base_model_id, D_train, compressed_cache,
-                           ratio, ccot_out, model_tag)
+                print(f"[PH1] Coconut canonical + compat checkpoints exist, skipping: {ckpt_dir}")
 
             # ── Phase 1 evaluation ────────────────────────────────────────────
             phase1_results = run_phase1_evaluation(
