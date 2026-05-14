@@ -77,7 +77,7 @@ def compute_shuffled_dom(
     best_layer: int,
     v_truth: torch.Tensor,
     seed: int = 42,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, dict]:
     """
     Control baseline: pool H+ and H- at best_layer, randomly permute labels
     (keeping class sizes constant), recompute DoM.  Returns unit-normalised
@@ -103,15 +103,21 @@ def compute_shuffled_dom(
     raw_norm    = v_raw.norm().item()
     v_shuffled  = v_raw / (raw_norm + 1e-8)
 
+    true_raw_norm = (H_p.mean(0) - H_n.mean(0)).norm().item()
     cos = torch.dot(v_shuffled.float(), v_truth.float()).item()
     print(f"\nControl — Shuffled-Label DoM  (layer L={best_layer}):")
-    print(f"  raw norm  : {raw_norm:.6f}  "
-          f"(true DoM raw norm for reference: "
-          f"{(H_p.mean(0) - H_n.mean(0)).norm().item():.6f})")
+    print(f"  raw norm          : {raw_norm:.6f}")
+    print(f"  true DoM raw norm : {true_raw_norm:.6f}")
     print(f"  cos(v_shuffled, v_truth): {cos:+.4f}  "
           f"({'unexpectedly aligned — check data' if abs(cos) > 0.3 else 'near-zero as expected'})")
 
-    return v_shuffled
+    stats = {
+        'layer':            best_layer,
+        'shuffled_raw_norm': raw_norm,
+        'true_raw_norm':     true_raw_norm,
+        'cos_with_truth':    cos,
+    }
+    return v_shuffled, stats
 
 
 def save_shuffled_vector(
