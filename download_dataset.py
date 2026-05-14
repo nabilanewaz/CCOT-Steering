@@ -50,13 +50,13 @@ def download_gsm8k(out_dir: str = "gsm8k") -> None:
     n_train = 0
     with open(train_path, "w", encoding="utf-8") as f:
         for i, item in enumerate(ds["train"]):
-            rec = {"id": i, "question": item["question"], "answer": item["answer"]}
+            rec = {"id": f"train_{i}", "question": item["question"], "answer": item["answer"]}
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
             n_train += 1
     n_test = 0
     with open(test_path, "w", encoding="utf-8") as f:
         for i, item in enumerate(ds["test"]):
-            rec = {"id": i, "question": item["question"], "answer": item["answer"]}
+            rec = {"id": f"test_{i}", "question": item["question"], "answer": item["answer"]}
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
             n_test += 1
     print(f"GSM8K: {n_train} train -> {train_path}")
@@ -93,12 +93,14 @@ def download_svamp(out_dir: str = "svamp") -> None:
     n_train = 0
     with open(train_path, "w", encoding="utf-8") as f:
         for i, row in enumerate(ds["train"]):
-            f.write(json.dumps(_svamp_record(i, row), ensure_ascii=False) + "\n")
+            rec = _svamp_record(i, row); rec["id"] = f"train_{i}"
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
             n_train += 1
     n_test = 0
     with open(test_path, "w", encoding="utf-8") as f:
         for i, row in enumerate(ds["test"]):
-            f.write(json.dumps(_svamp_record(i, row), ensure_ascii=False) + "\n")
+            rec = _svamp_record(i, row); rec["id"] = f"test_{i}"
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
             n_test += 1
     print(f"SVAMP: {n_train} train -> {train_path}")
     print(f"SVAMP: {n_test} test  -> {test_path}")
@@ -162,12 +164,14 @@ def download_prontoqa(out_dir: str = "prontoqa") -> None:
     n_train = 0
     with open(train_path, "w", encoding="utf-8") as f:
         for i, row in enumerate(ds["train"]):
-            f.write(json.dumps(_prontoqa_record(i, row), ensure_ascii=False) + "\n")
+            rec = _prontoqa_record(i, row); rec["id"] = f"train_{i}"
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
             n_train += 1
     n_test = 0
     with open(test_path, "w", encoding="utf-8") as f:
         for i, row in enumerate(ds["test"]):
-            f.write(json.dumps(_prontoqa_record(i, row), ensure_ascii=False) + "\n")
+            rec = _prontoqa_record(i, row); rec["id"] = f"test_{i}"
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
             n_test += 1
     print(f"ProntoQA: {n_train} train -> {train_path}")
     print(f"ProntoQA: {n_test} test  -> {test_path}")
