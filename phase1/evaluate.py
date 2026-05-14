@@ -49,6 +49,8 @@ def evaluate_condition(
     found = 0
     reasoning_lengths = []
     latencies = []
+    n = len(dataset)
+    log_every = max(1, n // 10)   # print ~10 progress lines per condition
 
     for i, item in enumerate(dataset):
         t0 = time.time()
@@ -74,7 +76,14 @@ def evaluate_condition(
         r_ids = tokenizer.encode(reasoning or '', add_special_tokens=False)
         reasoning_lengths.append(len(r_ids))
 
-    mean_tokens = float(np.mean(reasoning_lengths))
+        if (i + 1) % log_every == 0 or (i + 1) == n:
+            running_acc = correct / (i + 1)
+            mean_lat    = float(np.mean(latencies))
+            mean_tok    = float(np.mean(reasoning_lengths))
+            print(f"    [{i+1:>4}/{n}]  acc={running_acc:.3f}  "
+                  f"tokens={mean_tok:.0f}  lat={mean_lat:.2f}s/ex")
+
+    mean_tokens  = float(np.mean(reasoning_lengths))
     actual_ratio = (mean_tokens / full_cot_mean_tokens
                     if full_cot_mean_tokens else 0.0)
 
@@ -82,11 +91,11 @@ def evaluate_condition(
         condition=condition_name,
         model_tag=model_tag,
         ratio=ratio,
-        accuracy=correct / len(dataset),
+        accuracy=correct / n,
         reasoning_tokens=mean_tokens,
         actual_ratio=actual_ratio,
         latency_sec=float(np.mean(latencies)),
-        answer_found_rate=found / len(dataset),
+        answer_found_rate=found / n,
     )
 
 
@@ -108,9 +117,18 @@ def run_phase1_evaluation(
     Saves results to {results_dir}/phase1_val.json.
     """
     results: list[ConditionMetrics] = []
+    eval_start = time.time()
 
-    header = f"Phase 1 evaluation: {model_tag}  ({len(D_val)} val examples)"
-    print(f"\n{'='*len(header)}\n{header}\n{'='*len(header)}")
+    bar = '═' * 64
+    print(f"\n{bar}")
+    print(f"  Phase 1 Evaluation  [{model_tag}]")
+    print(f"  D_val = {len(D_val)} examples")
+    print(f"  Conditions: 1 no_cot  +  1 full_cot  +  "
+          f"5 trimmed_cot  +  5 ccot  = 12 total")
+    print(f"  Ratios: {RATIOS}")
+    print(f"  Checkpoints dir: {checkpoints_dir}")
+    print(f"  Results dir    : {results_dir}")
+    print(bar)
 
     # ── 1. No CoT ──────────────────────────────────────────────────────────────
     print("\n[1/12] No CoT (frozen base)...")
@@ -174,7 +192,12 @@ def run_phase1_evaluation(
     out_path = os.path.join(results_dir, 'phase1_val.json')
     with open(out_path, 'w') as f:
         json.dump([asdict(r) for r in results], f, indent=2)
-    print(f"\nPhase 1 results saved → {out_path}")
+
+    elapsed = time.time() - eval_start
+    print(f"\n{bar}")
+    print(f"  Phase 1 Evaluation complete  [{model_tag}]  ({elapsed:.0f}s)")
+    print(f"  Results saved → {out_path}")
+    print(bar)
     return results
 
 
