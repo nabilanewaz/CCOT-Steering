@@ -59,6 +59,9 @@ def collect_hidden_states(
     """
     layers = get_transformer_layers(model)
     num_layers = len(layers)
+    print(f"\n  Model has {num_layers} transformer layers")
+    print(f"  Target: {N} rollouts × {len(D_steer)} questions = "
+          f"up to {N * len(D_steer)} forward passes")
 
     H_plus_raw: dict = defaultdict(list)
     H_minus_raw: dict = defaultdict(list)
@@ -139,10 +142,11 @@ def collect_hidden_states(
             bucket_pos[L].extend([bkt] * len(item_h_pos[L]))
             bucket_neg[L].extend([bkt] * len(item_h_neg[L]))
 
-        if (item_idx + 1) % 50 == 0:
+        if (item_idx + 1) % 25 == 0 or (item_idx + 1) == len(D_steer):
             n_pos = len(H_plus_raw[0]) if 0 in H_plus_raw else 0
             n_neg = len(H_minus_raw[0]) if 0 in H_minus_raw else 0
-            print(f"  [{item_idx+1}/{len(D_steer)}]  "
+            pct   = (item_idx + 1) / len(D_steer) * 100
+            print(f"  [{item_idx+1:>4}/{len(D_steer)}]  {pct:5.1f}%  "
                   f"used={n_used}  skipped={n_skipped}  "
                   f"H+ per layer ~{n_pos}  H- per layer ~{n_neg}")
 
@@ -168,11 +172,28 @@ def collect_hidden_states(
         if n_pos >= min_samples and n_neg >= min_samples:
             H_pos[L] = torch.stack(H_plus_raw[L])   # [n+, d]
             H_neg[L] = torch.stack(H_minus_raw[L])  # [n-, d]
-        else:
-            print(f"  Layer {L:02d}: skipped "
-                  f"(H+={n_pos}, H-={n_neg}, min={min_samples})")
 
-    print(f"\nCollected hidden states from {len(H_pos)} / {num_layers} layers  "
-          f"[source: {source_tag}]  "
-          f"questions used={n_used}  skipped={n_skipped} (no contrast)")
+    # ── Per-layer sample table ────────────────────────────────────────────────
+    n_included = len(H_pos)
+    n_filtered = num_layers - n_included
+    print(f"\n  Per-layer sample counts  [source: {source_tag}]  "
+          f"(min_samples={min_samples}):")
+    print(f"  {'Layer':>7}  {'H+':>8}  {'H-':>8}  {'H+ shape':>14}  {'Status':>12}")
+    print(f"  {'─' * 58}")
+    for L in range(num_layers):
+        n_pos = len(H_plus_raw[L])
+        n_neg = len(H_minus_raw[L])
+        if L in H_pos:
+            d = H_pos[L].shape[1]
+            shape_str = f"[{n_pos}, {d}]"
+            status = 'included'
+        else:
+            shape_str = '—'
+            status = f'filtered (<{min_samples})'
+        print(f"  {L:>7}  {n_pos:>8}  {n_neg:>8}  {shape_str:>14}  {status:>12}")
+
+    print(f"\n  Summary: {n_included} layers included  {n_filtered} filtered  "
+          f"[source: {source_tag}]")
+    print(f"  Questions: {n_used} used (had contrast)  "
+          f"{n_skipped} skipped (no contrast)")
     return H_pos, H_neg
