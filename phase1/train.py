@@ -18,7 +18,7 @@ MODEL_HPARAMS = {
     "llama32_3b": {"lr": 1e-5, "batch": 1, "grad_accum": 64, "epochs": 20},
     "phi2": {"lr": 1e-5, "batch": 1, "grad_accum": 64, "epochs": 20},
     "qwen25_3b": {"lr": 1e-5, "batch": 1, "grad_accum": 64, "epochs": 20},
-    "qwen25_math1.5b": {"lr": 1e-5, "batch": 1, "grad_accum": 128, "epochs": 20},
+    "qwen25_math1.5b": {"lr": 1e-5, "latent_lr": 3e-6, "batch": 1, "grad_accum": 128, "epochs": 20},
 }
 _DEFAULT_HP = {"lr": 1e-5, "batch": 1, "grad_accum": 64, "epochs": 20}
 MAX_SEQ_LEN = 512
@@ -31,8 +31,11 @@ BEST_DIRNAME = "_coconut_phase1_best"
 EPOCH9_DIRNAME = "_coconut_phase1_epoch9"
 EARLY_STOP_PATIENCE = 2
 EARLY_STOP_MIN_DELTA = 0.002
-EARLY_STOP_MIN_EPOCH = 9
+EARLY_STOP_MIN_EPOCH = 20
 EPOCH9_SNAPSHOT_EPOCH = 9
+BEST_CHECKPOINT_MIN_STAGE = 1
+TRAIN_USE_KV_CACHE = False
+TRAIN_DETACH_LATENTS = False
 
 
 def _parse_steps(answer: str) -> tuple[list[str], str]:
@@ -61,6 +64,10 @@ def _to_coconut_examples(items: list[dict]) -> list[dict]:
 
 def _init_model(base_model_id: str, device: str):
     patch_transformers_custom_op_registration()
+    if torch.cuda.is_available() and hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+        # cuDNN SDPA backward has produced non-finite gradients in the latent
+        # curriculum on some torch/CUDA stacks. Prefer the other SDPA kernels.
+        torch.backends.cuda.enable_cudnn_sdp(False)
     model = AutoModelForCausalLM.from_pretrained(
         base_model_id,
         torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
@@ -229,10 +236,15 @@ def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, mo
     epoch9_dir = os.path.join(checkpoint_root, EPOCH9_DIRNAME)
     best_val_acc = -float("inf")
     best_epoch = None
+    best_stage = None
+    warmup_best_val_acc = -float("inf")
+    warmup_best_epoch = None
     early_stop_best_acc = -float("inf")
     early_stop_bad_epochs = 0
     early_stopped = False
     early_stop_epoch = None
+    skipped_nonfinite_losses = 0
+    skipped_nonfinite_steps = 0
 
     def _phase1_val_accuracy() -> float:
         if not val_raw:
@@ -271,7 +283,8 @@ def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, mo
         train_loader = DataLoader(train_ds, batch_size=hp["batch"], collate_fn=collator, shuffle=True)
         if optimizer is None or reset_opt:
             stage_transition_epochs.append(epoch)
-            optimizer = torch.optim.AdamW(coconut_model.parameters(), lr=hp["lr"], weight_decay=0.01, eps=1e-8)
+            stage_lr = hp["lr"] if stage == 0 else hp.get("latent_lr", hp["lr"] * 0.5)
+            optimizer = torch.optim.AdamW(coconut_model.parameters(), lr=stage_lr, weight_decay=0.01, eps=1e-8)
             epochs_in_stage = 3 if stage < 4 else max(1, hp["epochs"] - epoch)
             total_steps = max(1, (len(train_loader) * epochs_in_stage) // hp["grad_accum"])
             warmup_steps = max(10, int(total_steps * 0.1))
@@ -282,25 +295,52 @@ def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, mo
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
 
         coconut_model.train()
+        optimizer.zero_grad(set_to_none=True)
         pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{hp['epochs']} | Stage {stage}")
         total_loss = 0.0
+        finite_loss_steps = 0
+        epoch_skipped_losses = 0
+        epoch_skipped_steps = 0
         for step, batch in enumerate(pbar):
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
-                outputs = coconut_model(input_ids, attention_mask, labels)
+                outputs = coconut_model(
+                    input_ids,
+                    attention_mask,
+                    labels,
+                    detach_latents=TRAIN_DETACH_LATENTS,
+                    use_kv_cache=TRAIN_USE_KV_CACHE,
+                )
                 loss = outputs.loss.to(torch.float32) / hp["grad_accum"]
+            if not torch.isfinite(loss):
+                skipped_nonfinite_losses += 1
+                epoch_skipped_losses += 1
+                optimizer.zero_grad(set_to_none=True)
+                pbar.set_postfix({
+                    "loss": total_loss / max(finite_loss_steps, 1),
+                    "skipped": epoch_skipped_losses,
+                })
+                continue
             loss.backward()
             total_loss += float(loss.item() * hp["grad_accum"])
-            if (step + 1) % hp["grad_accum"] == 0:
-                torch.nn.utils.clip_grad_norm_(coconut_model.parameters(), max_norm=1.0)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-            pbar.set_postfix({"loss": total_loss / max(step + 1, 1)})
+            finite_loss_steps += 1
+            if finite_loss_steps % hp["grad_accum"] == 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(coconut_model.parameters(), max_norm=1.0)
+                if torch.isfinite(grad_norm):
+                    optimizer.step()
+                    scheduler.step()
+                else:
+                    skipped_nonfinite_steps += 1
+                    epoch_skipped_steps += 1
+                optimizer.zero_grad(set_to_none=True)
+            pbar.set_postfix({
+                "loss": total_loss / max(finite_loss_steps, 1),
+                "skipped": epoch_skipped_losses + epoch_skipped_steps,
+            })
 
-        epoch_avg_loss = total_loss / max(len(train_loader), 1)
+        epoch_avg_loss = total_loss / max(finite_loss_steps, 1)
         loss_history.append(epoch_avg_loss)
         losses_per_stage[stage].append(epoch_avg_loss)
         with torch.no_grad():
@@ -320,9 +360,14 @@ def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, mo
         val_acc = _phase1_val_accuracy()
         val_acc_history.append(val_acc)
         epoch_number = epoch + 1
-        if val_acc > best_val_acc:
+        if val_acc > warmup_best_val_acc:
+            warmup_best_val_acc = val_acc
+            warmup_best_epoch = epoch_number
+        eligible_for_best = stage >= BEST_CHECKPOINT_MIN_STAGE
+        if eligible_for_best and val_acc > best_val_acc:
             best_val_acc = val_acc
             best_epoch = epoch_number
+            best_stage = stage
             _save_coconut_checkpoint(
                 coconut_model,
                 tokenizer,
@@ -334,7 +379,7 @@ def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, mo
             )
             tqdm.write(
                 f"[phase1][{model_tag}] best checkpoint saved -> {best_dir} "
-                f"(epoch={epoch_number} val_acc={val_acc:.4f})"
+                f"(epoch={epoch_number} stage={stage} val_acc={val_acc:.4f})"
             )
         if epoch_number == EPOCH9_SNAPSHOT_EPOCH:
             _save_coconut_checkpoint(
@@ -354,6 +399,7 @@ def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, mo
             f"[phase1][{model_tag}] epoch={epoch_number}/{hp['epochs']} "
             f"stage={stage} train_loss={epoch_avg_loss:.4f} "
             f"val_acc={val_acc:.4f} "
+            f"skipped_nonfinite={epoch_skipped_losses + epoch_skipped_steps} "
             f"(train_n={len(train_raw)} val_n={len(val_raw)})"
         )
 
@@ -365,6 +411,7 @@ def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, mo
 
         if (
             epoch_number >= EARLY_STOP_MIN_EPOCH
+            and epoch_number < hp["epochs"]
             and early_stop_bad_epochs >= EARLY_STOP_PATIENCE
         ):
             early_stopped = True
@@ -387,6 +434,10 @@ def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, mo
     )
     print(f"Coconut final model saved -> {output_dir}")
     if best_epoch is None:
+        tqdm.write(
+            f"[phase1][{model_tag}] WARNING: no finite eligible latent-stage best checkpoint "
+            f"was found; falling back to final checkpoint for compatibility export."
+        )
         _save_coconut_checkpoint(
             coconut_model,
             tokenizer,
@@ -414,8 +465,16 @@ def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, mo
         "early_stop_min_epoch": EARLY_STOP_MIN_EPOCH,
         "best_val_accuracy": best_val_acc if best_epoch is not None else None,
         "best_epoch": best_epoch,
+        "best_stage": best_stage,
+        "best_checkpoint_min_stage": BEST_CHECKPOINT_MIN_STAGE,
+        "warmup_best_val_accuracy": warmup_best_val_acc if warmup_best_epoch is not None else None,
+        "warmup_best_epoch": warmup_best_epoch,
         "best_checkpoint_dir": best_dir,
         "epoch9_checkpoint_dir": epoch9_dir,
+        "train_use_kv_cache": TRAIN_USE_KV_CACHE,
+        "train_detach_latents": TRAIN_DETACH_LATENTS,
+        "skipped_nonfinite_losses": skipped_nonfinite_losses,
+        "skipped_nonfinite_steps": skipped_nonfinite_steps,
     }
 
 
@@ -518,6 +577,39 @@ def export_compat_checkpoints(
         )
 
 
+def _phase1_training_current(results_dir: str) -> bool:
+    metrics_path = os.path.join(results_dir, "phase1_training_metrics.json")
+    if not os.path.exists(metrics_path):
+        return False
+    try:
+        with open(metrics_path, encoding="utf-8") as f:
+            metrics = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        metrics.get("train_use_kv_cache") == TRAIN_USE_KV_CACHE
+        and metrics.get("train_detach_latents") == TRAIN_DETACH_LATENTS
+        and metrics.get("best_checkpoint_min_stage") == BEST_CHECKPOINT_MIN_STAGE
+        and metrics.get("early_stop_min_epoch") == EARLY_STOP_MIN_EPOCH
+        and metrics.get("completed_epochs") == metrics.get("epochs")
+        and metrics.get("best_stage") is not None
+        and metrics.get("best_stage") >= BEST_CHECKPOINT_MIN_STAGE
+    )
+
+
+def _remove_phase1_eval_artifacts(results_dir: str) -> None:
+    for filename in (
+        "phase1_latent_sweep.json",
+        "phase1_best_latent.json",
+        "phase1_val.json",
+        "phase1_latent_predictions.jsonl",
+        "phase1_comparison_predictions.jsonl",
+    ):
+        path = os.path.join(results_dir, filename)
+        if os.path.exists(path):
+            os.remove(path)
+
+
 def train_coconut_phase1(
     base_model_id: str,
     D_train: list,
@@ -534,11 +626,19 @@ def train_coconut_phase1(
         os.path.join(best_dir, "config.json"),
         os.path.join(epoch9_dir, "config.json"),
     ]
-    if not all(os.path.exists(path) for path in required_markers):
+    checkpoints_ready = all(os.path.exists(path) for path in required_markers)
+    training_current = _phase1_training_current(results_dir)
+    if not checkpoints_ready or not training_current:
+        if checkpoints_ready and not training_current:
+            print(
+                "Phase 1 checkpoints exist but were produced with stale stability/curriculum "
+                "settings; retraining."
+            )
         metrics = _run_coconut_training(base_model_id, D_train, canonical_dir, model_tag)
         os.makedirs(results_dir, exist_ok=True)
         with open(os.path.join(results_dir, "phase1_training_metrics.json"), "w", encoding="utf-8") as f:
             json.dump(metrics, f, indent=2)
+        _remove_phase1_eval_artifacts(results_dir)
         cfg_id = os.path.basename(os.path.dirname(checkpoints_dir))
         model_id = os.path.basename(checkpoints_dir)
         phase1_plot_dir = os.path.join("plots", cfg_id, model_id, "phase1")
