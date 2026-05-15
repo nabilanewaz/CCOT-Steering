@@ -53,6 +53,59 @@ def _trust(model_id: str) -> bool:
     return 'qwen' in model_id.lower()
 
 
+def _fallback_token_id(tokenizer, model, *names: str) -> int | None:
+    for name in names:
+        token_id = getattr(tokenizer, f"{name}_token_id", None)
+        if token_id is not None:
+            return token_id
+        token_id = getattr(getattr(model, "config", None), f"{name}_token_id", None)
+        if token_id is not None:
+            return token_id
+        token_id = getattr(getattr(model, "generation_config", None), f"{name}_token_id", None)
+        if token_id is not None:
+            return token_id
+    return None
+
+
+def _single_token_id(token_id) -> int | None:
+    if isinstance(token_id, (list, tuple)):
+        return token_id[0] if token_id else None
+    return token_id
+
+
+def _ensure_generation_token_ids(model, tokenizer) -> dict:
+    eos_id = _fallback_token_id(tokenizer, model, "eos", "sep")
+    pad_id = _single_token_id(_fallback_token_id(tokenizer, model, "pad", "eos", "unk"))
+    if pad_id is None:
+        pad_id = 0
+
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+        elif tokenizer.unk_token is not None:
+            tokenizer.pad_token = tokenizer.unk_token
+
+    if getattr(model, "config", None) is not None:
+        model.config.pad_token_id = pad_id
+        if eos_id is not None:
+            model.config.eos_token_id = eos_id
+    if getattr(model, "generation_config", None) is not None:
+        model.generation_config.pad_token_id = pad_id
+        if eos_id is not None:
+            model.generation_config.eos_token_id = eos_id
+
+    kwargs = {"pad_token_id": pad_id}
+    if eos_id is not None:
+        kwargs["eos_token_id"] = eos_id
+    return kwargs
+
+
+def _generate(model, tokenizer, **kwargs):
+    generation_kwargs = _ensure_generation_token_ids(model, tokenizer)
+    generation_kwargs.update(kwargs)
+    return model.generate(**generation_kwargs)
+
+
 def load_base_frozen(base_model_id: str, device: str):
     """Load the untuned base model (no LoRA)."""
     patch_transformers_custom_op_registration()
@@ -63,6 +116,7 @@ def load_base_frozen(base_model_id: str, device: str):
     model = AutoModelForCausalLM.from_pretrained(
         base_model_id, torch_dtype='auto', trust_remote_code=trust
     ).to(device)
+    _ensure_generation_token_ids(model, tokenizer)
     model.eval()
     return model, tokenizer
 
@@ -97,6 +151,7 @@ def load_finetuned(checkpoint_dir: str, device: str):
         )
 
     model = model.to(device)
+    _ensure_generation_token_ids(model, tokenizer)
     model.eval()
     return model, tokenizer
 
@@ -110,7 +165,7 @@ def run_no_cot(model, tokenizer, item: dict, device: str) -> tuple[str | None, s
         return_tensors='pt',
     ).to(device)
     with torch.no_grad():
-        out = model.generate(**enc, do_sample=False, max_new_tokens=32)
+        out = _generate(model, tokenizer, **enc, do_sample=False, max_new_tokens=32)
     text = tokenizer.decode(
         out[0][enc['input_ids'].shape[1]:], skip_special_tokens=True
     ).strip()
@@ -123,7 +178,7 @@ def run_cot(model, tokenizer, item: dict, device: str) -> tuple[str | None, str]
         return_tensors='pt',
     ).to(device)
     with torch.no_grad():
-        out = model.generate(**enc, do_sample=False, max_new_tokens=512)
+        out = _generate(model, tokenizer, **enc, do_sample=False, max_new_tokens=512)
     generated = tokenizer.decode(
         out[0][enc['input_ids'].shape[1]:], skip_special_tokens=True
     )
@@ -143,7 +198,7 @@ def run_ccot(model, tokenizer, item: dict, n_latents: int,
              device: str) -> tuple[str | None, str]:
     enc = tokenizer(latent_prompt(item['question'], n_latents), return_tensors='pt').to(device)
     with torch.no_grad():
-        out = model.generate(**enc, do_sample=False, max_new_tokens=256)
+        out = _generate(model, tokenizer, **enc, do_sample=False, max_new_tokens=256)
     generated = tokenizer.decode(
         out[0][enc['input_ids'].shape[1]:], skip_special_tokens=True
     )
@@ -168,7 +223,9 @@ def run_trimmed_cot(cot_model, tokenizer, item: dict, token_budget: int,
         return_tensors='pt',
     ).to(device)
     with torch.no_grad():
-        reasoning_ids = cot_model.generate(
+        reasoning_ids = _generate(
+            cot_model,
+            tokenizer,
             **reasoning_enc,
             do_sample=False,
             max_new_tokens=token_budget,
@@ -181,7 +238,9 @@ def run_trimmed_cot(cot_model, tokenizer, item: dict, token_budget: int,
     # Stage 2 — answer from truncated context
     answer_enc = tokenizer(reasoning_text + "\n#### ", return_tensors='pt').to(device)
     with torch.no_grad():
-        answer_ids = cot_model.generate(
+        answer_ids = _generate(
+            cot_model,
+            tokenizer,
             **answer_enc,
             do_sample=False,
             max_new_tokens=32,
@@ -210,7 +269,7 @@ def compute_per_example_budgets(cot_model, tokenizer, dataset: list,
             return_tensors='pt',
         ).to(device)
         with torch.no_grad():
-            out_ids = cot_model.generate(**enc, do_sample=False, max_new_tokens=512)
+            out_ids = _generate(cot_model, tokenizer, **enc, do_sample=False, max_new_tokens=512)
         generated = tokenizer.decode(
             out_ids[0][enc['input_ids'].shape[1]:], skip_special_tokens=True
         )
@@ -228,7 +287,7 @@ def measure_ccot_token_counts(ccot_model, tokenizer, dataset: list,
     for item in dataset:
         enc = tokenizer(latent_prompt(item['question'], n_latents), return_tensors='pt').to(device)
         with torch.no_grad():
-            out_ids = ccot_model.generate(**enc, do_sample=False, max_new_tokens=256)
+            out_ids = _generate(ccot_model, tokenizer, **enc, do_sample=False, max_new_tokens=256)
         full_text = tokenizer.decode(out_ids[0], skip_special_tokens=True)
         reasoning = extract_reasoning_span(full_text)
         lengths.append(len(tokenizer.encode(reasoning, add_special_tokens=False)))
