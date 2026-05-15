@@ -15,18 +15,24 @@ from phase1.modeling import Coconut
 from utils.torch_compat import patch_transformers_custom_op_registration
 
 MODEL_HPARAMS = {
-    "llama32_3b": {"lr": 1e-5, "batch": 1, "grad_accum": 64, "epochs": 50},
-    "phi2": {"lr": 1e-5, "batch": 1, "grad_accum": 64, "epochs": 50},
-    "qwen25_3b": {"lr": 1e-5, "batch": 1, "grad_accum": 64, "epochs": 50},
-    "qwen25_math1.5b": {"lr": 1e-5, "batch": 1, "grad_accum": 128, "epochs": 50},
+    "llama32_3b": {"lr": 1e-5, "batch": 1, "grad_accum": 64, "epochs": 20},
+    "phi2": {"lr": 1e-5, "batch": 1, "grad_accum": 64, "epochs": 20},
+    "qwen25_3b": {"lr": 1e-5, "batch": 1, "grad_accum": 64, "epochs": 20},
+    "qwen25_math1.5b": {"lr": 1e-5, "batch": 1, "grad_accum": 128, "epochs": 20},
 }
-_DEFAULT_HP = {"lr": 1e-5, "batch": 1, "grad_accum": 64, "epochs": 50}
+_DEFAULT_HP = {"lr": 1e-5, "batch": 1, "grad_accum": 64, "epochs": 20}
 MAX_SEQ_LEN = 512
 MAX_LATENT_TOKENS = 6
 C_THOUGHT = 2
 HYBRID_MODE = True
-RATIOS = [0.5, 0.6, 0.7, 0.8, 0.9]
+LATENT_TOKEN_COUNTS = [3, 4, 6]
 CANONICAL_DIRNAME = "_coconut_phase1"
+BEST_DIRNAME = "_coconut_phase1_best"
+EPOCH9_DIRNAME = "_coconut_phase1_epoch9"
+EARLY_STOP_PATIENCE = 2
+EARLY_STOP_MIN_DELTA = 0.002
+EARLY_STOP_MIN_EPOCH = 9
+EPOCH9_SNAPSHOT_EPOCH = 9
 
 
 def _parse_steps(answer: str) -> tuple[list[str], str]:
@@ -168,9 +174,39 @@ def _build_stage_dataset(base_dataset, stage: int, drop_remaining: bool, start_i
     return base_dataset.map(_process, remove_columns=list(base_dataset.features)).shuffle(seed=42)
 
 
+def _save_coconut_checkpoint(
+    coconut_model,
+    tokenizer,
+    output_dir: str,
+    base_model_id: str,
+    role: str,
+    epoch: int | None = None,
+    val_accuracy: float | None = None,
+) -> None:
+    os.makedirs(output_dir, exist_ok=True)
+    coconut_model.base_causallm.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    meta = {
+        "architecture": "coconut",
+        "base_model_id": base_model_id,
+        "latent_start_token": "<|start-latent|>",
+        "latent_token": "<|latent|>",
+        "latent_end_token": "<|end-latent|>",
+        "checkpoint_role": role,
+    }
+    if epoch is not None:
+        meta["epoch"] = epoch
+    if val_accuracy is not None:
+        meta["val_accuracy"] = val_accuracy
+    with open(os.path.join(output_dir, "coconut_meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+        f.write("\n")
+
+
 def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, model_tag: str):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    hp = MODEL_HPARAMS.get(model_tag, _DEFAULT_HP)
+    hp = dict(MODEL_HPARAMS.get(model_tag, _DEFAULT_HP))
+    hp["epochs"] = min(hp["epochs"], 20)
     coconut_model, tokenizer, latent_id, start_id, end_id = _init_model(base_model_id, device)
 
     raw_ds = _to_coconut_examples(D_train)
@@ -188,6 +224,15 @@ def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, mo
     val_acc_history = []
     drift_by_token = {"<|start-latent|>": [], "<|latent|>": [], "<|end-latent|>": []}
     input_embeds_ref = coconut_model.base_causallm.get_input_embeddings().weight.detach().clone()
+    checkpoint_root = os.path.dirname(output_dir)
+    best_dir = os.path.join(checkpoint_root, BEST_DIRNAME)
+    epoch9_dir = os.path.join(checkpoint_root, EPOCH9_DIRNAME)
+    best_val_acc = -float("inf")
+    best_epoch = None
+    early_stop_best_acc = -float("inf")
+    early_stop_bad_epochs = 0
+    early_stopped = False
+    early_stop_epoch = None
 
     def _phase1_val_accuracy() -> float:
         if not val_raw:
@@ -227,7 +272,7 @@ def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, mo
         if optimizer is None or reset_opt:
             stage_transition_epochs.append(epoch)
             optimizer = torch.optim.AdamW(coconut_model.parameters(), lr=hp["lr"], weight_decay=0.01, eps=1e-8)
-            epochs_in_stage = 3 if stage < 4 else max(1, hp["epochs"] - 12)
+            epochs_in_stage = 3 if stage < 4 else max(1, hp["epochs"] - epoch)
             total_steps = max(1, (len(train_loader) * epochs_in_stage) // hp["grad_accum"])
             warmup_steps = max(10, int(total_steps * 0.1))
             def _lr_lambda(step: int):
@@ -272,28 +317,86 @@ def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, mo
                     dim=-1,
                 ).item()
                 drift_by_token[name].append(drift)
-        val_acc_history.append(_phase1_val_accuracy())
+        val_acc = _phase1_val_accuracy()
+        val_acc_history.append(val_acc)
+        epoch_number = epoch + 1
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_epoch = epoch_number
+            _save_coconut_checkpoint(
+                coconut_model,
+                tokenizer,
+                best_dir,
+                base_model_id,
+                role="best",
+                epoch=epoch_number,
+                val_accuracy=val_acc,
+            )
+            tqdm.write(
+                f"[phase1][{model_tag}] best checkpoint saved -> {best_dir} "
+                f"(epoch={epoch_number} val_acc={val_acc:.4f})"
+            )
+        if epoch_number == EPOCH9_SNAPSHOT_EPOCH:
+            _save_coconut_checkpoint(
+                coconut_model,
+                tokenizer,
+                epoch9_dir,
+                base_model_id,
+                role="epoch9",
+                epoch=epoch_number,
+                val_accuracy=val_acc,
+            )
+            tqdm.write(
+                f"[phase1][{model_tag}] epoch 9 checkpoint saved -> {epoch9_dir} "
+                f"(val_acc={val_acc:.4f})"
+            )
         tqdm.write(
-            f"[phase1][{model_tag}] epoch={epoch + 1}/{hp['epochs']} "
+            f"[phase1][{model_tag}] epoch={epoch_number}/{hp['epochs']} "
             f"stage={stage} train_loss={epoch_avg_loss:.4f} "
-            f"val_acc={val_acc_history[-1]:.4f} "
+            f"val_acc={val_acc:.4f} "
             f"(train_n={len(train_raw)} val_n={len(val_raw)})"
         )
 
-    os.makedirs(output_dir, exist_ok=True)
-    coconut_model.base_causallm.save_pretrained(output_dir)
-    tokenizer.save_pretrained(output_dir)
-    with open(os.path.join(output_dir, "coconut_meta.json"), "w", encoding="utf-8") as f:
-        f.write(
-            "{\n"
-            f'  "architecture": "coconut",\n'
-            f'  "base_model_id": "{base_model_id}",\n'
-            f'  "latent_start_token": "<|start-latent|>",\n'
-            f'  "latent_token": "<|latent|>",\n'
-            f'  "latent_end_token": "<|end-latent|>"\n'
-            "}\n"
+        if val_acc > early_stop_best_acc + EARLY_STOP_MIN_DELTA:
+            early_stop_best_acc = val_acc
+            early_stop_bad_epochs = 0
+        else:
+            early_stop_bad_epochs += 1
+
+        if (
+            epoch_number >= EARLY_STOP_MIN_EPOCH
+            and early_stop_bad_epochs >= EARLY_STOP_PATIENCE
+        ):
+            early_stopped = True
+            early_stop_epoch = epoch_number
+            tqdm.write(
+                f"[phase1][{model_tag}] early stopping at epoch {epoch_number}: "
+                f"best_val_acc={best_val_acc:.4f} best_epoch={best_epoch} "
+                f"patience={EARLY_STOP_PATIENCE} min_delta={EARLY_STOP_MIN_DELTA}"
+            )
+            break
+
+    _save_coconut_checkpoint(
+        coconut_model,
+        tokenizer,
+        output_dir,
+        base_model_id,
+        role="final",
+        epoch=len(loss_history),
+        val_accuracy=val_acc_history[-1] if val_acc_history else None,
+    )
+    print(f"Coconut final model saved -> {output_dir}")
+    if best_epoch is None:
+        _save_coconut_checkpoint(
+            coconut_model,
+            tokenizer,
+            best_dir,
+            base_model_id,
+            role="best",
+            epoch=len(loss_history),
+            val_accuracy=val_acc_history[-1] if val_acc_history else None,
         )
-    print(f"Coconut model saved -> {output_dir}")
+        print(f"Coconut best model saved -> {best_dir}")
     return {
         "loss_history": loss_history,
         "losses_per_stage": losses_per_stage,
@@ -303,6 +406,16 @@ def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, mo
         "n_train": len(train_raw),
         "n_val": len(val_raw),
         "epochs": hp["epochs"],
+        "completed_epochs": len(loss_history),
+        "early_stopped": early_stopped,
+        "early_stop_epoch": early_stop_epoch,
+        "early_stop_patience": EARLY_STOP_PATIENCE,
+        "early_stop_min_delta": EARLY_STOP_MIN_DELTA,
+        "early_stop_min_epoch": EARLY_STOP_MIN_EPOCH,
+        "best_val_accuracy": best_val_acc if best_epoch is not None else None,
+        "best_epoch": best_epoch,
+        "best_checkpoint_dir": best_dir,
+        "epoch9_checkpoint_dir": epoch9_dir,
     }
 
 
@@ -352,13 +465,14 @@ def _plot_curves(metrics: dict, phase1_plot_dir: str) -> None:
 
 def _materialize_alias_dir(src_dir: str, dst_dir: str) -> None:
     os.makedirs(dst_dir, exist_ok=True)
-    if os.path.exists(os.path.join(dst_dir, "config.json")):
-        return
     for name in os.listdir(src_dir):
         src = os.path.join(src_dir, name)
         dst = os.path.join(dst_dir, name)
         if os.path.exists(dst) or os.path.islink(dst):
-            continue
+            if os.path.islink(dst) or os.path.isfile(dst):
+                os.unlink(dst)
+            elif os.path.isdir(dst):
+                shutil.rmtree(dst)
         rel_src = os.path.relpath(src, os.path.dirname(dst))
         try:
             os.symlink(rel_src, dst)
@@ -369,25 +483,35 @@ def _materialize_alias_dir(src_dir: str, dst_dir: str) -> None:
                 shutil.copy2(src, dst)
 
 
-def export_compat_checkpoints(checkpoints_dir: str, ratios: list[float] = RATIOS) -> None:
-    canonical_dir = os.path.join(checkpoints_dir, CANONICAL_DIRNAME)
-    if not os.path.exists(os.path.join(canonical_dir, "config.json")):
-        raise FileNotFoundError(f"Canonical Coconut checkpoint not found: {canonical_dir}")
+def export_compat_checkpoints(
+    checkpoints_dir: str,
+    latent_token_counts: list[int] = LATENT_TOKEN_COUNTS,
+    source_dirname: str = BEST_DIRNAME,
+) -> None:
+    source_dir = os.path.join(checkpoints_dir, source_dirname)
+    if not os.path.exists(os.path.join(source_dir, "config.json")):
+        fallback_dir = os.path.join(checkpoints_dir, CANONICAL_DIRNAME)
+        if not os.path.exists(os.path.join(fallback_dir, "config.json")):
+            raise FileNotFoundError(
+                f"No Coconut checkpoint found: {source_dir} or {fallback_dir}"
+            )
+        print(f"Best Coconut checkpoint not found -> {source_dir}; exporting aliases from {fallback_dir}")
+        source_dir = fallback_dir
+        source_dirname = CANONICAL_DIRNAME
 
     cot_dir = os.path.join(checkpoints_dir, "cot")
-    _materialize_alias_dir(canonical_dir, cot_dir)
-    for ratio in ratios:
-        rtag = f"R{int(ratio * 10)}"
-        ccot_dir = os.path.join(checkpoints_dir, f"ccot_{rtag}")
-        _materialize_alias_dir(canonical_dir, ccot_dir)
+    _materialize_alias_dir(source_dir, cot_dir)
+    for n_latents in latent_token_counts:
+        ccot_dir = os.path.join(checkpoints_dir, f"ccot_L{int(n_latents)}")
+        _materialize_alias_dir(source_dir, ccot_dir)
 
     meta_path = os.path.join(checkpoints_dir, "compat_export_meta.json")
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(
             {
-                "source": CANONICAL_DIRNAME,
-                "ratios": ratios,
-                "exported_dirs": ["cot"] + [f"ccot_R{int(r * 10)}" for r in ratios],
+                "source": source_dirname,
+                "latent_token_counts": latent_token_counts,
+                "exported_dirs": ["cot"] + [f"ccot_L{int(n)}" for n in latent_token_counts],
             },
             f,
             indent=2,
@@ -400,11 +524,17 @@ def train_coconut_phase1(
     checkpoints_dir: str,
     results_dir: str,
     model_tag: str,
-    ratios: list[float] = RATIOS,
+    latent_token_counts: list[int] = LATENT_TOKEN_COUNTS,
 ):
     canonical_dir = os.path.join(checkpoints_dir, CANONICAL_DIRNAME)
-    marker_path = os.path.join(canonical_dir, "config.json")
-    if not os.path.exists(marker_path):
+    best_dir = os.path.join(checkpoints_dir, BEST_DIRNAME)
+    epoch9_dir = os.path.join(checkpoints_dir, EPOCH9_DIRNAME)
+    required_markers = [
+        os.path.join(canonical_dir, "config.json"),
+        os.path.join(best_dir, "config.json"),
+        os.path.join(epoch9_dir, "config.json"),
+    ]
+    if not all(os.path.exists(path) for path in required_markers):
         metrics = _run_coconut_training(base_model_id, D_train, canonical_dir, model_tag)
         os.makedirs(results_dir, exist_ok=True)
         with open(os.path.join(results_dir, "phase1_training_metrics.json"), "w", encoding="utf-8") as f:
@@ -414,9 +544,12 @@ def train_coconut_phase1(
         phase1_plot_dir = os.path.join("plots", cfg_id, model_id, "phase1")
         _plot_curves(metrics, phase1_plot_dir)
     else:
-        print(f"Canonical Coconut checkpoint exists -> {canonical_dir} (skipping retrain)")
+        print(
+            "Phase 1 checkpoints exist -> "
+            f"{canonical_dir}, {best_dir}, {epoch9_dir} (skipping retrain)"
+        )
 
-    export_compat_checkpoints(checkpoints_dir, ratios=ratios)
+    export_compat_checkpoints(checkpoints_dir, latent_token_counts=latent_token_counts)
 
 
 def train_cot(base_model_id: str, D_train: list, output_dir: str, model_tag: str, lora_r: int = 16, lora_alpha: int = 32):
@@ -430,13 +563,13 @@ def train_ccot(
     base_model_id: str,
     D_train: list,
     compressed_cache: list,
-    ratio: float,
+    latent_tokens: int,
     output_dir: str,
     model_tag: str,
     lora_r: int = 16,
     lora_alpha: int = 32,
 ):
-    del compressed_cache, ratio, lora_r, lora_alpha
+    del compressed_cache, latent_tokens, lora_r, lora_alpha
     checkpoints_dir = os.path.dirname(output_dir)
     results_dir = os.path.join("results", checkpoints_dir.split("/")[-2], checkpoints_dir.split("/")[-1])
     train_coconut_phase1(base_model_id, D_train, checkpoints_dir, results_dir, model_tag)

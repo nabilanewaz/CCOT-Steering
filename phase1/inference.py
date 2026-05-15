@@ -37,11 +37,14 @@ def normalize_answer(text: str) -> str:
 
 
 def extract_reasoning_span(text: str) -> str:
-    """Strip [compress:R] tag and everything after 'Answer:' marker."""
+    """Strip control tags and everything after 'Answer:' marker."""
     parts = text.split('\n\nAnswer:')
     reasoning_block = parts[0]
     lines = reasoning_block.strip().split('\n')
-    return '\n'.join(l for l in lines if not l.startswith('[compress:'))
+    return '\n'.join(
+        l for l in lines
+        if not l.startswith('[compress:') and not l.startswith('[latents:')
+    )
 
 
 # ── Model loaders ─────────────────────────────────────────────────────────────
@@ -130,14 +133,15 @@ def run_cot(model, tokenizer, item: dict, device: str) -> tuple[str | None, str]
     return extract_answer(raw_answer), reasoning
 
 
-def run_ccot(model, tokenizer, item: dict, ratio: float,
-             device: str) -> tuple[str | None, str]:
-    n_latents = max(1, int(round(6 * ratio)))
+def latent_prompt(question: str, n_latents: int) -> str:
+    n_latents = max(1, int(n_latents))
     latent_span = "<|latent|>" * n_latents
-    enc = tokenizer(
-        f"{item['question']}\n<|start-latent|>{latent_span}<|end-latent|>\n",
-        return_tensors='pt',
-    ).to(device)
+    return f"{question}\n<|start-latent|>{latent_span}<|end-latent|>\n"
+
+
+def run_ccot(model, tokenizer, item: dict, n_latents: int,
+             device: str) -> tuple[str | None, str]:
+    enc = tokenizer(latent_prompt(item['question'], n_latents), return_tensors='pt').to(device)
     with torch.no_grad():
         out = model.generate(**enc, do_sample=False, max_new_tokens=256)
     generated = tokenizer.decode(
@@ -217,15 +221,12 @@ def compute_per_example_budgets(cot_model, tokenizer, dataset: list,
 
 
 def measure_ccot_token_counts(ccot_model, tokenizer, dataset: list,
-                               device: str, ratio: float) -> dict:
+                               device: str, n_latents: int) -> dict:
     """Run CCoT model on dataset and return reasoning token count statistics."""
     lengths = []
     ccot_model.eval()
     for item in dataset:
-        enc = tokenizer(
-            f"Question: {item['question']}\n\n[compress:{ratio}]\n",
-            return_tensors='pt',
-        ).to(device)
+        enc = tokenizer(latent_prompt(item['question'], n_latents), return_tensors='pt').to(device)
         with torch.no_grad():
             out_ids = ccot_model.generate(**enc, do_sample=False, max_new_tokens=256)
         full_text = tokenizer.decode(out_ids[0], skip_special_tokens=True)
@@ -236,5 +237,5 @@ def measure_ccot_token_counts(ccot_model, tokenizer, dataset: list,
         'median':      float(np.median(lengths)),
         'std':         float(np.std(lengths)),
         'per_example': lengths,
-        'ratio':       ratio,
+        'latent_tokens': n_latents,
     }

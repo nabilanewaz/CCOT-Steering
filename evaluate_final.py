@@ -25,6 +25,7 @@ from utils.dataset_paths import get_active_dataset_id, init_project_dataset
 from phase1.inference import (
     extract_answer,
     extract_reasoning_span,
+    latent_prompt,
     load_base_frozen,
     load_finetuned,
     normalize_answer,
@@ -266,7 +267,7 @@ def compute_condition_cis(
 
 def compute_paired_cis(
     all_preds: dict,
-    ratio_int: int,
+    condition_tag: str,
     source: str,
     n_bootstrap: int = N_BOOTSTRAP,
     seed: int = CI_SEED,
@@ -282,11 +283,11 @@ def compute_paired_cis(
       - ccot vs full CoT      (compression cost)
       - trimmed vs ccot       (mechanism baseline)
     """
-    ccot_cond  = f'ccot_R{ratio_int}'
-    dom_cond   = f'dom_R{ratio_int}_{source}'
-    cpca_cond  = f'cpca_R{ratio_int}_{source}'
-    noise_cond = f'noise_R{ratio_int}_{source}'
-    trim_cond  = f'trimmed_R{ratio_int}'
+    ccot_cond  = f'ccot_{condition_tag}'
+    dom_cond   = f'dom_{condition_tag}_{source}'
+    cpca_cond  = f'cpca_{condition_tag}_{source}'
+    noise_cond = f'noise_{condition_tag}_{source}'
+    trim_cond  = f'trimmed_{condition_tag}'
 
     pairs = [
         ('dom_vs_ccot',        ccot_cond,   dom_cond),
@@ -415,17 +416,17 @@ def _load_selected_yaml(path: str = 'configs/selected.yaml') -> dict:
 
 
 def _display_condition_name(name: str) -> str:
-    if name.startswith('ccot_R'):
+    if name.startswith('ccot_R') or name.startswith('ccot_L'):
         return 'ccot'
-    if name.startswith('trimmed_R'):
+    if name.startswith('trimmed_R') or name.startswith('trimmed_L'):
         return 'trimmed_cot'
-    if name.startswith('noise_R'):
+    if name.startswith('noise_R') or name.startswith('noise_L'):
         return 'random_noise'
-    if name.startswith('dom_R'):
+    if name.startswith('dom_R') or name.startswith('dom_L'):
         return 'ccot_dom'
-    if name.startswith('cpca_R'):
+    if name.startswith('cpca_R') or name.startswith('cpca_L'):
         return 'ccot_cpca'
-    if name.startswith('trimmed_dom_R'):
+    if name.startswith('trimmed_dom_R') or name.startswith('trimmed_dom_L'):
         return 'trimmed_dom'
     return name
 
@@ -727,16 +728,16 @@ def compute_all_flip_matrices(
     all_preds: dict,
     golds: list,
     model_tag: str,
-    ratio_int: int,
+    condition_tag: str,
     source: str,
 ) -> list[FlipMatrix]:
     """10 primary comparison pairs."""
-    ccot     = f'ccot_R{ratio_int}'
-    trim     = f'trimmed_R{ratio_int}'
-    dom      = f'dom_R{ratio_int}_{source}'
-    cpca     = f'cpca_R{ratio_int}_{source}'
-    trim_dom = f'trimmed_dom_R{ratio_int}'
-    noise    = f'noise_R{ratio_int}_{source}'
+    ccot     = f'ccot_{condition_tag}'
+    trim     = f'trimmed_{condition_tag}'
+    dom      = f'dom_{condition_tag}_{source}'
+    cpca     = f'cpca_{condition_tag}_{source}'
+    trim_dom = f'trimmed_dom_{condition_tag}'
+    noise    = f'noise_{condition_tag}_{source}'
 
     pairs = [
         ('no_cot',   'full_cot'),
@@ -1069,14 +1070,15 @@ def run_final_evaluation(
         # ── Load locked Phase 3 config ─────────────────────────────────────────
         best_cfg   = phase3_best.get(model_tag) or _load_best_config(results_dir)
         meta       = _load_meta_file(vectors_dir)
-        ratio      = float(best_cfg.get('ratio') or 0.7)
-        ratio_int  = int(round(ratio * 10))
+        latent_tokens = int(best_cfg.get('latent_tokens') or meta.get('best_ccot_latent_tokens') or 4)
+        ratio = latent_tokens / 6.0
+        condition_tag = f"L{latent_tokens}"
         source     = str(best_cfg.get('vector_source') or 'ccot')
         alpha_star = float(best_cfg.get('alpha_star') or 1.0)
         r_final    = int(meta.get('ccot_r_final', 10))
 
         print(
-            f"Locked: R={ratio}  src={source}  "
+            f"Locked: L={latent_tokens} latent tokens  src={source}  "
             f"method={best_cfg.get('vector_method')}  α*={alpha_star:.4f}"
         )
 
@@ -1117,7 +1119,7 @@ def run_final_evaluation(
         print(f"  acc={all_metrics['full_cot'].accuracy:.3f}")
 
         # Condition: Trimmed CoT
-        trim_cond = f'trimmed_R{ratio_int}'
+        trim_cond = f'trimmed_{condition_tag}'
         print(f"[PH4] {trim_cond}")
         t0 = time.time()
         examples = []
@@ -1139,7 +1141,7 @@ def run_final_evaluation(
         print(f"  acc={all_metrics[trim_cond].accuracy:.3f}")
 
         # Condition: Trimmed + DoM  (CoT model, base source, base L_star)
-        trim_dom_cond = f'trimmed_dom_R{ratio_int}'
+        trim_dom_cond = f'trimmed_dom_{condition_tag}'
         print(f"[PH4] {trim_dom_cond}")
         try:
             v_base_dom  = _load_dom(vectors_dir, 'base').to(device)
@@ -1209,8 +1211,8 @@ def run_final_evaluation(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # ── Phase C: CCoT model (locked ratio) ────────────────────────────────
-        ccot_ckpt = os.path.join(ckpt_dir, f'ccot_R{ratio_int}')
+        # ── Phase C: CCoT model (locked latent-token budget) ─────────────────
+        ccot_ckpt = os.path.join(ckpt_dir, f'ccot_{condition_tag}')
         if not (
             os.path.exists(os.path.join(ccot_ckpt, 'adapter_config.json'))
             or os.path.exists(os.path.join(ccot_ckpt, 'config.json'))
@@ -1221,9 +1223,7 @@ def run_final_evaluation(
             for p in ccot_model.parameters():
                 p.requires_grad = False
             ccot_model.eval()
-            ccot_prompt_fn = lambda item: (
-                f"Question: {item['question']}\n\n[compress:{ratio}]\n"
-            )
+            ccot_prompt_fn = lambda item, n=latent_tokens: latent_prompt(item['question'], n)
 
             # Load best-source vectors
             try:
@@ -1275,7 +1275,7 @@ def run_final_evaluation(
                     return exs, m
 
                 # Condition: CCoT baseline (no hook, but metrics captured)
-                ccot_cond = f'ccot_R{ratio_int}'
+                ccot_cond = f'ccot_{condition_tag}'
                 print(f"[PH4] {ccot_cond}")
                 t0 = time.time()
                 examples = []
@@ -1293,7 +1293,7 @@ def run_final_evaluation(
                 print(f"  acc={all_metrics[ccot_cond].accuracy:.3f}")
 
                 # Condition: Noise control
-                noise_cond = f'noise_R{ratio_int}_{source}'
+                noise_cond = f'noise_{condition_tag}_{source}'
                 print(f"[PH4] {noise_cond}")
                 exs, m = _make_steered_examples(
                     lambda b: make_noise_hook(b, alpha_star, device),
@@ -1305,7 +1305,7 @@ def run_final_evaluation(
                 print(f"  acc={m.accuracy:.3f}")
 
                 # Condition: DoM steering
-                dom_cond = f'dom_R{ratio_int}_{source}'
+                dom_cond = f'dom_{condition_tag}_{source}'
                 print(f"[PH4] {dom_cond}")
                 exs, m = _make_steered_examples(
                     lambda b: make_dom_hook(b, v_truth, alpha_star, device),
@@ -1318,7 +1318,7 @@ def run_final_evaluation(
 
                 # Condition: cPCA steering (if vector available)
                 if has_cpca:
-                    cpca_cond = f'cpca_R{ratio_int}_{source}'
+                    cpca_cond = f'cpca_{condition_tag}_{source}'
                     print(f"[PH4] {cpca_cond}")
                     exs, m = _make_steered_examples(
                         lambda b: make_cpca_hook(b, U_cpca, alpha_star, device),
@@ -1344,7 +1344,7 @@ def run_final_evaluation(
         # ── Bootstrap CIs (pure numpy, no model) ──────────────────────────────
         print(f"\n[PH4] Computing bootstrap CIs ({N_BOOTSTRAP} resamples)...")
         condition_cis = compute_condition_cis(all_preds, seed=CI_SEED)
-        paired_cis    = compute_paired_cis(all_preds, ratio_int, source, seed=CI_SEED)
+        paired_cis    = compute_paired_cis(all_preds, condition_tag, source, seed=CI_SEED)
 
         # Attach per-condition CIs back to FinalMetrics for inline display
         for cond, br in condition_cis.items():
@@ -1354,14 +1354,14 @@ def run_final_evaluation(
 
         # ── Compute flip matrices and grid ─────────────────────────────────────
         flip_matrices = compute_all_flip_matrices(
-            all_preds, golds, model_tag, ratio_int, source
+            all_preds, golds, model_tag, condition_tag, source
         )
         flip_grid = compute_full_flip_grid(all_preds, golds, model_tag)
 
         # ── Reporting ──────────────────────────────────────────────────────────
-        ccot_c  = f'ccot_R{ratio_int}'
-        dom_c   = f'dom_R{ratio_int}_{source}'
-        noise_c = f'noise_R{ratio_int}_{source}'
+        ccot_c  = f'ccot_{condition_tag}'
+        dom_c   = f'dom_{condition_tag}_{source}'
+        noise_c = f'noise_{condition_tag}_{source}'
 
         print_accuracy_table(all_metrics)
         print_ci_table(condition_cis)

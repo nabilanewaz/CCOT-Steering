@@ -26,10 +26,11 @@ def select_layers(
     """
     layers = sorted(layer_scores.keys())
     scores = torch.tensor([layer_scores[L] for L in layers], dtype=torch.float32)
-    threshold = (scores.mean() + multiplier * scores.std()).item()
+    score_std = scores.std(unbiased=False)
+    threshold = (scores.mean() + multiplier * score_std).item()
 
     print(f"\nProbe threshold: {threshold:.3f}  "
-          f"(mean={scores.mean():.3f}, std={scores.std():.3f})")
+          f"(mean={scores.mean():.3f}, std={score_std:.3f})")
 
     candidates = [L for L in layers if layer_scores[L] >= threshold]
     if not candidates:
@@ -193,10 +194,10 @@ def select_best_cpca(
     H_pos_L: torch.Tensor,
     H_neg_L: torch.Tensor,
     seed: int = 42,
-) -> tuple[torch.Tensor, torch.Tensor, int, float]:
+) -> tuple[torch.Tensor, torch.Tensor, int, float, float]:
     """
     Evaluate each (k, β) by stratified 80/20 held-out probe accuracy on the
-    projected space. Returns (U_best [d,k], lam_best [k], best_k, best_beta).
+    projected space. Returns (U_best [d,k], lam_best [k], best_k, best_beta, best_acc).
     """
     X = torch.cat([H_pos_L, H_neg_L]).numpy().astype(np.float32)
     y = np.array([1] * len(H_pos_L) + [0] * len(H_neg_L))
@@ -227,9 +228,10 @@ def select_best_cpca(
 
     best_k, best_beta = best_key
     U_best, lam_best  = sweep_results[best_key]
+    best_acc = scores[best_key]
     print(f"    Best: k={best_k}  β={best_beta:.1f}  "
-          f"acc={scores[best_key]:.3f}")
-    return U_best, lam_best, best_k, best_beta
+          f"acc={best_acc:.3f}")
+    return U_best, lam_best, best_k, best_beta, best_acc
 
 
 def run_cpca_sweep(
@@ -242,7 +244,7 @@ def run_cpca_sweep(
 ) -> dict:
     """
     Run the (k, β) grid sweep at every selected layer, pick the best per layer.
-    Returns {L: (U_best [d, best_k], lam_best [best_k], best_k, best_beta)}.
+    Returns {L: (U_best [d, best_k], lam_best [best_k], best_k, best_beta, best_acc)}.
     """
     layer_results = {}
     for L in selected_layers:
@@ -255,11 +257,11 @@ def run_cpca_sweep(
         if not sweep:
             print(f"    All (k, β) combinations failed — skipping layer {L}.")
             continue
-        U_best, lam_best, best_k, best_beta = select_best_cpca(
+        U_best, lam_best, best_k, best_beta, best_acc = select_best_cpca(
             sweep, H_pos[L], H_neg[L],
         )
         analyze_eigenspectrum(lam_best, L)
-        layer_results[L] = (U_best, lam_best, best_k, best_beta)
+        layer_results[L] = (U_best, lam_best, best_k, best_beta, best_acc)
     return layer_results
 
 
@@ -271,19 +273,21 @@ def weighted_subspace_merge(
     dom_vectors: dict[int, torch.Tensor],
     v_global: torch.Tensor,
     r_final: int,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, dict[int, float]]:
     """
     Merge per-layer cPCA subspaces into one [d, r_final] orthonormal subspace.
     Weight = probe_accuracy × mean_eigenvalue × directional_agreement.
     """
     print("\nLayer weights for subspace merge:")
     weighted_cols = []
+    layer_weights = {}
 
     for L, (U_L, lam_L) in sorted(subspaces.items()):
         probe_w = layer_scores.get(L, 0.5)
         eig_w   = lam_L.mean().item()
         dir_w   = max(0.0, torch.dot(dom_vectors[L], v_global).item())
         weight  = probe_w * eig_w * dir_w
+        layer_weights[int(L)] = float(weight)
         weighted_cols.append(U_L * weight)
         print(f"  Layer {L:02d}: probe={probe_w:.3f}  eig={eig_w:.4f}  "
               f"dir={dir_w:.3f}  -> weight={weight:.6f}")
@@ -303,7 +307,7 @@ def weighted_subspace_merge(
         cumulative += pct
         print(f"  SV{i+1}: {pct:5.1f}%  cumul {cumulative:5.1f}%")
 
-    return U_truth_final
+    return U_truth_final, layer_weights
 
 
 # ── Shuffled-label cPCA control ───────────────────────────────────────────────
@@ -352,8 +356,8 @@ def compute_shuffled_cpca(
     if not shuf_results:
         return None
 
-    subspaces_shuf = {L: (U, lam) for L, (U, lam, _, _) in shuf_results.items()}
-    U_shuffled = weighted_subspace_merge(
+    subspaces_shuf = {L: (U, lam) for L, (U, lam, _, _, _) in shuf_results.items()}
+    U_shuffled, _ = weighted_subspace_merge(
         subspaces_shuf, layer_scores, dom_vectors, v_truth, r_final
     )
 

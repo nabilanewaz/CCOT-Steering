@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from phase2.loaders import get_transformer_layers, find_boundary_idx_ccot
+from phase1.inference import latent_prompt
 
 _LAMBDA_M = {
     'phi2': 0.005,         # LayerNorm — more tolerant of large perturbations
@@ -42,7 +43,7 @@ def tune_alpha(
     layer_star: int,
     device: str,
     model_tag: str = '',
-    ratio: float = 0.7,
+    latent_tokens: int = 4,
     lambda_a: float = 0.1,
     lambda_m: float = None,     # None → per-backbone default from _LAMBDA_M
     max_epochs: int = 5,
@@ -103,7 +104,7 @@ def tune_alpha(
 
     def _compute_losses(item, grad: bool):
         """Returns (total_loss_tensor, L_ans_float, L_align_float, L_mag_float)."""
-        q_prompt = f"Question: {item['question']}\n\n[compress:{ratio}]\n"
+        q_prompt = latent_prompt(item['question'], latent_tokens)
         ans_text = item['answer'].split('####')[1].strip()
 
         q_enc = tokenizer(q_prompt, return_tensors='pt').to(device)

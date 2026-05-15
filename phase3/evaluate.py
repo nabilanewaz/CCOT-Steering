@@ -2,7 +2,7 @@
 
 Conditions evaluated per backbone (spec §3.2):
   Fixed (×1):      no_cot, full_cot
-  Per ratio (×5):  ccot_R*, trimmed_R*, noise_{src}, dom_{src}, cpca_{src}, trimmed_dom
+  Per latent budget:  ccot_L*, trimmed_L*, noise_{src}, dom_{src}, cpca_{src}, trimmed_dom
   → ~52 evaluations per backbone on D_val.
 """
 import glob as _glob
@@ -17,6 +17,7 @@ import torch
 from phase1.inference import (
     compute_per_example_budgets,
     extract_answer,
+    latent_prompt,
     load_finetuned,
     normalize_answer,
     run_cot,
@@ -33,7 +34,7 @@ from phase3.hooks import (
     run_with_hook,
 )
 
-RATIOS   = [0.5, 0.6, 0.7, 0.8, 0.9]
+LATENT_TOKEN_COUNTS = [3, 4, 6]
 SOURCES  = ('ccot', 'base')
 
 def _checkpoint_ready(path: str) -> bool:
@@ -229,11 +230,10 @@ def _tune_and_save_alpha(
       3. Save alpha_star, training history JSON, and loss-curve PNG.
     Results are cached per source — rerun is skipped if alpha_star file exists.
     """
-    best_ratio_int = meta['best_ccot_ratio']
-    best_ratio_flt = best_ratio_int / 10.0
+    best_latent_tokens = int(meta.get('best_ccot_latent_tokens') or 4)
 
     source_ckpt = {
-        'ccot': os.path.join(checkpoints_dir, f'ccot_R{best_ratio_int}'),
+        'ccot': os.path.join(checkpoints_dir, f'ccot_L{best_latent_tokens}'),
         'base': os.path.join(checkpoints_dir, 'cot'),
     }
     source_L_star = {
@@ -274,7 +274,7 @@ def _tune_and_save_alpha(
             D_sub    = D_val[:min(200, len(D_val))]
             sweep_sel = sweep_lambda_grid(
                 model, tok, D_sub, v_dom, L_star, device, model_tag,
-                ratio=best_ratio_flt,
+                latent_tokens=best_latent_tokens,
                 out_path=sweep_path,
                 max_epochs=2,
             )
@@ -296,7 +296,7 @@ def _tune_and_save_alpha(
         # ── Step 2: Full α* tuning with selected lambdas ──────────────────────
         alpha_star, history = tune_alpha(
             model, tok, D_val, v_dom, L_star, device,
-            model_tag=model_tag, ratio=best_ratio_flt,
+            model_tag=model_tag, latent_tokens=best_latent_tokens,
             lambda_a=lambda_a, lambda_m=lambda_m,
         )
         torch.save(alpha_star, out_path)
@@ -403,23 +403,27 @@ def run_phase3_evaluation(
     print(f"  full_cot: acc={results[-1].accuracy:.3f}  "
           f"mean_tok={full_cot_mean_tokens:.1f}")
 
-    # Pre-compute per-example budgets for all ratios (done while CoT is loaded)
-    budgets_by_ratio: dict[float, list[int]] = {}
-    for ratio in RATIOS:
-        print(f"  [budget] computing per-example budgets for R={ratio}…")
-        budgets_by_ratio[ratio] = compute_per_example_budgets(
-            cot_model, tok_cot, D_val, device, ratio
+    best_latent_tokens = int(meta.get('best_ccot_latent_tokens') or 4)
+    latent_token_counts = [best_latent_tokens]
+
+    # Pre-compute per-example budgets for the selected latent budget.
+    budgets_by_latents: dict[int, list[int]] = {}
+    for latent_tokens in latent_token_counts:
+        budget_ratio = latent_tokens / 6.0
+        print(f"  [budget] computing per-example budgets for L={latent_tokens}…")
+        budgets_by_latents[latent_tokens] = compute_per_example_budgets(
+            cot_model, tok_cot, D_val, device, budget_ratio
         )
 
-    # ── Per-ratio loop ─────────────────────────────────────────────────────────
-    for ratio in RATIOS:
-        ratio_int = int(ratio * 10)
-        rtag      = f"R{ratio_int}"
-        budgets   = budgets_by_ratio[ratio]
-        print(f"\n{'='*55}\n[PH3] Ratio = {ratio}  ({rtag})\n{'='*55}")
+    # ── Per-latent-budget loop ────────────────────────────────────────────────
+    for latent_tokens in latent_token_counts:
+        ratio = latent_tokens / 6.0
+        rtag = f"L{latent_tokens}"
+        budgets = budgets_by_latents[latent_tokens]
+        print(f"\n{'='*55}\n[PH3] Latent tokens = {latent_tokens}  ({rtag})\n{'='*55}")
 
-        # Trimmed CoT (CoT model, same token budget as CCoT)
-        print(f"  Evaluating: Trimmed CoT (R={ratio})")
+        # Trimmed CoT (CoT model, same approximate token budget as latent budget)
+        print(f"  Evaluating: Trimmed CoT (L={latent_tokens})")
         c_list, f_list, tok_list, lat_list = [], [], [], []
         for i, item in enumerate(D_val):
             t0   = time.time()
@@ -432,12 +436,12 @@ def run_phase3_evaluation(
             c_list.append(ok); f_list.append(pred is not None)
             tok_list.append(nt); lat_list.append(lt)
         results.append(_build_result(
-            f'trimmed_R{ratio_int}', model_tag, ratio, None, None, None,
+            f'trimmed_{rtag}', model_tag, ratio, None, None, None,
             c_list, f_list, tok_list, lat_list, None, full_cot_mean_tokens,
         ))
-        print(f"    trimmed_R{ratio_int}: acc={results[-1].accuracy:.3f}")
+        print(f"    trimmed_{rtag}: acc={results[-1].accuracy:.3f}")
 
-        # Load CCoT model for this ratio
+        # Load CCoT model for this latent budget
         ccot_ckpt  = os.path.join(checkpoints_dir, f'ccot_{rtag}')
         if not _checkpoint_ready(ccot_ckpt):
             print(f"  [SKIP] CCoT checkpoint missing: {ccot_ckpt}")
@@ -446,12 +450,10 @@ def run_phase3_evaluation(
         for p in ccot_model.parameters():
             p.requires_grad = False
         ccot_model.eval()
-        ccot_prompt_fn = lambda item: (
-            f"Question: {item['question']}\n\n[compress:{ratio}]\n"
-        )
+        ccot_prompt_fn = lambda item, n=latent_tokens: latent_prompt(item['question'], n)
 
         # CCoT baseline (no steering) — collect per-example correct flags
-        print(f"  Evaluating: CCoT (R={ratio})")
+        print(f"  Evaluating: CCoT (L={latent_tokens})")
         c_list, f_list, tok_list, lat_list = [], [], [], []
         for item in D_val:
             ok, fd, nt, lt = _eval_one(
@@ -490,7 +492,7 @@ def run_phase3_evaluation(
                 has_cpca = False
 
             # Condition 5: Random Noise
-            print(f"  Evaluating: Random Noise (R={ratio}, src={source})")
+            print(f"  Evaluating: Random Noise (L={latent_tokens}, src={source})")
             c_list, f_list, tok_list, lat_list = [], [], [], []
             noise_fac = lambda b, a=alpha: make_noise_hook(b, a, device)
             for item in D_val:
@@ -509,7 +511,7 @@ def run_phase3_evaluation(
                   f"flip={results[-1].flip_rate:.3f}")
 
             # Condition 6: CCoT + DoM
-            print(f"  Evaluating: CCoT + DoM (R={ratio}, src={source})")
+            print(f"  Evaluating: CCoT + DoM (L={latent_tokens}, src={source})")
             c_list, f_list, tok_list, lat_list = [], [], [], []
             dom_fac = lambda b, v=v_dom, a=alpha: make_dom_hook(b, v, a, device)
             for item in D_val:
@@ -529,7 +531,7 @@ def run_phase3_evaluation(
 
             # Condition 7: CCoT + cPCA
             if has_cpca:
-                print(f"  Evaluating: CCoT + cPCA (R={ratio}, src={source})")
+                print(f"  Evaluating: CCoT + cPCA (L={latent_tokens}, src={source})")
                 c_list, f_list, tok_list, lat_list = [], [], [], []
                 cpca_fac = lambda b, U=U_cpca, a=alpha: make_cpca_hook(b, U, a, device)
                 for item in D_val:
@@ -553,7 +555,7 @@ def run_phase3_evaluation(
             # Rules out: "the extraction procedure itself creates a useful artifact"
             try:
                 v_shuf = _load_shuffled_vector(vectors_dir, source, 'dom')
-                print(f"  Evaluating: Shuffled-label DoM (R={ratio}, src={source})")
+                print(f"  Evaluating: Shuffled-label DoM (L={latent_tokens}, src={source})")
                 c_list, f_list, tok_list, lat_list = [], [], [], []
                 shuf_dom_fac = lambda b, v=v_shuf, a=alpha: make_dom_hook(b, v, a, device)
                 for item in D_val:
@@ -575,7 +577,7 @@ def run_phase3_evaluation(
 
             # Control B: Negative DoM direction at α*
             # Injects −v_truth; should degrade accuracy if the direction is meaningful
-            print(f"  Evaluating: Negative DoM (R={ratio}, src={source})")
+            print(f"  Evaluating: Negative DoM (L={latent_tokens}, src={source})")
             c_list, f_list, tok_list, lat_list = [], [], [], []
             neg_dom_fac = lambda b, v=v_dom, a=alpha: make_dom_hook(b, v, -a, device)
             for item in D_val:
@@ -597,7 +599,7 @@ def run_phase3_evaluation(
             if has_cpca:
                 # Control C: Negative cPCA — subtract subspace projection at α*
                 # h' = h − α·σ·U·Uᵀ·ĥ; should degrade if subspace is meaningful
-                print(f"  Evaluating: Negative cPCA (R={ratio}, src={source})")
+                print(f"  Evaluating: Negative cPCA (L={latent_tokens}, src={source})")
                 c_list, f_list, tok_list, lat_list = [], [], [], []
                 neg_cpca_fac = lambda b, U=U_cpca, a=alpha: make_cpca_hook(b, U, -a, device)
                 for item in D_val:
@@ -620,7 +622,7 @@ def run_phase3_evaluation(
                 # Subspace-level analogue of shuffled-label DoM
                 try:
                     U_shuf_cpca = _load_shuffled_vector(vectors_dir, source, 'cpca', r_final)
-                    print(f"  Evaluating: Shuffled cPCA (R={ratio}, src={source})")
+                    print(f"  Evaluating: Shuffled cPCA (L={latent_tokens}, src={source})")
                     c_list, f_list, tok_list, lat_list = [], [], [], []
                     shuf_cpca_fac = lambda b, U=U_shuf_cpca, a=alpha: (
                         make_cpca_hook(b, U, a, device)
@@ -652,7 +654,7 @@ def run_phase3_evaluation(
                 L_star_base = meta.get('base_best_layer',
                                        meta.get('ccot_best_layer', 14))
 
-            print(f"  Evaluating: Trimmed + DoM (R={ratio})")
+            print(f"  Evaluating: Trimmed + DoM (L={latent_tokens})")
             c_list, f_list, tok_list, lat_list = [], [], [], []
             trim_dom_fac = lambda b, v=v_base_dom, a=alpha_base: (
                 make_dom_hook(b, v, a, device)
@@ -676,7 +678,7 @@ def run_phase3_evaluation(
             print(f"    trimmed_dom_{rtag}: acc={results[-1].accuracy:.3f}  "
                   f"flip={results[-1].flip_rate:.3f}")
         except FileNotFoundError:
-            print(f"  [SKIP] Base DoM vector missing — skipping Trimmed+DoM at R={ratio}")
+            print(f"  [SKIP] Base DoM vector missing — skipping Trimmed+DoM at L={latent_tokens}")
 
         del ccot_model
         if torch.cuda.is_available():
@@ -727,7 +729,7 @@ def _run_diagnostic_sweep(
     alphas  = [0.0, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0]
     D_sub   = D_val[:min(n_sub, len(D_val))]
     source  = 'ccot'
-    ratio_int = meta['best_ccot_ratio']
+    latent_tokens = int(meta.get('best_ccot_latent_tokens') or 4)
 
     try:
         v_dom  = _load_vector(vectors_dir, source, 'dom')
@@ -736,7 +738,7 @@ def _run_diagnostic_sweep(
         print("  [sweep skip] Missing vector or cPCA file.")
         return
 
-    ckpt   = os.path.join(checkpoints_dir, f'ccot_R{ratio_int}')
+    ckpt   = os.path.join(checkpoints_dir, f'ccot_L{latent_tokens}')
     if not _checkpoint_ready(ckpt):
         print("  [sweep skip] CCoT checkpoint missing.")
         return
@@ -746,8 +748,7 @@ def _run_diagnostic_sweep(
         p.requires_grad = False
     model.eval()
 
-    ratio      = ratio_int / 10.0
-    prompt_fn  = lambda item: f"Question: {item['question']}\n\n[compress:{ratio}]\n"
+    prompt_fn  = lambda item, n=latent_tokens: latent_prompt(item['question'], n)
     alpha_star = _load_alpha(vectors_dir, source)
 
     sweep = []

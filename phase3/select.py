@@ -1,6 +1,7 @@
 """Select the best steered configuration from Phase 3 results (spec §3.9)."""
 import json
 import os
+import re
 from math import sqrt
 
 
@@ -40,14 +41,17 @@ def select_best_steered_config(
     n = best.get('n_examples', 1) or 1
     wl = _wilson_lower(best['accuracy'], n)
 
-    # CCoT accuracy at same ratio (reference)
-    ccot_cond   = f"ccot_R{int(best['ratio'] * 10)}" if best.get('ratio') else None
+    # CCoT accuracy at same latent-token budget (reference)
+    latent_match = re.search(r'_L(\d+)', best.get('condition', ''))
+    latent_tokens = int(latent_match.group(1)) if latent_match else None
+    ccot_cond = f"ccot_L{latent_tokens}" if latent_tokens else None
     ccot_rec    = next((r for r in records if r['condition'] == ccot_cond), None)
     ccot_acc    = ccot_rec['accuracy'] if ccot_rec else None
 
     selection = {
         'model_tag':        model_tag,
         'best_condition':   best['condition'],
+        'latent_tokens':    latent_tokens,
         'ratio':            best.get('ratio'),
         'vector_source':    best.get('vector_source'),
         'vector_method':    best.get('vector_method'),

@@ -20,7 +20,6 @@ from utils.dataset_paths import (
     init_project_dataset,
     phase4_subprocess_env,
 )
-from phase1.compress import build_ccot_cache
 from phase1.train import train_coconut_phase1
 from phase1.evaluate import run_phase1_evaluation, print_comparison_table
 from phase2.run import run_phase2_all_sources
@@ -29,7 +28,7 @@ from phase3.select import select_best_steered_config
 
 CFG_ID     = 'S2'   # fixed 60/20/20 split
 MODEL_TAGS = ['llama32_3b', 'phi2', 'qwen25_3b', 'qwen25_math1.5b']
-RATIOS     = [0.5, 0.6, 0.7, 0.8, 0.9]
+LATENT_TOKEN_COUNTS = [3, 4, 6]
 
 MODEL_ID_MAP = {
     'llama32_3b':      'meta-llama/Llama-3.2-3B',
@@ -83,11 +82,6 @@ def main():
     D_train   = splits[CFG_ID]['D_train']
     D_steer   = splits[CFG_ID]['D_steer']
     D_val     = splits[CFG_ID]['D_val']
-    cache_dir = f"cache/{CFG_ID}"
-
-    # In Coconut phase1, this creates compatibility cache files for pipeline contracts.
-    build_ccot_cache(D_train, RATIOS, cache_dir, compressor=None)
-
     for model_tag in MODEL_TAGS:
             base_model_id = MODEL_ID_MAP[model_tag]
             ckpt_dir      = f"checkpoints/{CFG_ID}/{model_tag}"
@@ -95,21 +89,21 @@ def main():
 
             # ── Phase 1 training (single Coconut run + compat export) ────────
             cot_out = os.path.join(ckpt_dir, 'cot')
-            all_ccot_ready = all(
-                _checkpoint_ready(os.path.join(ckpt_dir, f"ccot_R{int(r * 10)}"))
-                for r in RATIOS
+            all_latent_ready = all(
+                _checkpoint_ready(os.path.join(ckpt_dir, f"ccot_L{int(n)}"))
+                for n in LATENT_TOKEN_COUNTS
             )
-            if not (_checkpoint_ready(cot_out) and all_ccot_ready):
+            if not (_checkpoint_ready(cot_out) and all_latent_ready):
                 train_coconut_phase1(
                     base_model_id=base_model_id,
                     D_train=D_train,
                     checkpoints_dir=ckpt_dir,
                     results_dir=results_dir,
                     model_tag=model_tag,
-                    ratios=RATIOS,
+                    latent_token_counts=LATENT_TOKEN_COUNTS,
                 )
             else:
-                print(f"[PH1] Coconut canonical + compat checkpoints exist, skipping: {ckpt_dir}")
+                print(f"[PH1] Coconut latent checkpoints exist, skipping: {ckpt_dir}")
 
             # ── Phase 1 evaluation ────────────────────────────────────────────
             phase1_results = run_phase1_evaluation(

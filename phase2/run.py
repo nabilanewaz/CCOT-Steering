@@ -1,6 +1,7 @@
 """Full Phase 2 runner: collect hidden states → probe → DoM → cPCA → compare."""
 import json
 import os
+import time
 
 import torch
 
@@ -40,6 +41,45 @@ _CPCA_FN_MAP = {
 }
 
 
+def _tensor_shape(value) -> list[int] | None:
+    return list(value.shape) if value is not None and hasattr(value, "shape") else None
+
+
+def _layer_selection_diagnostics(
+    layer_scores: dict[int, float],
+    threshold_multiplier: float,
+    selected_layers: list[int],
+) -> dict:
+    if not layer_scores:
+        return {
+            "threshold": 0.0,
+            "mean": 0.0,
+            "std": 0.0,
+            "layers_passing": [],
+            "selected_layers": selected_layers,
+        }
+    vals = torch.tensor(list(layer_scores.values()), dtype=torch.float32)
+    mean = vals.mean().item()
+    std = vals.std(unbiased=False).item()
+    threshold = mean + threshold_multiplier * std
+    return {
+        "threshold": threshold,
+        "mean": mean,
+        "std": std,
+        "layers_passing": sorted(int(L) for L, s in layer_scores.items() if s >= threshold),
+        "selected_layers": sorted(int(L) for L in selected_layers),
+    }
+
+
+def _save_diagnostics(vectors_dir: str, source: str, diagnostics: dict) -> str:
+    os.makedirs(vectors_dir, exist_ok=True)
+    path = os.path.join(vectors_dir, f"{source}_diagnostics.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(diagnostics, f, indent=2)
+    print(f"Saved {source} diagnostics -> {path}")
+    return path
+
+
 def run_phase2_source(
     model,
     tokenizer,
@@ -64,62 +104,135 @@ def run_phase2_source(
     """
     header = f"Phase 2: {model_tag} | source={source_tag}"
     print(f"\n{'='*len(header)}\n{header}\n{'='*len(header)}")
+    source_start = time.time()
+    step_times: dict[str, float] = {}
 
-    H_pos, H_neg = collect_hidden_states(
+    def _step(n: int, label: str) -> float:
+        elapsed = time.time() - source_start
+        print(f"\n{'-' * 72}")
+        print(f"STEP {n}/9 [{source_tag}] {label} | elapsed={elapsed:.1f}s")
+        print(f"{'-' * 72}")
+        return time.time()
+
+    def _finish_step(key: str, started: float) -> None:
+        step_times[key] = time.time() - started
+
+    t = _step(1, "collect hidden states")
+    H_pos, H_neg, collection_diag = collect_hidden_states(
         model, tokenizer, D_steer, N, device,
         boundary_idx_fn, source_tag,
         prompt_fn=prompt_fn,
         min_samples=min_samples,
     )
+    _finish_step("1_collection", t)
     if not H_pos:
         print("No layers passed min_samples threshold — aborting this source.")
-        return {}
+        diagnostics = {
+            "collection": collection_diag,
+            "step_times_s": {**step_times, "total": time.time() - source_start},
+        }
+        _save_diagnostics(vectors_dir, source_tag, diagnostics)
+        return {"diagnostics": diagnostics}
 
     # ── Layer probe scores ────────────────────────────────────────────────────
-    print("\n--- Layer Probe Scores ---")
+    t = _step(2, "score layer probes")
     layer_scores = score_all_layers(H_pos, H_neg)
+    _finish_step("2_probe", t)
 
     # ── Method A: best-layer DoM ──────────────────────────────────────────────
-    print("\n--- Method A: Best-Layer DoM ---")
+    t = _step(3, "compute best-layer DoM")
     dom_vectors         = compute_per_layer_dom(H_pos, H_neg)
     v_truth, best_layer = compute_best_layer_dom(dom_vectors, layer_scores)
+    dom_cosines = {
+        str(L): float(torch.dot(v.float(), v_truth.float()).item())
+        for L, v in dom_vectors.items()
+    }
+    _finish_step("3_dom", t)
 
     # ── Control: shuffled-label DoM ───────────────────────────────────────────
-    print("\n--- Control: Shuffled-Label DoM ---")
-    v_shuffled = compute_shuffled_dom(H_pos, H_neg, best_layer, v_truth)
+    t = _step(4, "compute shuffled-label DoM control")
+    v_shuffled, shuffled_dom_stats = compute_shuffled_dom(H_pos, H_neg, best_layer, v_truth)
     save_shuffled_vector(v_shuffled, model_tag, source_tag, vectors_dir,
                          best_layer=best_layer)
+    _finish_step("4_shuffled_dom", t)
+
+    # ── Layer selection ───────────────────────────────────────────────────────
+    t = _step(5, "select cPCA layers")
+    selected_layers = select_layers(layer_scores, multiplier=threshold_multiplier)
+    layer_selection_diag = _layer_selection_diagnostics(
+        layer_scores, threshold_multiplier, selected_layers
+    )
+    _finish_step("5_layer_selection", t)
 
     # ── Method B: cPCA sweep (k ∈ {1,2,5,10}, β ∈ {0.3,0.5,0.7}) ────────────
-    print("\n--- Method B: cPCA Sweep ---")
-    selected_layers = select_layers(layer_scores, multiplier=threshold_multiplier)
+    t = _step(6, "run cPCA sweep")
     cpca_fn = _CPCA_FN_MAP.get(cpca_variant, cpca_full)
 
     cpca_results = run_cpca_sweep(H_pos, H_neg, selected_layers, cpca_fn)
-    subspaces  = {L: (U, lam) for L, (U, lam, _, _) in cpca_results.items()}
-    sweep_meta = {L: {'k': k, 'beta': b}
-                  for L, (_, _, k, b) in cpca_results.items()}
+    subspaces  = {L: (U, lam) for L, (U, lam, _, _, _) in cpca_results.items()}
+    sweep_meta = {L: {'k': k, 'beta': b, 'acc': acc}
+                  for L, (_, _, k, b, acc) in cpca_results.items()}
+    cpca_sweep_diag = {
+        str(L): {
+            "best_k": int(k),
+            "best_beta": float(b),
+            "best_acc": float(acc),
+            "h_pos": int(H_pos[L].shape[0]),
+            "h_neg": int(H_neg[L].shape[0]),
+        }
+        for L, (_, _, k, b, acc) in cpca_results.items()
+    }
+    _finish_step("6_cpca_sweep", t)
 
     if not subspaces:
         print("No subspaces computed — saving DoM only, skipping Method B.")
         save_dom_vector(v_truth, model_tag, source_tag, vectors_dir,
                         best_layer=best_layer)
+        method_accs = {'dom': layer_scores.get(best_layer, 0.0), 'cpca': 0.0}
+        diagnostics = {
+            "collection": collection_diag,
+            "probe": {
+                "layer_scores": {str(L): float(s) for L, s in layer_scores.items()},
+                "gate_threshold": layer_selection_diag["threshold"],
+                "layers_passing": layer_selection_diag["layers_passing"],
+            },
+            "dom": {
+                "best_layer": int(best_layer),
+                "v_truth_norm": float(v_truth.norm().item()),
+                "per_layer_cosines_to_best": dom_cosines,
+            },
+            "shuffled_dom": shuffled_dom_stats,
+            "layer_selection": layer_selection_diag,
+            "cpca_sweep": cpca_sweep_diag,
+            "subspace_merge": {"r_final": r_final, "U_shape": None, "layer_weights": {}},
+            "method_comparison": {
+                "dom_acc": float(method_accs["dom"]),
+                "cpca_acc": 0.0,
+                "gap": -float(method_accs["dom"]),
+                "winner": "dom",
+            },
+            "shuffled_cpca": {"U_shape": None},
+            "step_times_s": {**step_times, "total": time.time() - source_start},
+        }
+        _save_diagnostics(vectors_dir, source_tag, diagnostics)
         return {
             'v_truth':    v_truth,    'U_truth':       None,
             'v_shuffled': v_shuffled, 'best_layer':    best_layer,
             'layer_scores':    layer_scores,
             'selected_layers': selected_layers, 'sweep_meta': {},
             'winner':     'dom', 'dom_vectors': dom_vectors, 'subspaces': {},
-            'method_accs': {'dom': layer_scores.get(best_layer, 0.0), 'cpca': 0.0},
+            'method_accs': method_accs,
+            'diagnostics': diagnostics,
         }
 
-    print("\n--- Weighted Subspace Merge ---")
-    U_truth = weighted_subspace_merge(
+    t = _step(7, "merge weighted cPCA subspaces")
+    U_truth, layer_weights = weighted_subspace_merge(
         subspaces, layer_scores, dom_vectors, v_truth, r_final
     )
+    _finish_step("7_subspace_merge", t)
 
     # ── Method comparison ─────────────────────────────────────────────────────
-    print("\n--- Method Comparison ---")
+    t = _step(8, "compare methods and save vectors")
     winner, method_accs = compare_methods(
         H_pos, H_neg, v_truth, U_truth, selected_layers
     )
@@ -129,9 +242,10 @@ def run_phase2_source(
     save_subspace(U_truth, selected_layers, model_tag, source_tag,
                   r_final, beta, vectors_dir,
                   layer_scores=layer_scores, sweep_meta=sweep_meta)
+    _finish_step("8_method_compare_save", t)
 
     # ── Control: Shuffled-Label cPCA ──────────────────────────────────────────
-    print("\n--- Control: Shuffled-Label cPCA ---")
+    t = _step(9, "compute shuffled-label cPCA control")
     U_shuffled_cpca = compute_shuffled_cpca(
         H_pos, H_neg, selected_layers, cpca_fn,
         dom_vectors, layer_scores, v_truth, r_final,
@@ -139,11 +253,56 @@ def run_phase2_source(
     if U_shuffled_cpca is not None:
         save_shuffled_subspace(U_shuffled_cpca, model_tag, source_tag,
                                r_final, vectors_dir)
+    _finish_step("9_shuffled_cpca", t)
+
+    total_elapsed = time.time() - source_start
+    diagnostics = {
+        "collection": collection_diag,
+        "probe": {
+            "layer_scores": {str(L): float(s) for L, s in layer_scores.items()},
+            "gate_threshold": layer_selection_diag["threshold"],
+            "layers_passing": layer_selection_diag["layers_passing"],
+        },
+        "dom": {
+            "best_layer": int(best_layer),
+            "v_truth_norm": float(v_truth.norm().item()),
+            "per_layer_cosines_to_best": dom_cosines,
+        },
+        "shuffled_dom": shuffled_dom_stats,
+        "layer_selection": layer_selection_diag,
+        "cpca_sweep": cpca_sweep_diag,
+        "subspace_merge": {
+            "r_final": int(r_final),
+            "U_shape": _tensor_shape(U_truth),
+            "layer_weights": {str(L): float(w) for L, w in layer_weights.items()},
+        },
+        "method_comparison": {
+            "dom_acc": float(method_accs.get("dom", 0.0)),
+            "cpca_acc": float(method_accs.get("cpca", 0.0)),
+            "gap": float(method_accs.get("cpca", 0.0) - method_accs.get("dom", 0.0)),
+            "winner": winner,
+        },
+        "shuffled_cpca": {"U_shape": _tensor_shape(U_shuffled_cpca)},
+        "step_times_s": {**step_times, "total": total_elapsed},
+    }
+    _save_diagnostics(vectors_dir, source_tag, diagnostics)
+
+    print(f"\n{'=' * 72}")
+    print(f"Phase 2 source complete: {model_tag} | source={source_tag}")
+    print(f"  best_layer={best_layer}  probe_acc={layer_scores.get(best_layer, 0.0):.3f}")
+    print(f"  winner={winner}  method_accs={method_accs}")
+    print(f"  v_truth_shape={_tensor_shape(v_truth)}  U_truth_shape={_tensor_shape(U_truth)}")
+    print(f"  shuffled_dom_shape={_tensor_shape(v_shuffled)}  shuffled_cpca_shape={_tensor_shape(U_shuffled_cpca)}")
+    print(f"  total_time={total_elapsed:.1f}s")
+    for key, seconds in step_times.items():
+        print(f"    {key}: {seconds:.1f}s")
+    print(f"{'=' * 72}")
 
     return {
         'v_truth':         v_truth,
         'U_truth':         U_truth,
         'v_shuffled':      v_shuffled,
+        'U_shuffled_cpca': U_shuffled_cpca,
         'best_layer':      best_layer,
         'layer_scores':    layer_scores,
         'selected_layers': selected_layers,
@@ -152,39 +311,51 @@ def run_phase2_source(
         'method_accs':     method_accs,
         'dom_vectors':     dom_vectors,
         'subspaces':       subspaces,
+        'diagnostics':     diagnostics,
     }
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def pick_best_ccot_ratio(results_dir: str, model_tag: str) -> int:
+def pick_best_ccot_latent_tokens(results_dir: str, model_tag: str) -> int:
     """
-    Read phase1_val.json and return the CCoT ratio (integer, e.g. 7 for R=0.7)
-    that maximises mechanism gain (CCoT acc − Trimmed CoT acc) on D_val.
-    Defaults to 7 if the file is missing or no match is found.
+    Read Phase 1 latent-token results and return the CCoT latent count that
+    maximizes validation accuracy. Defaults to 4 if no Phase 1 result exists.
     """
-    path = os.path.join(results_dir, 'phase1_val.json')
-    if not os.path.exists(path):
-        print(f"phase1_val.json not found at {path} — defaulting to R=7")
-        return 7
+    best_path = os.path.join(results_dir, 'phase1_best_latent.json')
+    if os.path.exists(best_path):
+        with open(best_path) as f:
+            best = json.load(f)
+        n_latents = int(best.get('latent_tokens') or 4)
+        print(
+            f"Best CCoT latent budget for {model_tag}: L={n_latents} "
+            f"(val acc = {best.get('accuracy', 0.0):.3f})"
+        )
+        return n_latents
 
-    with open(path) as f:
+    sweep_path = os.path.join(results_dir, 'phase1_latent_sweep.json')
+    if not os.path.exists(sweep_path):
+        print(f"Phase 1 latent results missing in {results_dir} — defaulting to L=4")
+        return 4
+
+    with open(sweep_path) as f:
         records = json.load(f)
 
-    res_map = {r['condition']: r for r in records}
-    best_ratio_int, best_gain = 7, float('-inf')
+    candidates = [
+        r for r in records
+        if str(r.get('condition', '')).startswith('ccot_L') and r.get('latent_tokens')
+    ]
+    if not candidates:
+        print(f"No latent-token CCoT records found in {sweep_path} — defaulting to L=4")
+        return 4
 
-    for ri in [5, 6, 7, 8, 9]:
-        k_ccot    = f'ccot_R{ri}'
-        k_trimmed = f'trimmed_cot_R{ri}'
-        if k_ccot in res_map and k_trimmed in res_map:
-            gain = res_map[k_ccot]['accuracy'] - res_map[k_trimmed]['accuracy']
-            if gain > best_gain:
-                best_gain, best_ratio_int = gain, ri
-
-    print(f"Best CCoT ratio for {model_tag}: R=0.{best_ratio_int}  "
-          f"(mechanism gain = {best_gain:.3f})")
-    return best_ratio_int
+    best = max(candidates, key=lambda r: (r.get('accuracy', 0.0), int(r['latent_tokens'])))
+    n_latents = int(best['latent_tokens'])
+    print(
+        f"Best CCoT latent budget for {model_tag}: L={n_latents} "
+        f"(val acc = {best.get('accuracy', 0.0):.3f})"
+    )
+    return n_latents
 
 
 def run_phase2_all_sources(
@@ -200,19 +371,23 @@ def run_phase2_all_sources(
     Load Source A (best CCoT checkpoint) and Source B (CoT checkpoint),
     run Phase 2 extraction for both, save vectors, and write phase2_meta.json.
     """
+    phase_start = time.time()
     cfg = get_model_config(model_tag)
-    ratio_int = pick_best_ccot_ratio(results_dir, model_tag)
-    ccot_ckpt = os.path.join(checkpoints_dir, f'ccot_R{ratio_int}')
+    best_latent_tokens = pick_best_ccot_latent_tokens(results_dir, model_tag)
+    ccot_ckpt = os.path.join(checkpoints_dir, f'ccot_L{best_latent_tokens}')
 
     results: dict = {}
 
     # ── Source A: CCoT fine-tuned model ──────────────────────────────────────
-    print(f"\nLoading Source A  CCoT R=0.{ratio_int}: {ccot_ckpt}")
+    print(f"\n{'#' * 72}")
+    print(f"SOURCE A/2: CCoT latent checkpoint | model={model_tag} | L={best_latent_tokens}")
+    print(f"{'#' * 72}")
+    print(f"\nLoading Source A  CCoT L={best_latent_tokens}: {ccot_ckpt}")
     ccot_model, tok_a = load_ccot_frozen(base_model_id, ccot_ckpt, device)
 
     ccot_prompt_fn = (
-        lambda item, ri=ratio_int:
-        f"{item['question']}\n<|start-latent|>{'<|latent|>' * ri}<|end-latent|>\n"
+        lambda item, n=best_latent_tokens:
+        f"{item['question']}\n<|start-latent|>{'<|latent|>' * n}<|end-latent|>\n"
     )
     results['ccot'] = run_phase2_source(
         ccot_model, tok_a, D_steer, model_tag,
@@ -229,6 +404,9 @@ def run_phase2_all_sources(
 
     # ── Source B: CoT fine-tuned model (Phase 1, Stage 1 checkpoint) ─────────
     # Using load_finetuned from phase1 (loads LoRA adapter), then freeze
+    print(f"\n{'#' * 72}")
+    print(f"SOURCE B/2: CoT checkpoint | model={model_tag}")
+    print(f"{'#' * 72}")
     from phase1.inference import load_finetuned
     cot_ckpt = os.path.join(checkpoints_dir, 'cot')
     print(f"\nLoading Source B  CoT checkpoint: {cot_ckpt}")
@@ -285,7 +463,8 @@ def run_phase2_all_sources(
 
     meta = {
         'model_tag':              model_tag,
-        'best_ccot_ratio':        ratio_int,
+        'best_ccot_latent_tokens': best_latent_tokens,
+        'best_ccot_condition':    f'ccot_L{best_latent_tokens}',
         # Per-source winner (dom vs cpca)
         'ccot_winner_method':     ccot_res.get('winner'),
         'base_winner_method':     base_res.get('winner'),
@@ -312,5 +491,27 @@ def run_phase2_all_sources(
     with open(meta_path, 'w') as f:
         json.dump(meta, f, indent=2)
     print(f"\nPhase 2 metadata -> {meta_path}")
+
+    total_elapsed = time.time() - phase_start
+    print(f"\n{'=' * 72}")
+    print(f"PHASE 2 COMPLETE | model={model_tag}")
+    print(f"  total_time={total_elapsed:.1f}s")
+    for source, res in (("ccot", ccot_res), ("base", base_res)):
+        diag = res.get("diagnostics", {})
+        method = res.get("winner")
+        best_layer = res.get("best_layer")
+        layer_scores = res.get("layer_scores", {})
+        probe_acc = layer_scores.get(best_layer, 0.0) if best_layer is not None else 0.0
+        print(f"  source={source}: best_layer={best_layer} probe_acc={probe_acc:.3f} winner={method}")
+        print(f"    v_truth_shape={_tensor_shape(res.get('v_truth'))} U_truth_shape={_tensor_shape(res.get('U_truth'))}")
+        step_times = diag.get("step_times_s", {})
+        if step_times:
+            timing = ", ".join(
+                f"{k}={v:.1f}s" for k, v in step_times.items()
+                if isinstance(v, (int, float))
+            )
+            print(f"    step_times: {timing}")
+    print(f"  overall winner: source={best_source} method={best_method} probe_acc={best_acc:.3f}")
+    print(f"{'=' * 72}")
 
     return results

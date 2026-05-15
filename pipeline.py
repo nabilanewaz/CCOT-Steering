@@ -30,7 +30,6 @@ from utils.dataset_paths import (
     init_project_dataset,
     phase4_subprocess_env,
 )
-from phase1.compress import build_ccot_cache
 from phase1.train import train_coconut_phase1
 from phase1.evaluate import run_phase1_evaluation, print_comparison_table
 from phase2.run import run_phase2_all_sources
@@ -40,7 +39,7 @@ from phase3.select import select_best_steered_config
 
 CONFIGS = ['S2']
 MODEL_TAGS = ['llama32_3b', 'phi2', 'qwen25_3b', 'qwen25_math1.5b']
-RATIOS = [0.5, 0.6, 0.7, 0.8, 0.9]
+LATENT_TOKEN_COUNTS = [3, 4, 6]
 
 MODEL_ID_MAP = {
     'llama32_3b':      'meta-llama/Llama-3.2-3B',
@@ -85,37 +84,36 @@ def _run_phase1(configs_to_run, models_to_run, splits, device):
     for cfg_id in configs_to_run:
         D_train   = splits[cfg_id]['D_train']
         D_val     = splits[cfg_id]['D_val']
-        cache_dir = f"cache/{cfg_id}"
-
-        # In Coconut phase1, this creates compatibility cache files for pipeline contracts.
-        build_ccot_cache(D_train, RATIOS, cache_dir, compressor=None)
-
         for model_tag in models_to_run:
             base_id  = MODEL_ID_MAP[model_tag]
             ckpt_dir = f"checkpoints/{cfg_id}/{model_tag}"
             res_dir  = f"results/{cfg_id}/{model_tag}"
 
             cot_out = os.path.join(ckpt_dir, 'cot')
-            all_ccot_ready = all(
-                _checkpoint_ready(os.path.join(ckpt_dir, f"ccot_R{int(r * 10)}"))
-                for r in RATIOS
+            all_latent_ready = all(
+                _checkpoint_ready(os.path.join(ckpt_dir, f"ccot_L{int(n)}"))
+                for n in LATENT_TOKEN_COUNTS
             )
-            if not (_checkpoint_ready(cot_out) and all_ccot_ready):
-                print(f"\n[{cfg_id}][{model_tag}] Coconut phase1 single-run (50 epochs) + compat export")
+            if not (_checkpoint_ready(cot_out) and all_latent_ready):
+                print(f"\n[{cfg_id}][{model_tag}] Coconut phase1 single-run (20 epochs) + latent export")
                 train_coconut_phase1(
                     base_model_id=base_id,
                     D_train=D_train,
                     checkpoints_dir=ckpt_dir,
                     results_dir=res_dir,
                     model_tag=model_tag,
-                    ratios=RATIOS,
+                    latent_token_counts=LATENT_TOKEN_COUNTS,
                 )
             else:
-                print(f"[{cfg_id}][{model_tag}] Coconut canonical + compat checkpoints exist — skipping")
+                print(f"[{cfg_id}][{model_tag}] Coconut latent checkpoints exist — skipping")
 
             # Phase 1 evaluation
-            out_path = os.path.join(res_dir, 'phase1_val.json')
-            if not _done(out_path):
+            phase1_eval_paths = [
+                os.path.join(res_dir, 'phase1_latent_sweep.json'),
+                os.path.join(res_dir, 'phase1_best_latent.json'),
+                os.path.join(res_dir, 'phase1_val.json'),
+            ]
+            if not all(_done(path) for path in phase1_eval_paths):
                 print(f"\n[{cfg_id}][{model_tag}] Phase 1 evaluation on D_val")
                 results = run_phase1_evaluation(
                     model_tag=model_tag,
@@ -127,7 +125,7 @@ def _run_phase1(configs_to_run, models_to_run, splits, device):
                 )
                 print_comparison_table(results)
             else:
-                print(f"[{cfg_id}][{model_tag}] Phase 1 val results exist — skipping")
+                print(f"[{cfg_id}][{model_tag}] Phase 1 latent results exist — skipping")
 
 
 def _run_phase2(configs_to_run, models_to_run, splits, device):

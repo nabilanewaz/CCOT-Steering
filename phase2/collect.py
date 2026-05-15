@@ -77,9 +77,11 @@ def collect_hidden_states(
 
     n_used = n_skipped = 0
     n_questions = len(D_steer)
+    total_rollouts = n_questions * N
     print(
         f"  Collecting [{source_tag}]: {n_questions} steer questions × {N} rollouts "
-        f"(each rollout: generate + full forward for hooks). Progress updates every question.",
+        f"= {total_rollouts} total rollouts across {num_layers} layers "
+        f"(each rollout: generate + full forward for hooks).",
         flush=True,
     )
 
@@ -158,6 +160,14 @@ def collect_hidden_states(
             n_pos = len(H_plus_raw[0]) if 0 in H_plus_raw else 0
             n_neg = len(H_minus_raw[0]) if 0 in H_minus_raw else 0
             pbar.set_postfix(used=n_used, skip=n_skipped, Hp=n_pos, Hm=n_neg, refresh=True)
+            if (item_idx + 1) % 25 == 0 or item_idx + 1 == n_questions:
+                pct = (item_idx + 1) / max(n_questions, 1) * 100
+                print(
+                    f"  [{source_tag}] progress: {item_idx + 1}/{n_questions} "
+                    f"questions ({pct:.1f}%)  used={n_used} skipped={n_skipped} "
+                    f"H+={n_pos} H-={n_neg}",
+                    flush=True,
+                )
             continue
 
         n_used += 1
@@ -171,6 +181,14 @@ def collect_hidden_states(
         n_pos = len(H_plus_raw[0]) if 0 in H_plus_raw else 0
         n_neg = len(H_minus_raw[0]) if 0 in H_minus_raw else 0
         pbar.set_postfix(used=n_used, skip=n_skipped, Hp=n_pos, Hm=n_neg, refresh=True)
+        if (item_idx + 1) % 25 == 0 or item_idx + 1 == n_questions:
+            pct = (item_idx + 1) / max(n_questions, 1) * 100
+            print(
+                f"  [{source_tag}] progress: {item_idx + 1}/{n_questions} "
+                f"questions ({pct:.1f}%)  used={n_used} skipped={n_skipped} "
+                f"H+={n_pos} H-={n_neg}",
+                flush=True,
+            )
 
     for h in handles:
         h.remove()
@@ -188,9 +206,24 @@ def collect_hidden_states(
 
     # ── Stack tensors and apply min_samples filter ────────────────────────────
     H_pos, H_neg = {}, {}
+    per_layer_diag = {}
     for L in range(num_layers):
         n_pos = len(H_plus_raw[L])
         n_neg = len(H_minus_raw[L])
+        sample = None
+        if n_pos:
+            sample = H_plus_raw[L][0]
+        elif n_neg:
+            sample = H_minus_raw[L][0]
+        hidden_dim = int(sample.numel()) if sample is not None else 0
+        included = n_pos >= min_samples and n_neg >= min_samples
+        per_layer_diag[str(L)] = {
+            "h_pos": n_pos,
+            "h_neg": n_neg,
+            "hidden_dim": hidden_dim,
+            "included": included,
+            "status": "included" if included else "filtered (<min)",
+        }
         if n_pos >= min_samples and n_neg >= min_samples:
             H_pos[L] = torch.stack(H_plus_raw[L])   # [n+, d]
             H_neg[L] = torch.stack(H_minus_raw[L])  # [n-, d]
@@ -198,7 +231,29 @@ def collect_hidden_states(
             print(f"  Layer {L:02d}: skipped "
                   f"(H+={n_pos}, H-={n_neg}, min={min_samples})")
 
+    print(f"\nPer-layer collection table [source: {source_tag}]")
+    print(f"  {'Layer':>5} {'H+':>8} {'H-':>8} {'Dim':>8}  Status")
+    print(f"  {'-' * 45}")
+    for L in range(num_layers):
+        row = per_layer_diag[str(L)]
+        print(
+            f"  {L:>5} {row['h_pos']:>8} {row['h_neg']:>8} "
+            f"{row['hidden_dim']:>8}  {row['status']}"
+        )
+
     print(f"\nCollected hidden states from {len(H_pos)} / {num_layers} layers  "
           f"[source: {source_tag}]  "
           f"questions used={n_used}  skipped={n_skipped} (no contrast)")
-    return H_pos, H_neg
+    collection_diag = {
+        "source": source_tag,
+        "n_layers": num_layers,
+        "n_questions": n_questions,
+        "rollouts_per_question": N,
+        "total_rollouts": total_rollouts,
+        "questions_used": n_used,
+        "questions_skipped_no_contrast": n_skipped,
+        "min_samples": min_samples,
+        "layers_included": sorted(int(L) for L in H_pos.keys()),
+        "per_layer": per_layer_diag,
+    }
+    return H_pos, H_neg, collection_diag

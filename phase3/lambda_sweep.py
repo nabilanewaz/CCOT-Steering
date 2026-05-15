@@ -24,7 +24,7 @@ def sweep_lambda_grid(
     layer_star: int,
     device: str,
     model_tag: str,
-    ratio: float = 0.7,
+    latent_tokens: int = 4,
     out_path: str = 'lambda_sweep.json',
     max_epochs: int = 2,
 ) -> dict:
@@ -42,7 +42,7 @@ def sweep_lambda_grid(
             print(f"\n[λ-sweep] λ_a={la}  λ_m={lm}")
             _, history = tune_alpha(
                 model, tokenizer, D_sub, v_truth, layer_star, device,
-                model_tag=model_tag, ratio=ratio,
+                model_tag=model_tag, latent_tokens=latent_tokens,
                 lambda_a=la, lambda_m=lm,
                 max_epochs=max_epochs,
                 es_patience=2,
