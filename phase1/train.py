@@ -33,7 +33,7 @@ EARLY_STOP_PATIENCE = 2
 EARLY_STOP_MIN_DELTA = 0.002
 EARLY_STOP_MIN_EPOCH = 20
 EPOCH9_SNAPSHOT_EPOCH = 9
-BEST_CHECKPOINT_MIN_STAGE = 1
+BEST_CHECKPOINT_MIN_STAGE = 4
 TRAIN_USE_KV_CACHE = False
 TRAIN_DETACH_LATENTS = False
 
@@ -467,6 +467,7 @@ def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, mo
         "best_epoch": best_epoch,
         "best_stage": best_stage,
         "best_checkpoint_min_stage": BEST_CHECKPOINT_MIN_STAGE,
+        "best_checkpoint_policy": "final_stage_only",
         "warmup_best_val_accuracy": warmup_best_val_acc if warmup_best_epoch is not None else None,
         "warmup_best_epoch": warmup_best_epoch,
         "best_checkpoint_dir": best_dir,
@@ -590,6 +591,7 @@ def _phase1_training_current(results_dir: str) -> bool:
         metrics.get("train_use_kv_cache") == TRAIN_USE_KV_CACHE
         and metrics.get("train_detach_latents") == TRAIN_DETACH_LATENTS
         and metrics.get("best_checkpoint_min_stage") == BEST_CHECKPOINT_MIN_STAGE
+        and metrics.get("best_checkpoint_policy") == "final_stage_only"
         and metrics.get("early_stop_min_epoch") == EARLY_STOP_MIN_EPOCH
         and metrics.get("completed_epochs") == metrics.get("epochs")
         and metrics.get("best_stage") is not None
