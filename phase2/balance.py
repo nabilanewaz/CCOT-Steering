@@ -1,8 +1,7 @@
 """Stratified balanced undersampling for H+/H− class imbalance (spec §2.8)."""
 import numpy as np
-from collections import defaultdict
 
-IMBALANCE_THRESHOLD = 3.0   # trigger rebalancing if |H−| / |H+| > this
+IMBALANCE_THRESHOLD = 1.0   # always balance — equal H+ and H-
 N_BUCKETS = 4               # difficulty quartiles (0 = hard, 3 = easy)
 
 
@@ -13,15 +12,62 @@ def difficulty_bucket(frac_correct: float) -> int:
 
 def check_balance(H_plus_raw: dict, H_minus_raw: dict) -> tuple[float, int, int]:
     """
-    Return (ratio, n_pos, n_neg) using the first available layer as reference.
-    ratio = |H−| / |H+|.
+    Return (ratio, n_pos, n_neg).
+    ratio = max(|H+|,|H-|) / min(|H+|,|H-|)  — symmetric, always >= 1.
     """
     if not H_plus_raw:
         return 0.0, 0, 0
     ref_L = next(iter(H_plus_raw))
     n_pos = len(H_plus_raw[ref_L])
     n_neg = len(H_minus_raw.get(ref_L, []))
-    return n_neg / max(n_pos, 1), n_pos, n_neg
+    ratio = max(n_pos, n_neg) / max(min(n_pos, n_neg), 1)
+    return ratio, n_pos, n_neg
+
+
+def _stratified_downsample(
+    H_small: dict,
+    H_large: dict,
+    bucket_small: dict,
+    bucket_large: dict,
+    rng: np.random.Generator,
+    label_large: str,
+) -> dict:
+    """
+    Downsample H_large (per layer) to match the count in H_small, stratified by
+    difficulty bucket. H_small is not touched.
+    """
+    H_large_bal: dict = {}
+
+    for L in H_small:
+        n_small = len(H_small[L])
+        h_large_L = H_large.get(L, [])
+        n_large = len(h_large_L)
+
+        if n_large <= n_small:
+            H_large_bal[L] = h_large_L
+            continue
+
+        small_b = np.asarray(bucket_small.get(L, [0] * n_small), dtype=np.int32)
+        large_b = np.asarray(bucket_large.get(L, [0] * n_large), dtype=np.int32)
+        keep_idx = []
+
+        for b in range(N_BUCKETS):
+            idx_small_b = np.where(small_b == b)[0]
+            idx_large_b = np.where(large_b == b)[0]
+            if len(idx_small_b) == 0 or len(idx_large_b) == 0:
+                continue
+            n_sample = min(len(idx_small_b), len(idx_large_b))
+            chosen = rng.choice(idx_large_b, size=n_sample, replace=False)
+            keep_idx.extend(chosen.tolist())
+
+        keep_idx.sort()
+        H_large_bal[L] = [h_large_L[i] for i in keep_idx]
+
+        n_bal = len(H_large_bal[L])
+        print(f"  Layer {L:02d}: {label_large} {n_large} -> {n_bal}  "
+              f"(balanced to match {n_small})  [stratified, {N_BUCKETS} buckets]")
+
+    return H_large_bal
 
 
 def stratified_balance(
@@ -33,56 +79,31 @@ def stratified_balance(
     seed: int = 42,
 ) -> tuple[dict, dict]:
     """
-    Per-layer stratified undersampling of H− when |H−|/|H+| > threshold.
+    Per-layer stratified undersampling to equalise H+ and H−.
 
-    Within each difficulty bucket, H− is downsampled to match the H+ count
-    in that bucket. H+ is kept intact. This preserves the difficulty
-    distribution while correcting the class imbalance.
-
-    Args:
-        H_plus_raw:  dict[L -> list[Tensor [d]]]
-        H_minus_raw: dict[L -> list[Tensor [d]]]
-        bucket_pos:  dict[L -> list[int]]  — difficulty bucket per H+ sample
-        bucket_neg:  dict[L -> list[int]]  — difficulty bucket per H- sample
-        threshold:   ratio above which rebalancing is triggered
-        seed:        RNG seed for reproducibility
-
-    Returns:
-        (H_plus_raw, H_minus_bal)  — H+ unchanged, H- undersampled
+    Whichever class is larger is downsampled to match the smaller, stratified
+    by difficulty bucket. Both directions are handled:
+      - H− > H+: downsample H−, keep all H+
+      - H+ > H−: downsample H+, keep all H−
     """
     rng = np.random.default_rng(seed)
-    H_minus_bal: dict = {}
 
-    for L in H_plus_raw:
-        n_pos = len(H_plus_raw[L])
-        h_neg_L = H_minus_raw.get(L, [])
-        n_neg = len(h_neg_L)
-        ratio = n_neg / max(n_pos, 1)
+    if not H_plus_raw:
+        return H_plus_raw, H_minus_raw
 
-        if ratio <= threshold:
-            H_minus_bal[L] = h_neg_L
-            continue
+    ref_L = next(iter(H_plus_raw))
+    n_pos = len(H_plus_raw[ref_L])
+    n_neg = len(H_minus_raw.get(ref_L, []))
 
-        # Collect H- indices to keep, bucket by bucket
-        pos_b = np.asarray(bucket_pos.get(L, [0] * n_pos), dtype=np.int32)
-        neg_b = np.asarray(bucket_neg.get(L, [0] * n_neg), dtype=np.int32)
-        keep_idx = []
-
-        for b in range(N_BUCKETS):
-            idx_pos_b = np.where(pos_b == b)[0]
-            idx_neg_b = np.where(neg_b == b)[0]
-            if len(idx_pos_b) == 0 or len(idx_neg_b) == 0:
-                continue
-            n_sample = min(len(idx_pos_b), len(idx_neg_b))
-            chosen = rng.choice(idx_neg_b, size=n_sample, replace=False)
-            keep_idx.extend(chosen.tolist())
-
-        keep_idx.sort()
-        H_minus_bal[L] = [h_neg_L[i] for i in keep_idx]
-
-        n_bal = len(H_minus_bal[L])
-        print(f"  Layer {L:02d}: H- {n_neg} -> {n_bal}  "
-              f"(ratio {ratio:.1f}x -> {n_bal/max(n_pos,1):.2f}x)  "
-              f"[stratified, {N_BUCKETS} buckets]")
-
-    return H_plus_raw, H_minus_bal
+    if n_neg >= n_pos:
+        print(f"  H- ({n_neg}) >= H+ ({n_pos}): downsampling H-")
+        H_minus_bal = _stratified_downsample(
+            H_plus_raw, H_minus_raw, bucket_pos, bucket_neg, rng, "H-"
+        )
+        return H_plus_raw, H_minus_bal
+    else:
+        print(f"  H+ ({n_pos}) > H- ({n_neg}): downsampling H+")
+        H_plus_bal = _stratified_downsample(
+            H_minus_raw, H_plus_raw, bucket_neg, bucket_pos, rng, "H+"
+        )
+        return H_plus_bal, H_minus_raw
