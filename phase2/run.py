@@ -346,6 +346,7 @@ def run_phase2_all_sources(
     device: str,
     vectors_dir: str,
     results_dir: str,
+    run_source_b: bool = False,
 ) -> dict:
     """
     Load Source A (best CCoT checkpoint) and Source B (CoT checkpoint),
@@ -391,33 +392,36 @@ def run_phase2_all_sources(
         torch.cuda.empty_cache()
 
     # ── Source B: CoT fine-tuned model (Phase 1, Stage 1 checkpoint) ─────────
-    from phase1.inference import load_finetuned
-    cot_ckpt = os.path.join(checkpoints_dir, 'cot')
+    if run_source_b:
+        from phase1.inference import load_finetuned
+        cot_ckpt = os.path.join(checkpoints_dir, 'cot')
 
-    print(f"\n{'▓' * 64}")
-    print(f"  SOURCE B  CoT")
-    print(f"{'▓' * 64}")
-    print(f"\nLoading Source B  CoT checkpoint: {cot_ckpt}")
-    cot_model, tok_b = load_finetuned(cot_ckpt, device)
-    for param in cot_model.parameters():
-        param.requires_grad = False
-    cot_model.eval()
+        print(f"\n{'▓' * 64}")
+        print(f"  SOURCE B  CoT")
+        print(f"{'▓' * 64}")
+        print(f"\nLoading Source B  CoT checkpoint: {cot_ckpt}")
+        cot_model, tok_b = load_finetuned(cot_ckpt, device)
+        for param in cot_model.parameters():
+            param.requires_grad = False
+        cot_model.eval()
 
-    cot_prompt_fn = (
-        lambda item: f"Question: {item['question']}\n\nReasoning:"
-    )
-    results['base'] = run_phase2_source(
-        cot_model, tok_b, D_steer, model_tag,
-        source_tag='base',
-        boundary_idx_fn=find_boundary_idx_base,
-        device=device,
-        vectors_dir=vectors_dir,
-        prompt_fn=cot_prompt_fn,
-        **cfg,
-    )
-    del cot_model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        cot_prompt_fn = (
+            lambda item: f"Question: {item['question']}\n\nReasoning:"
+        )
+        results['base'] = run_phase2_source(
+            cot_model, tok_b, D_steer, model_tag,
+            source_tag='base',
+            boundary_idx_fn=find_boundary_idx_base,
+            device=device,
+            vectors_dir=vectors_dir,
+            prompt_fn=cot_prompt_fn,
+            **cfg,
+        )
+        del cot_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    else:
+        print(f"\n  Source B (CoT) skipped  [run_source_b=False]")
 
     # ── Cross-source DoM alignment ────────────────────────────────────────────
     ccot_res = results.get('ccot', {})
