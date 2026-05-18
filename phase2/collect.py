@@ -158,8 +158,8 @@ def collect_hidden_states(
     print(f"\nClass balance  [source: {source_tag}]  "
           f"H+={n_pos_total}  H-={n_neg_total}  ratio={ratio:.2f}x")
     if ratio > IMBALANCE_THRESHOLD:
-        print(f"  Imbalance > {IMBALANCE_THRESHOLD}x "
-              f"— stratified undersampling of H-")
+        print(f"  Imbalance {ratio:.2f}x "
+              f"— stratified undersampling of larger class")
         H_plus_raw, H_minus_raw = stratified_balance(
             H_plus_raw, H_minus_raw, bucket_pos, bucket_neg,
         )
