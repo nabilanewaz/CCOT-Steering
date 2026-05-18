@@ -26,7 +26,7 @@ learning_rate: 2.0e-4
 max_seq_len:   512
 
 # ── Phase 2 ───────────────────────────────────────────────────────────────
-n_rollouts:          20        # per question in D_steer
+n_rollouts:          10        # per question in D_steer
 temperature:         1.0
 min_samples:         200       # minimum H+/H- per layer before cPCA
 beta_cpca:           0.5       # contrastive weight
