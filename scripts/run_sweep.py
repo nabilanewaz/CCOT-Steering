@@ -27,7 +27,7 @@ from phase2.run import run_phase2_all_sources
 from phase3.evaluate import run_phase3_evaluation
 from phase3.select import select_best_steered_config
 
-CFG_ID     = 'S2'   # fixed 60/20/20 split
+CFG_ID     = 'S2'   # 60% train / 10% steer / 30% val  (change to S1/S3/S4 as needed)
 MODEL_TAGS = ['llama32_3b', 'phi2', 'qwen25_3b', 'qwen25_math1.5b']
 RATIOS     = [0.5, 0.6, 0.7, 0.8, 0.9]
 

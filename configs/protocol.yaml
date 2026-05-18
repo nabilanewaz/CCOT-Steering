@@ -4,8 +4,8 @@ seed: 42
 train_pool: null   # resolved at runtime via utils/dataset_paths (CCOT_DATASET / configs/active_dataset.txt)
 test_path:  null   # resolved at runtime; never opened outside evaluate_final.py
 
-split: S2          # fixed 60% train / 20% steer / 20% val
-split_ratios: [0.60, 0.20, 0.20]
+split: S2          # fixed 60% train / 10% steer / 30% val
+split_ratios: [0.60, 0.10, 0.30]
 
 # ── Models ────────────────────────────────────────────────────────────────
 model_tags:
