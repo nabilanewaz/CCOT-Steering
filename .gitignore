@@ -1,0 +1,49 @@
+# Claude Code session data
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# HuggingFace cache
+hf_cache/
+
+# Dataset files (downloaded locally)
+gsm8k/
+svamp/
+prontoqa/
+
+# Generated outputs (large binary/json artifacts)
+checkpoints/
+vectors/
+cache/
+results/
+plots/
+tables/
+
+# Configs written at runtime
+configs/active_dataset.txt
+configs/selected.yaml
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini

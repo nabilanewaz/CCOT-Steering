@@ -13,7 +13,7 @@ An end-to-end framework for extracting and steering latent reasoning in language
 pip install -r requirements.txt
 
 # Download GSM8K (7,473 train + 1,319 test)
-python download_gsm8k.py
+python download_dataset.py --dataset gsm8k
 
 # Verify data isolation (no train/val/test overlap)
 python verify_isolation.py
@@ -63,19 +63,20 @@ project/
 ├── configs/
 │   ├── protocol.yaml           # master hyperparameters
 │   └── selected.yaml           # written at end of Phase 3 — winning config
-├── data/gsm8k/
+├── gsm8k/                      # downloaded by download_dataset.py
 │   ├── train.jsonl             # 7,473 examples — split pool
 │   └── test.jsonl              # 1,319 examples (locked until Phase 4)
-├── cache/compressed/           # pre-computed TokenSkip traces
-│   ├── R5.jsonl  ├── R6.jsonl  ├── R7.jsonl  ├── R8.jsonl  └── R9.jsonl
+├── cache/S2/                   # pre-computed LLMLingua-2 compression traces
+│   ├── compressed_R5.jsonl  ├── compressed_R6.jsonl  ├── compressed_R7.jsonl
+│   ├── compressed_R8.jsonl  └── compressed_R9.jsonl
 ├── checkpoints/{S1,S2,S3,S4}/{model}/
 │   ├── cot/                    # Stage 1: CoT LoRA adapter
 │   ├── ccot_R5/ ├── ccot_R6/ ├── ccot_R7/ ├── ccot_R8/ └── ccot_R9/
 ├── vectors/{S1,S2,S3,S4}/{model}/
 │   ├── ccot_dom.pt             # Source A: DoM vector
-│   ├── ccot_cpca_r10.pt        # Source A: cPCA subspace [d, r_final]
-│   ├── base_dom.pt             # Source B: DoM vector
-│   ├── base_cpca_r10.pt        # Source B: cPCA subspace
+│   ├── ccot_cpca_r{N}.pt       # Source A: cPCA subspace [d, r_final]
+│   ├── base_dom.pt             # Source B: DoM vector  (skipped if run_source_b=False)
+│   ├── base_cpca_r{N}.pt       # Source B: cPCA subspace  (skipped if run_source_b=False)
 │   ├── {source}_alpha_star.pt  # tuned steering intensity α*
 │   └── phase2_meta.json        # probe scores + layer metadata
 ├── results/
@@ -151,11 +152,11 @@ Collect hidden states from positive (correct reasoning) and negative (incorrect)
 **Two Sources**
 
 1. **Source A (CCoT)**: hidden states from the best CCoT checkpoint (R ratio with highest mechanism gain)
-2. **Source B (CoT)**: hidden states from the full CoT checkpoint
+2. **Source B (CoT)**: hidden states from the full CoT checkpoint *(currently paused — set `run_source_b=True` in `phase2/run.py` to re-enable)*
 
 **Per Source**
 
-1. Collect H⁺ and H⁻ from D_steer (×15 rollouts per question)
+1. Collect H⁺ and H⁻ from D_steer (×20 rollouts per question), balanced to equal class counts via stratified undersampling
 2. Score all layers (logistic regression on held-out split)
 3. Select layers above threshold (mean + 0.5×std)
 4. Compute per-layer DoM and cPCA
@@ -164,8 +165,10 @@ Collect hidden states from positive (correct reasoning) and negative (incorrect)
 
 **Saved Artifacts**
 
-- `vectors/{config}/{model}/{source}_dom.pt` — [d]
-- `vectors/{config}/{model}/{source}_cpca_r10.pt` — [d, r_final]
+- `vectors/{config}/{model}/ccot_dom.pt` — [d] (Source A always)
+- `vectors/{config}/{model}/ccot_cpca_r{N}.pt` — [d, r_final] (Source A always)
+- `vectors/{config}/{model}/base_dom.pt` — [d] (Source B, when `run_source_b=True`)
+- `vectors/{config}/{model}/base_cpca_r{N}.pt` — [d, r_final] (Source B, when `run_source_b=True`)
 - `vectors/{config}/{model}/phase2_meta.json` — probe scores + layer metadata
 
 **Manual Run**

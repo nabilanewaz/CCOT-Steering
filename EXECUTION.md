@@ -52,8 +52,8 @@ python verify_isolation.py
 ## 3. Build Offline Compression Cache
 
 Compresses D\_train reasoning traces at all five ratios (0.5–0.9) using LLMLingua-2.  
-Writes `cache/S2/compressed_R5.jsonl` … `cache/S2/compressed_R9.jsonl`.  
-Run once. Safe to re-run — already-built files are skipped.
+Writes `cache/S2/compressed_R5.jsonl` … `cache/S2/compressed_R9.jsonl` (dataset-namespaced).  
+Run once. Safe to re-run — already-built ratio files are skipped.
 
 ```bash
 python preprocess_compress.py
@@ -110,10 +110,14 @@ python pipeline.py --phase 2 --model llama32_3b
 ```
 
 Key output files per model:
-- `vectors/S2/<model>/ccot_dom.pt` — CCoT DoM vector
-- `vectors/S2/<model>/base_dom.pt` — CoT DoM vector
-- `vectors/S2/<model>/ccot_cpca_r10.pt` — CCoT cPCA subspace
+- `vectors/S2/<model>/ccot_dom.pt` — CCoT DoM vector (Source A)
+- `vectors/S2/<model>/ccot_cpca_r{N}.pt` — CCoT cPCA subspace (Source A)
 - `vectors/S2/<model>/phase2_meta.json` — best probe layer, probe accuracy
+- `vectors/S2/<model>/base_dom.pt` — CoT DoM vector *(Source B — skipped by default)*
+- `vectors/S2/<model>/base_cpca_r{N}.pt` — CoT cPCA subspace *(Source B — skipped by default)*
+
+> Source B (CoT checkpoint) is currently paused. To re-enable it, set `run_source_b=True`
+> in `phase2/run.py` → `run_phase2_all_sources(...)` or pass the flag directly.
 
 ---
 
