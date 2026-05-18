@@ -6,12 +6,10 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
-.Python
 *.egg-info/
 dist/
 build/
 .eggs/
-*.egg
 
 # Virtual environments
 venv/
@@ -21,7 +19,6 @@ env/
 
 # Jupyter
 .ipynb_checkpoints/
-*.ipynb
 
 # HuggingFace cache
 hf_cache/
@@ -31,7 +28,7 @@ gsm8k/
 svamp/
 prontoqa/
 
-# Generated outputs (large binary/json artifacts)
+# Generated outputs
 checkpoints/
 vectors/
 cache/
