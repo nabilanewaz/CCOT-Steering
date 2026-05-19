@@ -102,8 +102,18 @@ def run_phase2_source(
     Phase 2 extraction for a single (model, source) pair.
     Saves {source}_dom.pt and {source}_cpca_r{r_final}.pt to vectors_dir.
     """
+    for param in model.parameters():
+        param.requires_grad = False
+    model.eval()
+    frozen_params = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
     header = f"Phase 2: {model_tag} | source={source_tag}"
     print(f"\n{'='*len(header)}\n{header}\n{'='*len(header)}")
+    print(
+        f"Phase 2 freeze check [{source_tag}]: "
+        f"trainable_params={trainable_params} frozen_params={frozen_params}"
+    )
     source_start = time.time()
     step_times: dict[str, float] = {}
 
@@ -129,6 +139,11 @@ def run_phase2_source(
         print("No layers passed min_samples threshold — aborting this source.")
         diagnostics = {
             "collection": collection_diag,
+            "freeze": {
+                "trainable_params": trainable_params,
+                "frozen_params": frozen_params,
+                "model_training": bool(model.training),
+            },
             "step_times_s": {**step_times, "total": time.time() - source_start},
         }
         _save_diagnostics(vectors_dir, source_tag, diagnostics)
@@ -191,6 +206,11 @@ def run_phase2_source(
         method_accs = {'dom': layer_scores.get(best_layer, 0.0), 'cpca': 0.0}
         diagnostics = {
             "collection": collection_diag,
+            "freeze": {
+                "trainable_params": trainable_params,
+                "frozen_params": frozen_params,
+                "model_training": bool(model.training),
+            },
             "probe": {
                 "layer_scores": {str(L): float(s) for L, s in layer_scores.items()},
                 "gate_threshold": layer_selection_diag["threshold"],
@@ -258,6 +278,11 @@ def run_phase2_source(
     total_elapsed = time.time() - source_start
     diagnostics = {
         "collection": collection_diag,
+        "freeze": {
+            "trainable_params": trainable_params,
+            "frozen_params": frozen_params,
+            "model_training": bool(model.training),
+        },
         "probe": {
             "layer_scores": {str(L): float(s) for L, s in layer_scores.items()},
             "gate_threshold": layer_selection_diag["threshold"],
@@ -485,6 +510,9 @@ def run_phase2_all_sources(
         'base_max_probe_score':   max(base_ls.values()) if base_ls else 0.0,
         'cross_source_cos':       cross_cos,
         'ccot_r_final':           cfg.get('r_final', 10),
+        'phase2_models_frozen':   True,
+        'ccot_trainable_params':  int(ccot_res.get('diagnostics', {}).get('freeze', {}).get('trainable_params', 0)),
+        'base_trainable_params':  int(base_res.get('diagnostics', {}).get('freeze', {}).get('trainable_params', 0)),
     }
     os.makedirs(vectors_dir, exist_ok=True)
     meta_path = os.path.join(vectors_dir, 'phase2_meta.json')

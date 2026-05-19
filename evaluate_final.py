@@ -500,6 +500,7 @@ def _build_summary(all_results: dict, n_test: int) -> dict:
         'mechanism_gain_table': {},
         'specificity_table': {},
         'flip_grids': {},
+        'token_budgeting_table': {},
     }
 
     for model_tag, data in all_results.items():
@@ -539,6 +540,7 @@ def _build_summary(all_results: dict, n_test: int) -> dict:
                                           if _metric_by_prefix(metrics, 'cpca') else 0.0),
         }
         summary['flip_grids'][model_tag] = data['flip_grid']
+        summary['token_budgeting_table'][model_tag] = data.get('token_budgeting', {})
 
     # ── Confidence intervals ───────────────────────────────────────────────────
     summary['confidence_intervals'] = {
@@ -700,6 +702,62 @@ def collect_condition_metrics(
         trajectory_coherence=float(np.mean([e.traj_coherence for e in examples])) if examples else 0.0,
         truth_alignment=float(np.mean([e.truth_align for e in examples]))         if examples else 0.0,
     )
+
+
+def coconut_thinking_token_counts(
+    examples: list[ExampleResult],
+    latent_tokens: int,
+) -> list[int]:
+    """
+    Token budget used for the matched trimmed-CoT baseline.
+    Counts fixed Coconut latent tokens plus any visible reasoning tokens emitted
+    after the latent span.
+    """
+    return [
+        max(1, int(latent_tokens) + int(e.reasoning_tokens))
+        for e in examples
+    ]
+
+
+def build_token_budget_log(
+    D_test: list,
+    full_cot_counts: list[int],
+    coconut_counts: list[int],
+    trimmed_examples: list[ExampleResult],
+    model_tag: str,
+    condition_tag: str,
+    latent_tokens: int,
+) -> dict:
+    full_mean = float(np.mean(full_cot_counts)) if full_cot_counts else 0.0
+    coconut_mean = float(np.mean(coconut_counts)) if coconut_counts else 0.0
+    ratio = coconut_mean / max(full_mean, 1e-8)
+    trimmed_counts = [e.reasoning_tokens for e in trimmed_examples]
+    trimmed_mean = float(np.mean(trimmed_counts)) if trimmed_counts else 0.0
+    per_example = []
+    for i, (item, full_n, coco_n, trim_ex) in enumerate(
+        zip(D_test, full_cot_counts, coconut_counts, trimmed_examples)
+    ):
+        per_example.append({
+            "id": item.get("id", i),
+            "full_cot_reasoning_tokens": int(full_n),
+            "coconut_matched_tokens": int(coco_n),
+            "trimmed_cot_budget_tokens": int(coco_n),
+            "trimmed_cot_actual_reasoning_tokens": int(trim_ex.reasoning_tokens),
+            "trimmed_cot_correct": bool(trim_ex.correct),
+            "per_example_ratio": float(coco_n / max(full_n, 1)),
+        })
+    return {
+        "model_tag": model_tag,
+        "condition_tag": condition_tag,
+        "latent_tokens": int(latent_tokens),
+        "policy": "trim_full_cot_to_best_coconut_token_count",
+        "x_coconut_tokens_mean": coconut_mean,
+        "y_full_cot_tokens_mean": full_mean,
+        "x_over_y_ratio": ratio,
+        "trimmed_cot_actual_tokens_mean": trimmed_mean,
+        "n_examples": len(per_example),
+        "per_example": per_example,
+    }
 
 
 # ── Flip matrix computation ────────────────────────────────────────────────────
@@ -1012,6 +1070,7 @@ def save_final_results(
             'flip_grid':      data.get('flip_grid', {}),
             'alpha_sweep':    data.get('alpha_sweep', []),
             'locked_config':  data.get('locked_config', {}),
+            'token_budgeting': data.get('token_budgeting', {}),
             'condition_cis':  {
                 k: _ser_br(v) for k, v in data.get('condition_cis', {}).items()
             },
@@ -1031,6 +1090,13 @@ def save_final_results(
         with open(out_path, 'w') as f:
             json.dump(serializable, f, indent=2)
         print(f"  Saved: {out_path}")
+
+        budget_log = data.get('token_budget_log')
+        if budget_log:
+            budget_path = os.path.join(out_dir, f"{model_tag}_trimmed_cot_budget_log.json")
+            with open(budget_path, 'w') as f:
+                json.dump(budget_log, f, indent=2)
+            print(f"  Saved: {budget_path}")
 
     summary_path = os.path.join(out_dir, 'summary_test.json')
     with open(summary_path, 'w') as f:
@@ -1071,7 +1137,6 @@ def run_final_evaluation(
         best_cfg   = phase3_best.get(model_tag) or _load_best_config(results_dir)
         meta       = _load_meta_file(vectors_dir)
         latent_tokens = int(best_cfg.get('latent_tokens') or meta.get('best_ccot_latent_tokens') or 4)
-        ratio = latent_tokens / 6.0
         condition_tag = f"L{latent_tokens}"
         source     = str(best_cfg.get('vector_source') or 'ccot')
         alpha_star = float(best_cfg.get('alpha_star') or 1.0)
@@ -1085,6 +1150,9 @@ def run_final_evaluation(
         all_preds:   dict = {}
         all_metrics: dict = {}
         sweep        = []   # default; populated if CCoT checkpoint exists
+        token_budgeting = {}
+        token_budget_log = {}
+        coconut_budget_counts: list[int] = []
 
         # ── Phase A: CoT model ─────────────────────────────────────────────────
         cot_ckpt = os.path.join(ckpt_dir, 'cot')
@@ -1093,12 +1161,8 @@ def run_final_evaluation(
             p.requires_grad = False
         cot_model.eval()
 
-        print("[PH4] Precomputing full CoT token counts on D_test...")
-        full_cot_counts = precompute_full_cot_tokens(cot_model, tok_cot, D_test, device)
-        budgets = [max(10, round(ratio * t)) for t in full_cot_counts]
-
         # Condition: Full CoT
-        print("[PH4] full_cot")
+        print("[PH4] full_cot (recording y = full CoT reasoning tokens)")
         t0 = time.time()
         examples = []
         for item in D_test:
@@ -1112,76 +1176,12 @@ def run_final_evaluation(
                 reasoning_tokens=nt, total_tokens=nt,
                 latency_sec=time.time() - t1,
             ))
+        full_cot_counts = [e.reasoning_tokens for e in examples]
         all_metrics['full_cot'] = collect_condition_metrics(
             examples, full_cot_counts, 'full_cot', model_tag, time.time() - t0
         )
         all_preds['full_cot'] = [e.correct for e in examples]
         print(f"  acc={all_metrics['full_cot'].accuracy:.3f}")
-
-        # Condition: Trimmed CoT
-        trim_cond = f'trimmed_{condition_tag}'
-        print(f"[PH4] {trim_cond}")
-        t0 = time.time()
-        examples = []
-        for i, item in enumerate(D_test):
-            t1 = time.time()
-            pred, reasoning = run_trimmed_cot(cot_model, tok_cot, item, budgets[i], device)
-            gold = item['answer'].split('####')[1].strip()
-            ok   = normalize_answer(pred) == normalize_answer(gold) if pred else False
-            nt   = len(tok_cot.encode(reasoning or '', add_special_tokens=False))
-            examples.append(ExampleResult(
-                correct=ok, answer_found=pred is not None,
-                reasoning_tokens=nt, total_tokens=nt,
-                latency_sec=time.time() - t1,
-            ))
-        all_metrics[trim_cond] = collect_condition_metrics(
-            examples, full_cot_counts, trim_cond, model_tag, time.time() - t0
-        )
-        all_preds[trim_cond] = [e.correct for e in examples]
-        print(f"  acc={all_metrics[trim_cond].accuracy:.3f}")
-
-        # Condition: Trimmed + DoM  (CoT model, base source, base L_star)
-        trim_dom_cond = f'trimmed_dom_{condition_tag}'
-        print(f"[PH4] {trim_dom_cond}")
-        try:
-            v_base_dom  = _load_dom(vectors_dir, 'base').to(device)
-            try:
-                L_star_base = get_injection_layer(vectors_dir, 'base')
-            except FileNotFoundError:
-                L_star_base = meta.get('base_best_layer', meta.get('ccot_best_layer', 14))
-            try:
-                alpha_base = _load_alpha_file(vectors_dir, 'base')
-            except FileNotFoundError:
-                alpha_base = alpha_star
-
-            cot_prompt_fn = lambda item: f"Question: {item['question']}\n\nReasoning:"
-            t0 = time.time()
-            examples = []
-            for i, item in enumerate(D_test):
-                prompt = cot_prompt_fn(item)
-                enc = tok_cot(prompt, return_tensors='pt').to(device)
-                with torch.no_grad():
-                    probe_ids = cot_model.generate(
-                        **enc, do_sample=False, max_new_tokens=128,
-                        pad_token_id=tok_cot.eos_token_id,
-                    )
-                try:
-                    b_idx = find_boundary_idx_base(probe_ids, tok_cot)
-                except Exception:
-                    b_idx = max(0, enc['input_ids'].shape[1] - 1)
-                hook_fn = make_dom_hook(b_idx, v_base_dom, alpha_base, device)
-                ex = run_steered_with_metrics(
-                    cot_model, tok_cot, prompt, item, hook_fn,
-                    L_star_base, v_base_dom, device, budgets[i],
-                )
-                examples.append(ex)
-            all_metrics[trim_dom_cond] = collect_condition_metrics(
-                examples, full_cot_counts, trim_dom_cond, model_tag, time.time() - t0
-            )
-            all_preds[trim_dom_cond] = [e.correct for e in examples]
-            print(f"  acc={all_metrics[trim_dom_cond].accuracy:.3f}")
-        except FileNotFoundError as exc:
-            print(f"  [SKIP] {trim_dom_cond}: {exc}")
 
         del cot_model
         if torch.cuda.is_available():
@@ -1291,6 +1291,23 @@ def run_final_evaluation(
                 )
                 all_preds[ccot_cond] = [e.correct for e in examples]
                 print(f"  acc={all_metrics[ccot_cond].accuracy:.3f}")
+                coconut_budget_counts = coconut_thinking_token_counts(examples, latent_tokens)
+                full_mean = float(np.mean(full_cot_counts)) if full_cot_counts else 0.0
+                coconut_mean = float(np.mean(coconut_budget_counts)) if coconut_budget_counts else 0.0
+                token_budgeting = {
+                    "policy": "trim_full_cot_to_best_coconut_token_count",
+                    "condition_tag": condition_tag,
+                    "latent_tokens": latent_tokens,
+                    "x_coconut_tokens_mean": coconut_mean,
+                    "y_full_cot_tokens_mean": full_mean,
+                    "x_over_y_ratio": coconut_mean / max(full_mean, 1e-8),
+                    "trimmed_condition": f"trimmed_{condition_tag}",
+                }
+                print(
+                    "  matched trimmed-CoT budget: "
+                    f"x_coconut={coconut_mean:.2f} y_full_cot={full_mean:.2f} "
+                    f"ratio={token_budgeting['x_over_y_ratio']:.4f}"
+                )
 
                 # Condition: Noise control
                 noise_cond = f'noise_{condition_tag}_{source}'
@@ -1341,6 +1358,109 @@ def run_final_evaluation(
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+        # ── Phase D: Matched-token trimmed CoT ───────────────────────────────
+        # Budget is derived from the actual best-latent Coconut run:
+        #   x = mean(latent_tokens + Coconut visible reasoning tokens)
+        #   y = mean(full CoT reasoning tokens)
+        #   ratio = x / y
+        if coconut_budget_counts:
+            cot_ckpt = os.path.join(ckpt_dir, 'cot')
+            cot_model, tok_cot = load_finetuned(cot_ckpt, device)
+            for p in cot_model.parameters():
+                p.requires_grad = False
+            cot_model.eval()
+
+            trim_cond = f'trimmed_{condition_tag}'
+            print(
+                f"[PH4] {trim_cond} "
+                f"(matched to best Coconut token budget; ratio={token_budgeting.get('x_over_y_ratio', 0.0):.4f})"
+            )
+            t0 = time.time()
+            examples = []
+            for i, item in enumerate(D_test):
+                t1 = time.time()
+                pred, reasoning = run_trimmed_cot(
+                    cot_model, tok_cot, item, coconut_budget_counts[i], device
+                )
+                gold = item['answer'].split('####')[1].strip()
+                ok   = normalize_answer(pred) == normalize_answer(gold) if pred else False
+                nt   = len(tok_cot.encode(reasoning or '', add_special_tokens=False))
+                examples.append(ExampleResult(
+                    correct=ok, answer_found=pred is not None,
+                    reasoning_tokens=nt, total_tokens=nt,
+                    latency_sec=time.time() - t1,
+                ))
+            all_metrics[trim_cond] = collect_condition_metrics(
+                examples, full_cot_counts, trim_cond, model_tag, time.time() - t0
+            )
+            all_preds[trim_cond] = [e.correct for e in examples]
+            token_budget_log = build_token_budget_log(
+                D_test,
+                full_cot_counts,
+                coconut_budget_counts,
+                examples,
+                model_tag,
+                condition_tag,
+                latent_tokens,
+            )
+            token_budgeting.update({
+                "trimmed_cot_accuracy": all_metrics[trim_cond].accuracy,
+                "trimmed_cot_actual_tokens_mean": token_budget_log["trimmed_cot_actual_tokens_mean"],
+            })
+            print(
+                f"  acc={all_metrics[trim_cond].accuracy:.3f} "
+                f"actual_ratio={all_metrics[trim_cond].actual_ratio_mean:.4f}"
+            )
+
+            # Condition: Trimmed + DoM  (CoT model, base source, base L_star)
+            trim_dom_cond = f'trimmed_dom_{condition_tag}'
+            print(f"[PH4] {trim_dom_cond}")
+            try:
+                v_base_dom  = _load_dom(vectors_dir, 'base').to(device)
+                try:
+                    L_star_base = get_injection_layer(vectors_dir, 'base')
+                except FileNotFoundError:
+                    L_star_base = meta.get('base_best_layer', meta.get('ccot_best_layer', 14))
+                try:
+                    alpha_base = _load_alpha_file(vectors_dir, 'base')
+                except FileNotFoundError:
+                    alpha_base = alpha_star
+
+                cot_prompt_fn = lambda item: f"Question: {item['question']}\n\nReasoning:"
+                t0 = time.time()
+                examples = []
+                for i, item in enumerate(D_test):
+                    prompt = cot_prompt_fn(item)
+                    enc = tok_cot(prompt, return_tensors='pt').to(device)
+                    with torch.no_grad():
+                        probe_ids = cot_model.generate(
+                            **enc, do_sample=False, max_new_tokens=128,
+                            pad_token_id=tok_cot.eos_token_id,
+                        )
+                    try:
+                        b_idx = find_boundary_idx_base(probe_ids, tok_cot)
+                    except Exception:
+                        b_idx = max(0, enc['input_ids'].shape[1] - 1)
+                    hook_fn = make_dom_hook(b_idx, v_base_dom, alpha_base, device)
+                    ex = run_steered_with_metrics(
+                        cot_model, tok_cot, prompt, item, hook_fn,
+                        L_star_base, v_base_dom, device, coconut_budget_counts[i],
+                    )
+                    examples.append(ex)
+                all_metrics[trim_dom_cond] = collect_condition_metrics(
+                    examples, full_cot_counts, trim_dom_cond, model_tag, time.time() - t0
+                )
+                all_preds[trim_dom_cond] = [e.correct for e in examples]
+                print(f"  acc={all_metrics[trim_dom_cond].accuracy:.3f}")
+            except FileNotFoundError as exc:
+                print(f"  [SKIP] {trim_dom_cond}: {exc}")
+
+            del cot_model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        else:
+            print("[PH4] matched trimmed CoT skipped: no Coconut token counts available")
+
         # ── Bootstrap CIs (pure numpy, no model) ──────────────────────────────
         print(f"\n[PH4] Computing bootstrap CIs ({N_BOOTSTRAP} resamples)...")
         condition_cis = compute_condition_cis(all_preds, seed=CI_SEED)
@@ -1380,6 +1500,8 @@ def run_final_evaluation(
             'locked_config':  best_cfg,
             'condition_cis':  condition_cis,
             'paired_cis':     paired_cis,
+            'token_budgeting': token_budgeting,
+            'token_budget_log': token_budget_log,
         }
 
     return all_results
