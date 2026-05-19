@@ -316,14 +316,14 @@ def pick_best_ccot_ratio(results_dir: str, model_tag: str) -> int:
     """
     path = os.path.join(results_dir, 'phase1_val.json')
     if not os.path.exists(path):
-        print(f"phase1_val.json not found at {path} — defaulting to R=7")
-        return 7
+        print(f"phase1_val.json not found at {path} — defaulting to R=6")
+        return 6
 
     with open(path) as f:
         records = json.load(f)
 
     res_map = {r['condition']: r for r in records}
-    best_ratio_int, best_gain = 7, float('-inf')
+    best_ratio_int, best_gain = 6, float('-inf')
 
     for ri in [5, 6, 7, 8, 9]:
         k_ccot    = f'ccot_R{ri}'
