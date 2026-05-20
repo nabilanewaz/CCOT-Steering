@@ -51,10 +51,11 @@ N_BOOTSTRAP  = 1000    # resamples for all bootstrap CIs
 CI_SEED      = 0       # fixed seed → reproducible CIs across re-runs
 CI_LEVEL     = 0.95    # 95% confidence interval
 
-MODEL_TAGS = ['llama32_3b', 'phi2', 'qwen25_3b', 'qwen25_math1.5b']
+MODEL_TAGS = ['llama32_3b', 'phi2', 'qwen25_0.5b', 'qwen25_3b', 'qwen25_math1.5b']
 MODEL_ID_MAP = {
     'llama32_3b':      'meta-llama/Llama-3.2-3B',
     'phi2':            'microsoft/phi-2',
+    'qwen25_0.5b':     'Qwen/Qwen2.5-0.5B',
     'qwen25_3b':       'Qwen/Qwen2.5-3B',
     'qwen25_math1.5b': 'Qwen/Qwen2.5-Math-1.5B',
 }
@@ -1535,7 +1536,7 @@ def main():
     parser.add_argument(
         '--model',
         default='all',
-        help='Model tag(s): all | qwen25_math1.5b | llama32_3b,phi2',
+        help='Model tag(s): all | qwen25_0.5b | qwen25_math1.5b | llama32_3b,phi2',
     )
     args, _unknown = parser.parse_known_args()
 

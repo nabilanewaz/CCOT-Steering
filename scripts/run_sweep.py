@@ -27,12 +27,13 @@ from phase3.evaluate import run_phase3_evaluation
 from phase3.select import select_best_steered_config
 
 CFG_ID     = 'S2'   # fixed 60/20/20 split
-MODEL_TAGS = ['llama32_3b', 'phi2', 'qwen25_3b', 'qwen25_math1.5b']
+MODEL_TAGS = ['llama32_3b', 'phi2', 'qwen25_0.5b', 'qwen25_3b', 'qwen25_math1.5b']
 LATENT_TOKEN_COUNTS = [3, 4, 6]
 
 MODEL_ID_MAP = {
     'llama32_3b':      'meta-llama/Llama-3.2-3B',
     'phi2':            'microsoft/phi-2',
+    'qwen25_0.5b':     'Qwen/Qwen2.5-0.5B',
     'qwen25_3b':       'Qwen/Qwen2.5-3B',
     'qwen25_math1.5b': 'Qwen/Qwen2.5-Math-1.5B',
 }

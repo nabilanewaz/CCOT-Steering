@@ -17,6 +17,7 @@ from utils.torch_compat import patch_transformers_custom_op_registration
 MODEL_HPARAMS = {
     "llama32_3b": {"lr": 1e-5, "batch": 1, "grad_accum": 64, "epochs": 20},
     "phi2": {"lr": 1e-5, "batch": 1, "grad_accum": 64, "epochs": 20},
+    "qwen25_0.5b": {"lr": 1e-5, "batch": 1, "grad_accum": 64, "epochs": 20},
     "qwen25_3b": {"lr": 1e-5, "batch": 1, "grad_accum": 64, "epochs": 20},
     "qwen25_math1.5b": {"lr": 1e-5, "latent_lr": 3e-6, "batch": 1, "grad_accum": 128, "epochs": 20},
 }

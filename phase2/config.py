@@ -19,6 +19,15 @@ MODEL_PHASE2_CONFIG = {
         'threshold_multiplier': 0.3,
         'min_samples':          200,
     },
+    'qwen25_0.5b': {
+        'N': 20,
+        'cpca_variant':         'full',
+        'r_per_layer':          2,
+        'r_final':              6,
+        'beta':                 0.5,
+        'threshold_multiplier': 0.5,
+        'min_samples':          200,
+    },
     'qwen25_3b': {
         'N': 20,
         'cpca_variant':         'full',

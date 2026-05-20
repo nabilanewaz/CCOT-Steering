@@ -11,7 +11,7 @@ import sys
 from scripts.build_splits import build_all_splits
 from scripts.selection import select_best_config
 
-MODEL_TAGS = ['llama32_3b', 'phi2', 'qwen25_3b', 'qwen25_math1.5b']
+MODEL_TAGS = ['llama32_3b', 'phi2', 'qwen25_0.5b', 'qwen25_3b', 'qwen25_math1.5b']
 
 
 def main():

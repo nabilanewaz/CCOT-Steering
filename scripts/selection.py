@@ -129,5 +129,5 @@ if __name__ == '__main__':
             'S2': {'D_train': 4484, 'D_steer': 1495, 'D_val': 1495},
         }
 
-    MODEL_TAGS = ['llama32_3b', 'phi2', 'qwen25_3b', 'qwen25_math1.5b']
+    MODEL_TAGS = ['llama32_3b', 'phi2', 'qwen25_0.5b', 'qwen25_3b', 'qwen25_math1.5b']
     select_best_config(splits, args.results, MODEL_TAGS)

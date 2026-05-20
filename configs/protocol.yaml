@@ -11,6 +11,7 @@ split_ratios: [0.60, 0.20, 0.20]
 model_tags:
   llama32_3b:      meta-llama/Llama-3.2-3B
   phi2:            microsoft/phi-2
+  qwen25_0.5b:     Qwen/Qwen2.5-0.5B
   qwen25_3b:       Qwen/Qwen2.5-3B
   qwen25_math1.5b: Qwen/Qwen2.5-Math-1.5B
 
