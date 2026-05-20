@@ -28,12 +28,14 @@ HYBRID_MODE = True
 LATENT_TOKEN_COUNTS = [3, 4, 6]
 CANONICAL_DIRNAME = "_coconut_phase1"
 BEST_DIRNAME = "_coconut_phase1_best"
+LATENT_ONLY_BEST_DIRNAME = "_coconut_phase1_best_latent_only"
 EPOCH9_DIRNAME = "_coconut_phase1_epoch9"
 EARLY_STOP_PATIENCE = 2
 EARLY_STOP_MIN_DELTA = 0.002
 EARLY_STOP_MIN_EPOCH = 20
 EPOCH9_SNAPSHOT_EPOCH = 9
-BEST_CHECKPOINT_MIN_STAGE = 4
+BEST_CHECKPOINT_MIN_STAGE = 3
+LATENT_ONLY_CHECKPOINT_MIN_STAGE = 4
 TRAIN_USE_KV_CACHE = False
 TRAIN_DETACH_LATENTS = False
 
@@ -233,10 +235,14 @@ def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, mo
     input_embeds_ref = coconut_model.base_causallm.get_input_embeddings().weight.detach().clone()
     checkpoint_root = os.path.dirname(output_dir)
     best_dir = os.path.join(checkpoint_root, BEST_DIRNAME)
+    latent_only_best_dir = os.path.join(checkpoint_root, LATENT_ONLY_BEST_DIRNAME)
     epoch9_dir = os.path.join(checkpoint_root, EPOCH9_DIRNAME)
     best_val_acc = -float("inf")
     best_epoch = None
     best_stage = None
+    latent_only_best_val_acc = -float("inf")
+    latent_only_best_epoch = None
+    latent_only_best_stage = None
     warmup_best_val_acc = -float("inf")
     warmup_best_epoch = None
     early_stop_best_acc = -float("inf")
@@ -381,6 +387,24 @@ def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, mo
                 f"[phase1][{model_tag}] best checkpoint saved -> {best_dir} "
                 f"(epoch={epoch_number} stage={stage} val_acc={val_acc:.4f})"
             )
+        eligible_for_latent_only_best = stage >= LATENT_ONLY_CHECKPOINT_MIN_STAGE
+        if eligible_for_latent_only_best and val_acc > latent_only_best_val_acc:
+            latent_only_best_val_acc = val_acc
+            latent_only_best_epoch = epoch_number
+            latent_only_best_stage = stage
+            _save_coconut_checkpoint(
+                coconut_model,
+                tokenizer,
+                latent_only_best_dir,
+                base_model_id,
+                role="best_latent_only",
+                epoch=epoch_number,
+                val_accuracy=val_acc,
+            )
+            tqdm.write(
+                f"[phase1][{model_tag}] best latent-only checkpoint saved -> {latent_only_best_dir} "
+                f"(epoch={epoch_number} stage={stage} val_acc={val_acc:.4f})"
+            )
         if epoch_number == EPOCH9_SNAPSHOT_EPOCH:
             _save_coconut_checkpoint(
                 coconut_model,
@@ -448,6 +472,21 @@ def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, mo
             val_accuracy=val_acc_history[-1] if val_acc_history else None,
         )
         print(f"Coconut best model saved -> {best_dir}")
+    if latent_only_best_epoch is None:
+        tqdm.write(
+            f"[phase1][{model_tag}] WARNING: no finite latent-only checkpoint "
+            f"was found; falling back to final checkpoint for latent-only export."
+        )
+        _save_coconut_checkpoint(
+            coconut_model,
+            tokenizer,
+            latent_only_best_dir,
+            base_model_id,
+            role="best_latent_only",
+            epoch=len(loss_history),
+            val_accuracy=val_acc_history[-1] if val_acc_history else None,
+        )
+        print(f"Coconut latent-only best model saved -> {latent_only_best_dir}")
     return {
         "loss_history": loss_history,
         "losses_per_stage": losses_per_stage,
@@ -467,7 +506,12 @@ def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, mo
         "best_epoch": best_epoch,
         "best_stage": best_stage,
         "best_checkpoint_min_stage": BEST_CHECKPOINT_MIN_STAGE,
-        "best_checkpoint_policy": "final_stage_only",
+        "best_checkpoint_policy": "full_latent_budget_stage3_plus",
+        "latent_only_best_val_accuracy": latent_only_best_val_acc if latent_only_best_epoch is not None else None,
+        "latent_only_best_epoch": latent_only_best_epoch,
+        "latent_only_best_stage": latent_only_best_stage,
+        "latent_only_checkpoint_min_stage": LATENT_ONLY_CHECKPOINT_MIN_STAGE,
+        "latent_only_best_checkpoint_dir": latent_only_best_dir,
         "warmup_best_val_accuracy": warmup_best_val_acc if warmup_best_epoch is not None else None,
         "warmup_best_epoch": warmup_best_epoch,
         "best_checkpoint_dir": best_dir,
@@ -591,11 +635,14 @@ def _phase1_training_current(results_dir: str) -> bool:
         metrics.get("train_use_kv_cache") == TRAIN_USE_KV_CACHE
         and metrics.get("train_detach_latents") == TRAIN_DETACH_LATENTS
         and metrics.get("best_checkpoint_min_stage") == BEST_CHECKPOINT_MIN_STAGE
-        and metrics.get("best_checkpoint_policy") == "final_stage_only"
+        and metrics.get("best_checkpoint_policy") == "full_latent_budget_stage3_plus"
+        and metrics.get("latent_only_checkpoint_min_stage") == LATENT_ONLY_CHECKPOINT_MIN_STAGE
         and metrics.get("early_stop_min_epoch") == EARLY_STOP_MIN_EPOCH
         and metrics.get("completed_epochs") == metrics.get("epochs")
         and metrics.get("best_stage") is not None
         and metrics.get("best_stage") >= BEST_CHECKPOINT_MIN_STAGE
+        and metrics.get("latent_only_best_stage") is not None
+        and metrics.get("latent_only_best_stage") >= LATENT_ONLY_CHECKPOINT_MIN_STAGE
     )
 
 
@@ -622,10 +669,12 @@ def train_coconut_phase1(
 ):
     canonical_dir = os.path.join(checkpoints_dir, CANONICAL_DIRNAME)
     best_dir = os.path.join(checkpoints_dir, BEST_DIRNAME)
+    latent_only_best_dir = os.path.join(checkpoints_dir, LATENT_ONLY_BEST_DIRNAME)
     epoch9_dir = os.path.join(checkpoints_dir, EPOCH9_DIRNAME)
     required_markers = [
         os.path.join(canonical_dir, "config.json"),
         os.path.join(best_dir, "config.json"),
+        os.path.join(latent_only_best_dir, "config.json"),
         os.path.join(epoch9_dir, "config.json"),
     ]
     checkpoints_ready = all(os.path.exists(path) for path in required_markers)
@@ -648,7 +697,7 @@ def train_coconut_phase1(
     else:
         print(
             "Phase 1 checkpoints exist -> "
-            f"{canonical_dir}, {best_dir}, {epoch9_dir} (skipping retrain)"
+            f"{canonical_dir}, {best_dir}, {latent_only_best_dir}, {epoch9_dir} (skipping retrain)"
         )
 
     export_compat_checkpoints(checkpoints_dir, latent_token_counts=latent_token_counts)
