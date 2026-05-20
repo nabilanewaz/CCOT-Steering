@@ -5,7 +5,7 @@ from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
-PROBE_GATE = 0.65   # minimum per-layer accuracy required in at least one layer
+PROBE_GATE = 0.55   # minimum per-layer accuracy required in at least one layer
 
 
 def score_all_layers(

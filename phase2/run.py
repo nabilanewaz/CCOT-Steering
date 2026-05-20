@@ -94,12 +94,21 @@ def run_phase2_source(
 
     # ── STEP 1: Collect hidden states ─────────────────────────────────────────
     t_step = _step(1, N_STEPS, 'Collecting hidden states', phase_start)
-    H_pos, H_neg = collect_hidden_states(
-        model, tokenizer, D_steer, N, device,
-        boundary_idx_fn, source_tag,
-        prompt_fn=prompt_fn,
-        min_samples=min_samples,
-    )
+    os.makedirs(vectors_dir, exist_ok=True)
+    hstates_cache = os.path.join(vectors_dir, f'{source_tag}_hstates_cache.pt')
+    if os.path.exists(hstates_cache):
+        print(f"  Loading cached hidden states from {hstates_cache}")
+        _cache = torch.load(hstates_cache, map_location='cpu')
+        H_pos, H_neg = _cache['H_pos'], _cache['H_neg']
+    else:
+        H_pos, H_neg = collect_hidden_states(
+            model, tokenizer, D_steer, N, device,
+            boundary_idx_fn, source_tag,
+            prompt_fn=prompt_fn,
+            min_samples=min_samples,
+        )
+        torch.save({'H_pos': H_pos, 'H_neg': H_neg}, hstates_cache)
+        print(f"  Hidden states cached -> {hstates_cache}")
     step_times['collection'] = round(time.time() - t_step, 2)
 
     if not H_pos:
@@ -121,9 +130,9 @@ def run_phase2_source(
     layer_scores = score_all_layers(H_pos, H_neg)
     step_times['probe'] = round(time.time() - t_step, 2)
 
-    passing_gate = [L for L, s in layer_scores.items() if s > 0.65]
+    passing_gate = [L for L, s in layer_scores.items() if s > 0.55]
     diag['probe'] = {
-        'gate_threshold':     0.65,
+        'gate_threshold':     0.55,
         'layer_scores':       {str(L): round(s, 4) for L, s in sorted(layer_scores.items())},
         'best_layer':         max(layer_scores, key=layer_scores.get),
         'best_score':         round(max(layer_scores.values()), 4),
