@@ -198,7 +198,7 @@ def _run_selection(models_to_run, splits):
     print(f"\nWinner: {winner}  (configs/selected.yaml updated)")
 
 
-def _run_phase4():
+def _run_phase4(models_to_run=None):
     print("\n" + "=" * 70)
     print("PHASE 4: Final Evaluation on D_test")
     print("=" * 70)
@@ -206,8 +206,11 @@ def _run_phase4():
         print("[PH4] configs/selected.yaml missing — run split selection first.")
         sys.exit(1)
     print("Delegating to evaluate_final.py (the only script that may open test.jsonl).")
+    cmd = [sys.executable, 'evaluate_final.py']
+    if models_to_run:
+        cmd.extend(['--model', ','.join(models_to_run)])
     result = subprocess.run(
-        [sys.executable, 'evaluate_final.py'],
+        cmd,
         check=False,
         env=phase4_subprocess_env(),
     )
@@ -315,7 +318,7 @@ def main():
         _run_selection(models_to_run, splits)
 
     if args.phase in (0, 4):
-        _run_phase4()
+        _run_phase4(models_to_run)
 
 
 if __name__ == '__main__':

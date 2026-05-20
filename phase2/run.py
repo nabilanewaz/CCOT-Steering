@@ -12,7 +12,7 @@ from phase2.loaders import (
     find_boundary_idx_base,
 )
 from phase2.collect import collect_hidden_states
-from phase2.probe import score_all_layers
+from phase2.probe import PROBE_GATE, score_all_layers
 from phase2.dom import (
     compute_per_layer_dom,
     compute_best_layer_dom,
@@ -128,12 +128,34 @@ def run_phase2_source(
         step_times[key] = time.time() - started
 
     t = _step(1, "collect hidden states")
-    H_pos, H_neg, collection_diag = collect_hidden_states(
-        model, tokenizer, D_steer, N, device,
-        boundary_idx_fn, source_tag,
-        prompt_fn=prompt_fn,
-        min_samples=min_samples,
-    )
+    os.makedirs(vectors_dir, exist_ok=True)
+    hstates_cache = os.path.join(vectors_dir, f"{source_tag}_hstates_cache.pt")
+    if os.path.exists(hstates_cache):
+        print(f"  Loading cached hidden states from {hstates_cache}")
+        cache = torch.load(hstates_cache, map_location="cpu")
+        H_pos, H_neg = cache["H_pos"], cache["H_neg"]
+        collection_diag = dict(cache.get("collection_diag") or {})
+        collection_diag["cached"] = True
+        collection_diag["cache_path"] = hstates_cache
+    else:
+        H_pos, H_neg, collection_diag = collect_hidden_states(
+            model, tokenizer, D_steer, N, device,
+            boundary_idx_fn, source_tag,
+            prompt_fn=prompt_fn,
+            min_samples=min_samples,
+        )
+        collection_diag = dict(collection_diag or {})
+        collection_diag["cached"] = False
+        collection_diag["cache_path"] = hstates_cache
+        torch.save(
+            {
+                "H_pos": H_pos,
+                "H_neg": H_neg,
+                "collection_diag": collection_diag,
+            },
+            hstates_cache,
+        )
+        print(f"  Hidden states cached -> {hstates_cache}")
     _finish_step("1_collection", t)
     if not H_pos:
         print("No layers passed min_samples threshold — aborting this source.")
@@ -213,8 +235,8 @@ def run_phase2_source(
             },
             "probe": {
                 "layer_scores": {str(L): float(s) for L, s in layer_scores.items()},
-                "gate_threshold": layer_selection_diag["threshold"],
-                "layers_passing": layer_selection_diag["layers_passing"],
+                "gate_threshold": PROBE_GATE,
+                "layers_passing": sorted(int(L) for L, s in layer_scores.items() if s > PROBE_GATE),
             },
             "dom": {
                 "best_layer": int(best_layer),
@@ -285,8 +307,8 @@ def run_phase2_source(
         },
         "probe": {
             "layer_scores": {str(L): float(s) for L, s in layer_scores.items()},
-            "gate_threshold": layer_selection_diag["threshold"],
-            "layers_passing": layer_selection_diag["layers_passing"],
+            "gate_threshold": PROBE_GATE,
+            "layers_passing": sorted(int(L) for L, s in layer_scores.items() if s > PROBE_GATE),
         },
         "dom": {
             "best_layer": int(best_layer),

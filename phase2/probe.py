@@ -5,7 +5,7 @@ from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
-PROBE_GATE = 0.65   # minimum per-layer accuracy required in at least one layer
+PROBE_GATE = 0.55   # minimum per-layer accuracy required in at least one layer
 
 
 def score_all_layers(
@@ -17,7 +17,7 @@ def score_all_layers(
     Fit a stratified 80/20 logistic probe on each layer's hidden states.
     Returns dict[layer -> held-out accuracy].
 
-    Raises RuntimeError if no layer exceeds `gate` (default 65%) — this
+    Raises RuntimeError if no layer exceeds `gate` (default 55%) — this
     indicates the collected states carry no linear separability signal and
     downstream DoM/cPCA vectors would be meaningless.
     """

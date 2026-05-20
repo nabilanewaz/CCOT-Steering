@@ -1114,6 +1114,7 @@ def run_final_evaluation(
     vectors_base: str = 'vectors',
     checkpoints_base: str = 'checkpoints',
     max_new_tokens: int = 256,
+    model_tags: list[str] | None = None,
 ) -> dict:
     """
     Single-pass D_test evaluation using locked Phase 3 configs.
@@ -1123,8 +1124,9 @@ def run_final_evaluation(
     phase3_best = _load_phase3_best_configs(cfg, winning_config, results_base)
     all_results:  dict = {}
     golds = [item['answer'].split('####')[1].strip() for item in D_test]
+    model_tags = model_tags or MODEL_TAGS
 
-    for model_tag in MODEL_TAGS:
+    for model_tag in model_tags:
         base_model_id = MODEL_ID_MAP[model_tag]
         results_dir   = os.path.join(results_base, winning_config, model_tag)
         vectors_dir   = os.path.join(vectors_base, winning_config, model_tag)
@@ -1530,6 +1532,11 @@ def main():
         default='results/final',
         help='Directory for summary_test.json and <model>_test.json (default: results/final)',
     )
+    parser.add_argument(
+        '--model',
+        default='all',
+        help='Model tag(s): all | qwen25_math1.5b | llama32_3b,phi2',
+    )
     args, _unknown = parser.parse_known_args()
 
     init_project_dataset(args.dataset, interactive=sys.stdin.isatty())
@@ -1543,6 +1550,11 @@ def main():
     cfg = _load_selected_yaml('configs/selected.yaml')
     winning = cfg['winning_config']
     print(f"[PH4] Winning config: {winning}")
+    models_to_run = MODEL_TAGS if args.model == 'all' else args.model.split(',')
+    bad_model = [m for m in models_to_run if m not in MODEL_TAGS]
+    if bad_model:
+        raise SystemExit(f"Unknown model(s): {bad_model}. Valid: {MODEL_TAGS}")
+    print(f"[PH4] Models: {models_to_run}")
 
     if get_active_dataset_id() != 'gsm8k':
         _print_transfer_artifact_banner(winning)
@@ -1550,11 +1562,12 @@ def main():
     D_test = load_test_set()
     print(f"[PH4] Loaded D_test: {len(D_test)} examples")
 
-    all_results = run_final_evaluation(D_test, cfg, device)
+    all_results = run_final_evaluation(D_test, cfg, device, model_tags=models_to_run)
     provenance = {
         'eval_dataset': get_active_dataset_id(),
         'steering_artifact_policy': 'frozen_from_gsm8k_pipeline',
         'winning_config': winning,
+        'models': models_to_run,
         'vectors_base': 'vectors',
         'checkpoints_base': 'checkpoints',
     }
