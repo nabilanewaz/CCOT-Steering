@@ -28,6 +28,7 @@ def _boundary_state(h: torch.Tensor, boundary_idx: int):
 
 def _write_boundary_state(h: torch.Tensor, boundary_idx: int, h_new: torch.Tensor):
     h_out = h.clone()
+    h_new = h_new.to(dtype=h_out.dtype, device=h_out.device)
     if h.dim() == 3:
         h_out[:, boundary_idx, :] = h_new
     elif h.dim() == 2:
@@ -37,15 +38,16 @@ def _write_boundary_state(h: torch.Tensor, boundary_idx: int, h_new: torch.Tenso
 def make_dom_hook(boundary_idx: int, v_truth: torch.Tensor,
                   alpha: float, device: str):
     """h' = h + alpha * sigma_h * v_hat  (DoM direction, spec §3.5)"""
-    v = (v_truth / (v_truth.norm() + 1e-8)).to(device)
+    v = (v_truth / (v_truth.norm() + 1e-8)).to(device).float()
 
     def hook(module, input, output):
         h = _first_hidden(output)
         h_t = _boundary_state(h, boundary_idx)
         if h_t is None:
             return output
-        sigma = h_t.norm(dim=-1, keepdim=True) / (h_t.shape[-1] ** 0.5)
-        h_out = _write_boundary_state(h, boundary_idx, h_t + alpha * sigma * v)
+        h_float = h_t.float()
+        sigma = h_float.norm(dim=-1, keepdim=True) / (h_float.shape[-1] ** 0.5)
+        h_out = _write_boundary_state(h, boundary_idx, h_float + alpha * sigma * v)
         return _replace_first_hidden(output, h_out)
 
     return hook
@@ -54,20 +56,21 @@ def make_dom_hook(boundary_idx: int, v_truth: torch.Tensor,
 def make_cpca_hook(boundary_idx: int, U_truth: torch.Tensor,
                    alpha: float, device: str):
     """h' = h + alpha * sigma_h * U U^T h_hat  (cPCA subspace, spec §3.5)"""
-    U = U_truth.to(device)
+    U = U_truth.to(device).float()
 
     def hook(module, input, output):
         h = _first_hidden(output)
         h_t = _boundary_state(h, boundary_idx)
         if h_t is None:
             return output
-        sigma = h_t.norm(dim=-1, keepdim=True) / (h_t.shape[-1] ** 0.5)
-        h_hat = h_t / (h_t.norm(dim=-1, keepdim=True) + 1e-8)
+        h_float = h_t.float()
+        sigma = h_float.norm(dim=-1, keepdim=True) / (h_float.shape[-1] ** 0.5)
+        h_hat = h_float / (h_float.norm(dim=-1, keepdim=True) + 1e-8)
         if h_hat.dim() == 1:
             proj = U @ (U.T @ h_hat)
         else:
             proj = (U @ (U.T @ h_hat.T)).T
-        h_out = _write_boundary_state(h, boundary_idx, h_t + alpha * sigma * proj)
+        h_out = _write_boundary_state(h, boundary_idx, h_float + alpha * sigma * proj)
         return _replace_first_hidden(output, h_out)
 
     return hook
@@ -83,10 +86,11 @@ def make_noise_hook(boundary_idx: int, alpha: float, device: str):
         h_t = _boundary_state(h, boundary_idx)
         if h_t is None:
             return output
-        sigma = h_t.norm(dim=-1, keepdim=True) / (h_t.shape[-1] ** 0.5)
-        noise = torch.randn(h_t.shape, device=device)
+        h_float = h_t.float()
+        sigma = h_float.norm(dim=-1, keepdim=True) / (h_float.shape[-1] ** 0.5)
+        noise = torch.randn(h_float.shape, device=device, dtype=h_float.dtype)
         noise = noise / (noise.norm(dim=-1, keepdim=True) + 1e-8)
-        h_out = _write_boundary_state(h, boundary_idx, h_t + alpha * sigma * noise)
+        h_out = _write_boundary_state(h, boundary_idx, h_float + alpha * sigma * noise)
         return _replace_first_hidden(output, h_out)
 
     return hook

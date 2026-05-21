@@ -408,7 +408,7 @@ def make_subspace_hook(boundary_idx: int, U_truth: torch.Tensor,
     Returns a hook that applies subspace-based steering at inference time:
         h' = h + alpha * sigma_h * U U^T h_hat
     """
-    U = U_truth.to(device)
+    U = U_truth.to(device).float()
 
     def hook(module, input, output):
         h = output[0] if isinstance(output, tuple) else output
@@ -423,16 +423,18 @@ def make_subspace_hook(boundary_idx: int, U_truth: torch.Tensor,
             h_t = h[boundary_idx, :]
         else:
             return output
-        sigma = h_t.norm(dim=-1, keepdim=True) / (h_t.shape[-1] ** 0.5)
-        h_hat = h_t / (h_t.norm(dim=-1, keepdim=True) + 1e-8)
+        h_float = h_t.float()
+        sigma = h_float.norm(dim=-1, keepdim=True) / (h_float.shape[-1] ** 0.5)
+        h_hat = h_float / (h_float.norm(dim=-1, keepdim=True) + 1e-8)
         if h_hat.dim() == 1:
             proj = U @ (U.T @ h_hat)
         else:
             proj = (U @ (U.T @ h_hat.T)).T
+        h_new = (h_float + alpha * sigma * proj).to(dtype=h_out.dtype, device=h_out.device)
         if h.dim() == 3:
-            h_out[:, boundary_idx, :] = h_t + alpha * sigma * proj
+            h_out[:, boundary_idx, :] = h_new
         else:
-            h_out[boundary_idx, :] = h_t + alpha * sigma * proj
+            h_out[boundary_idx, :] = h_new
         return (h_out,) + output[1:] if isinstance(output, tuple) else h_out
 
     return hook
