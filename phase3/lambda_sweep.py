@@ -36,10 +36,17 @@ def sweep_lambda_grid(
     Returns {'lambda_a': ..., 'lambda_m': ...} for the selected combination.
     """
     rows = []
+    total_combos = len(LAMBDA_A_GRID) * len(LAMBDA_M_GRID)
+    combo_idx = 0
 
     for la in LAMBDA_A_GRID:
         for lm in LAMBDA_M_GRID:
-            print(f"\n[λ-sweep] λ_a={la}  λ_m={lm}")
+            combo_idx += 1
+            print(
+                f"\n[λ-sweep] combo {combo_idx}/{total_combos} "
+                f"λ_a={la}  λ_m={lm}",
+                flush=True,
+            )
             _, history = tune_alpha(
                 model, tokenizer, D_sub, v_truth, layer_star, device,
                 model_tag=model_tag, latent_tokens=latent_tokens,
@@ -64,7 +71,8 @@ def sweep_lambda_grid(
 
             flag = ' !! COLLAPSE' if collapse else ''
             print(f"  es={es_loss:.4f}  L_ans={L_ans_val:.4f}  "
-                  f"λ_a·L_align={la_L_align:.4f}  λ_m·L_mag={lm_L_mag:.4f}{flag}")
+                  f"λ_a·L_align={la_L_align:.4f}  λ_m·L_mag={lm_L_mag:.4f}{flag}",
+                  flush=True)
 
             rows.append({
                 'lambda_a':          la,
@@ -79,7 +87,7 @@ def sweep_lambda_grid(
     # Select best non-collapsed combination
     valid = [r for r in rows if not r['norm_collapse']]
     if not valid:
-        print("[λ-sweep] All combinations flag as collapsed — falling back to (0.1, 0.01)")
+        print("[λ-sweep] All combinations flag as collapsed — falling back to (0.1, 0.01)", flush=True)
         best_la, best_lm = 0.1, 0.01
     else:
         best_row = min(valid, key=lambda r: r['es_loss'])
@@ -87,7 +95,7 @@ def sweep_lambda_grid(
         best_lm  = best_row['lambda_m']
 
     # Summary table
-    print(f"\n[λ-sweep] Grid summary  ({model_tag})")
+    print(f"\n[λ-sweep] Grid summary  ({model_tag})", flush=True)
     print(f"  {'λ_a':>6}  {'λ_m':>6}  {'es_loss':>9}  {'L_ans':>8}  "
           f"{'collapse':>8}")
     print(f"  {'─' * 50}")
@@ -96,7 +104,7 @@ def sweep_lambda_grid(
         cflag = '     YES' if r['norm_collapse'] else '      no'
         print(f"  {r['lambda_a']:>6.3f}  {r['lambda_m']:>6.3f}  "
               f"{r['es_loss']:>9.4f}  {r['L_ans']:>8.4f}  {cflag}{star}")
-    print(f"\n  Selected: λ_a={best_la}  λ_m={best_lm}")
+    print(f"\n  Selected: λ_a={best_la}  λ_m={best_lm}", flush=True)
 
     selected = {'lambda_a': best_la, 'lambda_m': best_lm}
     payload  = {
@@ -107,6 +115,6 @@ def sweep_lambda_grid(
     os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
     with open(out_path, 'w') as f:
         json.dump(payload, f, indent=2)
-    print(f"  -> {out_path}")
+    print(f"  -> {out_path}", flush=True)
 
     return selected

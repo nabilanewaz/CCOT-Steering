@@ -181,10 +181,18 @@ def tune_alpha(
     best_theta   = alpha_module.theta.detach().clone()
     patience     = es_patience
     history      = []
+    train_log_every = max(1, len(D_tune) // 10)
+    es_log_every = max(1, len(D_es) // 5) if D_es else 1
+    print(
+        f"  [α-tune] start: train={len(D_tune)} es={len(D_es)} "
+        f"epochs={max_epochs} λ_a={lambda_a} λ_m={lambda_m}",
+        flush=True,
+    )
 
     for epoch in range(max_epochs):
+        print(f"  [α-tune] epoch {epoch + 1}/{max_epochs} train begin", flush=True)
         ep_loss, ep_la, ep_lal, ep_lm = [], [], [], []
-        for item in D_tune:
+        for item_idx, item in enumerate(D_tune, start=1):
             optimizer.zero_grad()
             loss, la, lal, lm = _compute_losses(item, grad=True)
             loss.backward()
@@ -193,12 +201,26 @@ def tune_alpha(
             ep_la.append(la)
             ep_lal.append(lal)
             ep_lm.append(lm)
+            if item_idx == 1 or item_idx % train_log_every == 0 or item_idx == len(D_tune):
+                print(
+                    f"    [α-tune] epoch {epoch + 1}/{max_epochs} "
+                    f"train {item_idx}/{len(D_tune)} "
+                    f"loss={_mean(ep_loss):.4f} α={alpha_module.value:.4f}",
+                    flush=True,
+                )
 
         if D_es:
-            es_loss = _mean([
-                _compute_losses(item, grad=False)[0].item()
-                for item in D_es
-            ])
+            es_vals = []
+            print(f"  [α-tune] epoch {epoch + 1}/{max_epochs} ES begin", flush=True)
+            for item_idx, item in enumerate(D_es, start=1):
+                es_vals.append(_compute_losses(item, grad=False)[0].item())
+                if item_idx == 1 or item_idx % es_log_every == 0 or item_idx == len(D_es):
+                    print(
+                        f"    [α-tune] epoch {epoch + 1}/{max_epochs} "
+                        f"ES {item_idx}/{len(D_es)} loss={_mean(es_vals):.4f}",
+                        flush=True,
+                    )
+            es_loss = _mean(es_vals)
         else:
             es_loss = _mean(ep_loss)
 
@@ -215,7 +237,8 @@ def tune_alpha(
         print(f"  [α-tune] epoch {epoch + 1}/{max_epochs}  "
               f"train={_mean(ep_loss):.4f}  es={es_loss:.4f}  "
               f"L_ans={_mean(ep_la):.4f}  L_align={_mean(ep_lal):.4f}  "
-              f"L_mag={_mean(ep_lm):.4f}  α={alpha_module.value:.4f}")
+              f"L_mag={_mean(ep_lm):.4f}  α={alpha_module.value:.4f}",
+              flush=True)
 
         if es_loss < best_es_loss:
             best_es_loss = es_loss
@@ -224,11 +247,11 @@ def tune_alpha(
         else:
             patience -= 1
             if patience == 0:
-                print(f"  Early stopping at epoch {epoch + 1}")
+                print(f"  Early stopping at epoch {epoch + 1}", flush=True)
                 break
 
     handle.remove()
     alpha_module.theta.data = best_theta
     alpha_star = alpha_module().detach()
-    print(f"  Learned α* = {alpha_star.item():.4f}")
+    print(f"  Learned α* = {alpha_star.item():.4f}", flush=True)
     return alpha_star, history
