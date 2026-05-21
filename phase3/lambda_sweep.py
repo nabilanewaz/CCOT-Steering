@@ -27,6 +27,9 @@ def sweep_lambda_grid(
     latent_tokens: int = 4,
     out_path: str = 'lambda_sweep.json',
     max_epochs: int = 2,
+    prompt_fn=None,
+    boundary_fn=None,
+    prompt_mode: str = 'ccot',
 ) -> dict:
     """
     Run tune_alpha for all 16 (λ_a, λ_m) combinations on D_sub (≤200 examples).
@@ -53,6 +56,8 @@ def sweep_lambda_grid(
                 lambda_a=la, lambda_m=lm,
                 max_epochs=max_epochs,
                 es_patience=2,
+                prompt_fn=prompt_fn,
+                boundary_fn=boundary_fn,
             )
 
             if history:
@@ -109,6 +114,7 @@ def sweep_lambda_grid(
     selected = {'lambda_a': best_la, 'lambda_m': best_lm}
     payload  = {
         'model_tag': model_tag,
+        'prompt_mode': prompt_mode,
         'selected':  selected,
         'grid':      rows,
     }

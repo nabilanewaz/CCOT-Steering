@@ -25,6 +25,7 @@ from utils.dataset_paths import get_active_dataset_id, init_project_dataset
 from phase1.inference import (
     extract_answer,
     extract_reasoning_span,
+    cot_prompt,
     latent_prompt,
     load_base_frozen,
     load_finetuned,
@@ -44,6 +45,7 @@ from phase3.hooks import (
     make_dom_hook,
     make_noise_hook,
 )
+from phase3.hook_utils import last_token_state
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -62,12 +64,7 @@ MODEL_ID_MAP = {
 
 
 def _last_hidden_state(output) -> torch.Tensor | None:
-    h = output[0] if isinstance(output, tuple) else output
-    if h.dim() == 3:
-        return h[:, -1, :]
-    if h.dim() == 2:
-        return h[-1:, :]
-    return None
+    return last_token_state(output)
 
 
 # ── Data classes ───────────────────────────────────────────────────────────────
@@ -560,8 +557,11 @@ def _build_summary(all_results: dict, n_test: int) -> dict:
             'condition_cis': {
                 _display_condition_name(k): {
                     'accuracy':   v.point,
+                    'point':      v.point,
                     'ci_lower':   v.lower,
                     'ci_upper':   v.upper,
+                    'lower':      v.lower,
+                    'upper':      v.upper,
                     'half_width': v.half_width,
                 }
                 for k, v in data.get('condition_cis', {}).items()
@@ -569,8 +569,11 @@ def _build_summary(all_results: dict, n_test: int) -> dict:
             'paired_cis': {
                 k: {
                     'delta':       v.point,
+                    'point':       v.point,
                     'ci_lower':    v.lower,
                     'ci_upper':    v.upper,
+                    'lower':       v.lower,
+                    'upper':       v.upper,
                     'significant': v.significant,
                 }
                 for k, v in data.get('paired_cis', {}).items()
@@ -591,10 +594,7 @@ def precompute_full_cot_tokens(
     counts = []
     cot_model.eval()
     for item in D_test:
-        enc = tokenizer(
-            f"Question: {item['question']}\n\nReasoning:",
-            return_tensors='pt',
-        ).to(device)
+        enc = tokenizer(cot_prompt(item['question']), return_tensors='pt').to(device)
         with torch.no_grad():
             out = cot_model.generate(
                 **enc, do_sample=False, max_new_tokens=512,
@@ -603,7 +603,7 @@ def precompute_full_cot_tokens(
         generated = tokenizer.decode(
             out[0][enc['input_ids'].shape[1]:], skip_special_tokens=True
         )
-        reasoning = generated.split('\n\nAnswer:')[0].strip()
+        reasoning = extract_reasoning_span(generated)
         counts.append(len(tokenizer.encode(reasoning, add_special_tokens=False)))
     return counts
 
@@ -741,7 +741,8 @@ def build_token_budget_log(
 ) -> dict:
     full_mean = float(np.mean(full_cot_counts)) if full_cot_counts else 0.0
     coconut_mean = float(np.mean(coconut_counts)) if coconut_counts else 0.0
-    ratio = coconut_mean / max(full_mean, 1e-8)
+    token_budget_valid = full_mean > 0.0
+    ratio = coconut_mean / full_mean if token_budget_valid else None
     trimmed_counts = [e.reasoning_tokens for e in trimmed_examples]
     trimmed_mean = float(np.mean(trimmed_counts)) if trimmed_counts else 0.0
     per_example = []
@@ -755,7 +756,7 @@ def build_token_budget_log(
             "trimmed_cot_budget_tokens": int(coco_n),
             "trimmed_cot_actual_reasoning_tokens": int(trim_ex.reasoning_tokens),
             "trimmed_cot_correct": bool(trim_ex.correct),
-            "per_example_ratio": float(coco_n / max(full_n, 1)),
+            "per_example_ratio": float(coco_n / full_n) if full_n > 0 else None,
         })
     return {
         "model_tag": model_tag,
@@ -765,6 +766,7 @@ def build_token_budget_log(
         "x_coconut_tokens_mean": coconut_mean,
         "y_full_cot_tokens_mean": full_mean,
         "x_over_y_ratio": ratio,
+        "token_budget_valid": token_budget_valid,
         "trimmed_cot_actual_tokens_mean": trimmed_mean,
         "n_examples": len(per_example),
         "per_example": per_example,
@@ -1067,9 +1069,17 @@ def save_final_results(
     for model_tag, data in all_results.items():
         out_path = os.path.join(out_dir, f"{model_tag}_test.json")
         def _ser_br(br) -> dict:
-            return {'point': br.point, 'lower': br.lower,
-                    'upper': br.upper, 'significant': br.significant,
-                    'half_width': br.half_width}
+            return {
+                'point': br.point,
+                'lower': br.lower,
+                'upper': br.upper,
+                'delta': br.point,
+                'ci_lower': br.lower,
+                'ci_upper': br.upper,
+                'accuracy': br.point,
+                'significant': br.significant,
+                'half_width': br.half_width,
+            }
 
         serializable = {
             'model_tag':      model_tag,
@@ -1151,13 +1161,15 @@ def run_final_evaluation(
         meta       = _load_meta_file(vectors_dir)
         latent_tokens = int(best_cfg.get('latent_tokens') or meta.get('best_ccot_latent_tokens') or 4)
         condition_tag = f"L{latent_tokens}"
+        vector_method = best_cfg.get('vector_method')
+        steering_locked = vector_method in ('dom', 'cpca') and best_cfg.get('vector_source')
         source     = str(best_cfg.get('vector_source') or 'ccot')
-        alpha_star = float(best_cfg.get('alpha_star') or 1.0)
+        alpha_star = float(best_cfg.get('alpha_star') or 0.0) if steering_locked else 0.0
         r_final    = int(meta.get('ccot_r_final', 10))
 
         print(
             f"Locked: L={latent_tokens} latent tokens  src={source}  "
-            f"method={best_cfg.get('vector_method')}  α*={alpha_star:.4f}"
+            f"method={vector_method}  α*={alpha_star:.4f}"
         )
 
         all_preds:   dict = {}
@@ -1238,90 +1250,106 @@ def run_final_evaluation(
             ccot_model.eval()
             ccot_prompt_fn = lambda item, n=latent_tokens: latent_prompt(item['question'], n)
 
-            # Load best-source vectors
+            # Load locked-source vector if available. CCoT baseline can still run
+            # without a vector; steering-only conditions require a valid locked vector.
             try:
                 v_truth = _load_dom(vectors_dir, source).to(device)
+                vector_available = True
             except FileNotFoundError:
                 print(f"  [SKIP] DoM vector missing for source={source}")
-                goto_flip = True
-            else:
-                goto_flip = False
+                v_truth = None
+                vector_available = False
 
-            if not goto_flip:
+            try:
+                L_star = get_injection_layer(vectors_dir, source)
+            except FileNotFoundError:
+                L_star = meta.get(f'{source}_best_layer', meta.get('ccot_best_layer', 14))
+
+            if steering_locked and vector_available:
                 try:
                     U_cpca   = _load_cpca(vectors_dir, source, r_final).to(device)
                     has_cpca = True
                 except FileNotFoundError:
                     U_cpca   = None
                     has_cpca = False
+            else:
+                U_cpca = None
+                has_cpca = False
 
-                try:
-                    L_star = get_injection_layer(vectors_dir, source)
-                except FileNotFoundError:
-                    L_star = meta.get(f'{source}_best_layer', meta.get('ccot_best_layer', 14))
-
-                # Helper: probe-generate boundary, create hook, run + collect
-                def _make_steered_examples(hook_factory, boundary_fn, cond_name):
-                    t_inner = time.time()
-                    exs = []
-                    for item in D_test:
-                        prompt = ccot_prompt_fn(item)
-                        enc = tok_ccot(prompt, return_tensors='pt').to(device)
-                        with torch.no_grad():
-                            probe_ids = ccot_model.generate(
-                                **enc, do_sample=False, max_new_tokens=128,
-                                pad_token_id=tok_ccot.eos_token_id,
-                            )
-                        try:
-                            b_idx = boundary_fn(probe_ids, tok_ccot)
-                        except Exception:
-                            b_idx = max(0, enc['input_ids'].shape[1] - 1)
-                        hook_fn = hook_factory(b_idx)
-                        ex = run_steered_with_metrics(
-                            ccot_model, tok_ccot, prompt, item, hook_fn,
-                            L_star, v_truth, device, max_new_tokens,
-                        )
-                        exs.append(ex)
-                    m = collect_condition_metrics(
-                        exs, full_cot_counts, cond_name, model_tag, time.time() - t_inner
-                    )
-                    return exs, m
-
-                # Condition: CCoT baseline (no hook, but metrics captured)
-                ccot_cond = f'ccot_{condition_tag}'
-                print(f"[PH4] {ccot_cond}")
-                t0 = time.time()
-                examples = []
+            # Helper: probe-generate boundary, create hook, run + collect
+            def _make_steered_examples(hook_factory, boundary_fn, cond_name):
+                t_inner = time.time()
+                exs = []
                 for item in D_test:
                     prompt = ccot_prompt_fn(item)
+                    enc = tok_ccot(prompt, return_tensors='pt').to(device)
+                    with torch.no_grad():
+                        probe_ids = ccot_model.generate(
+                            **enc, do_sample=False, max_new_tokens=128,
+                            pad_token_id=tok_ccot.eos_token_id,
+                        )
+                    try:
+                        b_idx = boundary_fn(probe_ids, tok_ccot)
+                    except Exception:
+                        b_idx = max(0, enc['input_ids'].shape[1] - 1)
+                    hook_fn = hook_factory(b_idx)
                     ex = run_steered_with_metrics(
-                        ccot_model, tok_ccot, prompt, item, None,
+                        ccot_model, tok_ccot, prompt, item, hook_fn,
                         L_star, v_truth, device, max_new_tokens,
                     )
-                    examples.append(ex)
-                all_metrics[ccot_cond] = collect_condition_metrics(
-                    examples, full_cot_counts, ccot_cond, model_tag, time.time() - t0
+                    exs.append(ex)
+                m = collect_condition_metrics(
+                    exs, full_cot_counts, cond_name, model_tag, time.time() - t_inner
                 )
-                all_preds[ccot_cond] = [e.correct for e in examples]
-                print(f"  acc={all_metrics[ccot_cond].accuracy:.3f}")
-                coconut_budget_counts = coconut_thinking_token_counts(examples, latent_tokens)
-                full_mean = float(np.mean(full_cot_counts)) if full_cot_counts else 0.0
-                coconut_mean = float(np.mean(coconut_budget_counts)) if coconut_budget_counts else 0.0
-                token_budgeting = {
-                    "policy": "trim_full_cot_to_best_coconut_token_count",
-                    "condition_tag": condition_tag,
-                    "latent_tokens": latent_tokens,
-                    "x_coconut_tokens_mean": coconut_mean,
-                    "y_full_cot_tokens_mean": full_mean,
-                    "x_over_y_ratio": coconut_mean / max(full_mean, 1e-8),
-                    "trimmed_condition": f"trimmed_{condition_tag}",
-                }
-                print(
-                    "  matched trimmed-CoT budget: "
-                    f"x_coconut={coconut_mean:.2f} y_full_cot={full_mean:.2f} "
-                    f"ratio={token_budgeting['x_over_y_ratio']:.4f}"
-                )
+                return exs, m
 
+            # Condition: CCoT baseline (no hook, but metrics captured)
+            ccot_cond = f'ccot_{condition_tag}'
+            print(f"[PH4] {ccot_cond}")
+            t0 = time.time()
+            examples = []
+            for item in D_test:
+                prompt = ccot_prompt_fn(item)
+                ex = run_steered_with_metrics(
+                    ccot_model, tok_ccot, prompt, item, None,
+                    L_star, v_truth, device, max_new_tokens,
+                )
+                examples.append(ex)
+            all_metrics[ccot_cond] = collect_condition_metrics(
+                examples, full_cot_counts, ccot_cond, model_tag, time.time() - t0
+            )
+            all_preds[ccot_cond] = [e.correct for e in examples]
+            print(f"  acc={all_metrics[ccot_cond].accuracy:.3f}")
+            coconut_budget_counts = coconut_thinking_token_counts(examples, latent_tokens)
+            full_mean = float(np.mean(full_cot_counts)) if full_cot_counts else 0.0
+            coconut_mean = float(np.mean(coconut_budget_counts)) if coconut_budget_counts else 0.0
+            token_budget_valid = full_mean > 0.0
+            token_budgeting = {
+                "policy": "trim_full_cot_to_best_coconut_token_count",
+                "condition_tag": condition_tag,
+                "latent_tokens": latent_tokens,
+                "x_coconut_tokens_mean": coconut_mean,
+                "y_full_cot_tokens_mean": full_mean,
+                "x_over_y_ratio": coconut_mean / full_mean if token_budget_valid else None,
+                "token_budget_valid": token_budget_valid,
+                "trimmed_condition": f"trimmed_{condition_tag}",
+            }
+            ratio_text = (
+                f"{token_budgeting['x_over_y_ratio']:.4f}"
+                if token_budgeting['x_over_y_ratio'] is not None else "invalid"
+            )
+            print(
+                "  matched trimmed-CoT budget: "
+                f"x_coconut={coconut_mean:.2f} y_full_cot={full_mean:.2f} "
+                f"ratio={ratio_text}"
+            )
+            if not token_budget_valid:
+                print("  [PH4] token budget invalid: full CoT reasoning tokens are zero")
+                coconut_budget_counts = []
+
+            if not (steering_locked and vector_available):
+                print("[PH4] locked config has no valid steering vector; skipping steered conditions")
+            else:
                 # Condition: Noise control
                 noise_cond = f'noise_{condition_tag}_{source}'
                 print(f"[PH4] {noise_cond}")

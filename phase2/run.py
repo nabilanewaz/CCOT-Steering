@@ -33,6 +33,7 @@ from phase2.cpca import (
     save_shuffled_subspace,
 )
 from phase2.compare import compare_methods, select_best_source_method
+from phase1.inference import cot_prompt, latent_prompt
 
 _CPCA_FN_MAP = {
     'full':       cpca_full,
@@ -90,6 +91,7 @@ def run_phase2_source(
     device: str,
     vectors_dir: str,
     prompt_fn=None,
+    prompt_mode: str = 'unknown',
     N: int = 20,
     beta: float = 0.5,
     r_per_layer: int = 3,
@@ -130,13 +132,29 @@ def run_phase2_source(
     t = _step(1, "collect hidden states")
     os.makedirs(vectors_dir, exist_ok=True)
     hstates_cache = os.path.join(vectors_dir, f"{source_tag}_hstates_cache.pt")
+    cache_meta_expected = {
+        "phase2_prompt_version": 2,
+        "prompt_mode": prompt_mode,
+        "answer_label_source": "generated_text_only",
+    }
+    cache = None
     if os.path.exists(hstates_cache):
-        print(f"  Loading cached hidden states from {hstates_cache}")
-        cache = torch.load(hstates_cache, map_location="cpu")
+        loaded = torch.load(hstates_cache, map_location="cpu")
+        cache_meta = dict(loaded.get("cache_meta") or {})
+        if all(cache_meta.get(k) == v for k, v in cache_meta_expected.items()):
+            cache = loaded
+            print(f"  Loading cached hidden states from {hstates_cache}")
+        else:
+            print(
+                f"  Ignoring stale hidden-state cache: {hstates_cache} "
+                f"meta={cache_meta or 'missing'}"
+            )
+    if cache is not None:
         H_pos, H_neg = cache["H_pos"], cache["H_neg"]
         collection_diag = dict(cache.get("collection_diag") or {})
         collection_diag["cached"] = True
         collection_diag["cache_path"] = hstates_cache
+        collection_diag["cache_meta"] = dict(cache.get("cache_meta") or {})
     else:
         H_pos, H_neg, collection_diag = collect_hidden_states(
             model, tokenizer, D_steer, N, device,
@@ -147,11 +165,13 @@ def run_phase2_source(
         collection_diag = dict(collection_diag or {})
         collection_diag["cached"] = False
         collection_diag["cache_path"] = hstates_cache
+        collection_diag["cache_meta"] = cache_meta_expected
         torch.save(
             {
                 "H_pos": H_pos,
                 "H_neg": H_neg,
                 "collection_diag": collection_diag,
+                "cache_meta": cache_meta_expected,
             },
             hstates_cache,
         )
@@ -432,8 +452,7 @@ def run_phase2_all_sources(
     ccot_model, tok_a = load_ccot_frozen(base_model_id, ccot_ckpt, device)
 
     ccot_prompt_fn = (
-        lambda item, n=best_latent_tokens:
-        f"{item['question']}\n<|start-latent|>{'<|latent|>' * n}<|end-latent|>\n"
+        lambda item, n=best_latent_tokens: latent_prompt(item['question'], n)
     )
     results['ccot'] = run_phase2_source(
         ccot_model, tok_a, D_steer, model_tag,
@@ -442,6 +461,7 @@ def run_phase2_all_sources(
         device=device,
         vectors_dir=vectors_dir,
         prompt_fn=ccot_prompt_fn,
+        prompt_mode='latent_prompt',
         **cfg,
     )
     del ccot_model
@@ -461,9 +481,7 @@ def run_phase2_all_sources(
         param.requires_grad = False
     cot_model.eval()
 
-    cot_prompt_fn = (
-        lambda item: f"{item['question']}\n<|start-latent|><|latent|><|latent|><|end-latent|>\n"
-    )
+    cot_prompt_fn = lambda item: cot_prompt(item['question'])
     results['base'] = run_phase2_source(
         cot_model, tok_b, D_steer, model_tag,
         source_tag='base',
@@ -471,6 +489,7 @@ def run_phase2_all_sources(
         device=device,
         vectors_dir=vectors_dir,
         prompt_fn=cot_prompt_fn,
+        prompt_mode='cot_prompt',
         **cfg,
     )
     del cot_model
@@ -509,6 +528,9 @@ def run_phase2_all_sources(
 
     meta = {
         'model_tag':              model_tag,
+        'phase2_prompt_version':  2,
+        'ccot_prompt_mode':       'latent_prompt',
+        'base_prompt_mode':       'cot_prompt',
         'best_ccot_latent_tokens': best_latent_tokens,
         'best_ccot_condition':    f'ccot_L{best_latent_tokens}',
         # Per-source winner (dom vs cpca)
@@ -529,6 +551,8 @@ def run_phase2_all_sources(
         'base_layer_scores':      {str(L): s for L, s in base_ls.items()},
         'ccot_max_probe_score':   max(ccot_ls.values()) if ccot_ls else 0.0,
         'base_max_probe_score':   max(base_ls.values()) if base_ls else 0.0,
+        'ccot_probe_gate':        ccot_res.get('diagnostics', {}).get('probe', {}),
+        'base_probe_gate':        base_res.get('diagnostics', {}).get('probe', {}),
         'cross_source_cos':       cross_cos,
         'ccot_r_final':           cfg.get('r_final', 10),
         'phase2_models_frozen':   True,

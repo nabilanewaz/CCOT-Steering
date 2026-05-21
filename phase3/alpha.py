@@ -7,6 +7,12 @@ import torch.nn.functional as F
 
 from phase2.loaders import get_transformer_layers, find_boundary_idx_ccot
 from phase1.inference import latent_prompt
+from phase3.hook_utils import (
+    boundary_state,
+    first_hidden,
+    replace_first_hidden,
+    write_boundary_state,
+)
 
 _LAMBDA_M = {
     'phi2': 0.005,         # LayerNorm — more tolerant of large perturbations
@@ -49,6 +55,8 @@ def tune_alpha(
     max_epochs: int = 5,
     es_patience: int = 5,
     lr: float = 5e-2,
+    prompt_fn=None,
+    boundary_fn=None,
 ) -> tuple:
     """
     Gradient-descent alpha tuning on 90% of D_val_tune (10% early-stopping).
@@ -65,12 +73,16 @@ def tune_alpha(
     """
     if lambda_m is None:
         lambda_m = _LAMBDA_M.get(model_tag, _LAMBDA_M_DEFAULT)
+    if prompt_fn is None:
+        prompt_fn = lambda item: latent_prompt(item['question'], latent_tokens)
+    if boundary_fn is None:
+        boundary_fn = find_boundary_idx_ccot
 
     for p in model.parameters():
         p.requires_grad = False
     model.eval()
 
-    v = (v_truth / (v_truth.norm() + 1e-8)).to(device)
+    v = (v_truth / (v_truth.norm() + 1e-8)).to(device).float()
 
     alpha_module = LearnableAlpha(alpha_max=50.0, alpha_init=1.0).to(device)
     optimizer    = torch.optim.AdamW(alpha_module.parameters(), lr=lr)
@@ -84,63 +96,44 @@ def tune_alpha(
 
     cache: dict = {}
 
-    def _first_hidden(output):
-        return output[0] if isinstance(output, tuple) else output
-
-    def _replace_first_hidden(output, h):
-        return (h,) + output[1:] if isinstance(output, tuple) else h
-
-    def _boundary_state(h: torch.Tensor, boundary_idx: int):
-        if h.dim() == 3:
-            if boundary_idx >= h.shape[1]:
-                return None
-            return h[:, boundary_idx, :]
-        if h.dim() == 2:
-            if boundary_idx >= h.shape[0]:
-                return None
-            return h[boundary_idx, :]
-        return None
-
-    def _write_boundary_state(h: torch.Tensor, boundary_idx: int, h_new: torch.Tensor):
-        h_out = h.clone()
-        if h.dim() == 3:
-            h_out[:, boundary_idx, :] = h_new
-        elif h.dim() == 2:
-            h_out[boundary_idx, :] = h_new
-        return h_out
 
     def steer_hook(module, input, output):
-        h = _first_hidden(output)
+        h = first_hidden(output)
         b = cache.get('boundary_idx', 0)
-        h_t = _boundary_state(h, b)
+        h_t = boundary_state(h, b)
         if h_t is None:
             return output
-        sigma = h_t.detach().norm(dim=-1, keepdim=True) / (h_t.shape[-1] ** 0.5)
+        h_float = h_t.float()
+        sigma = h_float.detach().norm(dim=-1, keepdim=True) / (h_float.shape[-1] ** 0.5)
         alpha = alpha_module()
         delta = alpha * sigma * v        # grad flows through alpha_module -> delta
-        cache['h_steered'] = h_t + delta  # grad through delta -> alpha
-        cache['h_orig']    = h_t.detach() # reference norm (no grad needed)
+        cache['h_steered'] = h_float + delta  # grad through delta -> alpha
+        cache['h_orig']    = h_float.detach() # reference norm (no grad needed)
         cache['delta']     = delta        # keep grad so L_mag regularises alpha
-        h_out = _write_boundary_state(h, b, cache['h_steered'])
-        return _replace_first_hidden(output, h_out)
+        h_out = write_boundary_state(h, b, cache['h_steered'])
+        return replace_first_hidden(output, h_out)
 
-    handle = target_layer.register_forward_hook(steer_hook)
 
     def _compute_losses(item, grad: bool):
-        """Returns (total_loss_tensor, L_ans_float, L_align_float, L_mag_float)."""
-        q_prompt = latent_prompt(item['question'], latent_tokens)
+        """Returns (loss, L_ans, L_align, L_mag, boundary_fallback)."""
+        cache.clear()
+        q_prompt = prompt_fn(item)
         ans_text = item['answer'].split('####')[1].strip()
 
         q_enc = tokenizer(q_prompt, return_tensors='pt').to(device)
+        # Boundary probing must be unsteered; otherwise the alpha being tuned can
+        # change the sequence used to choose its own injection point.
         with torch.no_grad():
             gen_ids = model.generate(
                 **q_enc, do_sample=False, max_new_tokens=128,
                 pad_token_id=tokenizer.eos_token_id,
             )
+        boundary_fallback = False
         try:
-            cache['boundary_idx'] = find_boundary_idx_ccot(gen_ids, tokenizer)
+            cache['boundary_idx'] = boundary_fn(gen_ids, tokenizer)
         except Exception:
             cache['boundary_idx'] = max(0, q_enc['input_ids'].shape[1] - 1)
+            boundary_fallback = True
 
         a_ids    = tokenizer(ans_text, return_tensors='pt',
                              add_special_tokens=False).input_ids.to(device)
@@ -150,13 +143,17 @@ def tune_alpha(
 
         ctx = torch.enable_grad() if grad else torch.no_grad()
         with ctx:
-            out   = model(input_ids=full_ids, labels=labels)
+            handle = target_layer.register_forward_hook(steer_hook)
+            try:
+                out = model(input_ids=full_ids, labels=labels)
+            finally:
+                handle.remove()
             L_ans = out.loss
 
             h_s = cache.get('h_steered')
             L_align = (
                 1.0 - F.cosine_similarity(
-                    h_s, v.unsqueeze(0), dim=-1
+                    h_s.float(), v.unsqueeze(0), dim=-1
                 ).clamp(-1.0, 1.0).mean()
                 if h_s is not None
                 else torch.tensor(0.0, device=device)
@@ -165,14 +162,16 @@ def tune_alpha(
             delta  = cache.get('delta')
             h_orig = cache.get('h_orig')
             L_mag = (
-                (delta.norm(dim=-1) / (h_orig.norm(dim=-1) + 1e-8)).pow(2).mean()
+                (delta.float().norm(dim=-1) / (h_orig.float().norm(dim=-1) + 1e-8)).pow(2).mean()
                 if delta is not None and h_orig is not None
                 else torch.tensor(0.0, device=device)
             )
 
             loss = L_ans + lambda_a * L_align + lambda_m * L_mag
+            if not loss.requires_grad:
+                loss = loss + 0.0 * alpha_module()
 
-        return loss, L_ans.item(), L_align.item(), L_mag.item()
+        return loss, L_ans.item(), L_align.item(), L_mag.item(), boundary_fallback
 
     def _mean(lst):
         return sum(lst) / max(len(lst), 1)
@@ -191,16 +190,25 @@ def tune_alpha(
 
     for epoch in range(max_epochs):
         print(f"  [α-tune] epoch {epoch + 1}/{max_epochs} train begin", flush=True)
-        ep_loss, ep_la, ep_lal, ep_lm = [], [], [], []
+        ep_loss, ep_la, ep_lal, ep_lm, ep_grad = [], [], [], [], []
+        ep_boundary_total = 0
+        ep_boundary_fallback = 0
         for item_idx, item in enumerate(D_tune, start=1):
             optimizer.zero_grad()
-            loss, la, lal, lm = _compute_losses(item, grad=True)
+            loss, la, lal, lm, bf = _compute_losses(item, grad=True)
             loss.backward()
+            grad_norm = (
+                float(alpha_module.theta.grad.detach().abs().item())
+                if alpha_module.theta.grad is not None else 0.0
+            )
             optimizer.step()
             ep_loss.append(loss.item())
             ep_la.append(la)
             ep_lal.append(lal)
             ep_lm.append(lm)
+            ep_grad.append(grad_norm)
+            ep_boundary_total += 1
+            ep_boundary_fallback += int(bf)
             if item_idx == 1 or item_idx % train_log_every == 0 or item_idx == len(D_tune):
                 print(
                     f"    [α-tune] epoch {epoch + 1}/{max_epochs} "
@@ -232,6 +240,11 @@ def tune_alpha(
             'total_train': _mean(ep_loss),
             'es_loss':     es_loss,
             'alpha':       alpha_module.value,
+            'grad_norm_theta': _mean(ep_grad),
+            'boundary_fallback_rate': (
+                ep_boundary_fallback / max(ep_boundary_total, 1)
+            ),
+            'mean_delta_norm_ratio': _mean([x ** 0.5 for x in ep_lm]),
         })
 
         print(f"  [α-tune] epoch {epoch + 1}/{max_epochs}  "
@@ -250,7 +263,6 @@ def tune_alpha(
                 print(f"  Early stopping at epoch {epoch + 1}", flush=True)
                 break
 
-    handle.remove()
     alpha_module.theta.data = best_theta
     alpha_star = alpha_module().detach()
     print(f"  Learned α* = {alpha_star.item():.4f}", flush=True)

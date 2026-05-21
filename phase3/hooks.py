@@ -2,38 +2,15 @@
 import torch
 
 from phase2.loaders import get_transformer_layers
+from phase3.hook_utils import (
+    boundary_state,
+    first_hidden,
+    replace_first_hidden,
+    write_boundary_state,
+)
 
 
 # ── Hook factories ─────────────────────────────────────────────────────────────
-
-def _first_hidden(output):
-    return output[0] if isinstance(output, tuple) else output
-
-
-def _replace_first_hidden(output, h):
-    return (h,) + output[1:] if isinstance(output, tuple) else h
-
-
-def _boundary_state(h: torch.Tensor, boundary_idx: int):
-    if h.dim() == 3:
-        if boundary_idx >= h.shape[1]:
-            return None
-        return h[:, boundary_idx, :]
-    if h.dim() == 2:
-        if boundary_idx >= h.shape[0]:
-            return None
-        return h[boundary_idx, :]
-    return None
-
-
-def _write_boundary_state(h: torch.Tensor, boundary_idx: int, h_new: torch.Tensor):
-    h_out = h.clone()
-    h_new = h_new.to(dtype=h_out.dtype, device=h_out.device)
-    if h.dim() == 3:
-        h_out[:, boundary_idx, :] = h_new
-    elif h.dim() == 2:
-        h_out[boundary_idx, :] = h_new
-    return h_out
 
 def make_dom_hook(boundary_idx: int, v_truth: torch.Tensor,
                   alpha: float, device: str):
@@ -41,14 +18,14 @@ def make_dom_hook(boundary_idx: int, v_truth: torch.Tensor,
     v = (v_truth / (v_truth.norm() + 1e-8)).to(device).float()
 
     def hook(module, input, output):
-        h = _first_hidden(output)
-        h_t = _boundary_state(h, boundary_idx)
+        h = first_hidden(output)
+        h_t = boundary_state(h, boundary_idx)
         if h_t is None:
             return output
         h_float = h_t.float()
         sigma = h_float.norm(dim=-1, keepdim=True) / (h_float.shape[-1] ** 0.5)
-        h_out = _write_boundary_state(h, boundary_idx, h_float + alpha * sigma * v)
-        return _replace_first_hidden(output, h_out)
+        h_out = write_boundary_state(h, boundary_idx, h_float + alpha * sigma * v)
+        return replace_first_hidden(output, h_out)
 
     return hook
 
@@ -59,8 +36,8 @@ def make_cpca_hook(boundary_idx: int, U_truth: torch.Tensor,
     U = U_truth.to(device).float()
 
     def hook(module, input, output):
-        h = _first_hidden(output)
-        h_t = _boundary_state(h, boundary_idx)
+        h = first_hidden(output)
+        h_t = boundary_state(h, boundary_idx)
         if h_t is None:
             return output
         h_float = h_t.float()
@@ -70,8 +47,8 @@ def make_cpca_hook(boundary_idx: int, U_truth: torch.Tensor,
             proj = U @ (U.T @ h_hat)
         else:
             proj = (U @ (U.T @ h_hat.T)).T
-        h_out = _write_boundary_state(h, boundary_idx, h_float + alpha * sigma * proj)
-        return _replace_first_hidden(output, h_out)
+        h_out = write_boundary_state(h, boundary_idx, h_float + alpha * sigma * proj)
+        return replace_first_hidden(output, h_out)
 
     return hook
 
@@ -82,16 +59,16 @@ def make_noise_hook(boundary_idx: int, alpha: float, device: str):
     the condition tests whether ANY perturbation helps, not a specific direction."""
 
     def hook(module, input, output):
-        h = _first_hidden(output)
-        h_t = _boundary_state(h, boundary_idx)
+        h = first_hidden(output)
+        h_t = boundary_state(h, boundary_idx)
         if h_t is None:
             return output
         h_float = h_t.float()
         sigma = h_float.norm(dim=-1, keepdim=True) / (h_float.shape[-1] ** 0.5)
         noise = torch.randn(h_float.shape, device=device, dtype=h_float.dtype)
         noise = noise / (noise.norm(dim=-1, keepdim=True) + 1e-8)
-        h_out = _write_boundary_state(h, boundary_idx, h_float + alpha * sigma * noise)
-        return _replace_first_hidden(output, h_out)
+        h_out = write_boundary_state(h, boundary_idx, h_float + alpha * sigma * noise)
+        return replace_first_hidden(output, h_out)
 
     return hook
 

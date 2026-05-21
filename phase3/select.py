@@ -3,6 +3,7 @@ import json
 import os
 import re
 from math import sqrt
+from pathlib import Path
 
 
 def _wilson_lower(accuracy: float, n: int, z: float = 1.96) -> float:
@@ -13,6 +14,40 @@ def _wilson_lower(accuracy: float, n: int, z: float = 1.96) -> float:
     margin = (z * sqrt(max(p * (1 - p) / n + z ** 2 / (4 * n ** 2), 0.0))) / (1 + z ** 2 / n)
     return centre - margin
 
+
+
+
+def _load_phase2_meta(results_dir: str) -> dict:
+    candidates = [Path(results_dir) / 'phase2_meta.json']
+    parts = Path(results_dir).parts
+    if 'results' in parts:
+        idx = parts.index('results')
+        candidates.append(Path(*parts[:idx], 'vectors', *parts[idx + 1:], 'phase2_meta.json'))
+    for path in candidates:
+        if path.exists():
+            with open(path) as f:
+                return json.load(f)
+    return {}
+
+
+def _source_gate_passed(meta: dict, source: str, default_gate: float = 0.55) -> bool:
+    gate_info = meta.get(f'{source}_probe_gate') or {}
+    if 'gate_passed' in gate_info:
+        return bool(gate_info.get('gate_passed'))
+    score = meta.get(f'{source}_max_probe_score')
+    threshold = gate_info.get('gate_threshold', default_gate)
+    return bool(score is not None and float(score) > float(threshold))
+
+
+def _write_selection_yaml(selection: dict, out_path: str) -> None:
+    try:
+        import yaml
+        with open(out_path, 'w') as f:
+            yaml.dump(selection, f, default_flow_style=False)
+    except ImportError:
+        with open(out_path, 'w') as f:
+            for k, v in selection.items():
+                f.write(f"{k}: {v}\n")
 
 def select_best_steered_config(
     results_dir: str,
@@ -30,11 +65,55 @@ def select_best_steered_config(
     with open(ph3_path) as f:
         records = json.load(f)
 
-    # Steered conditions: vector_method in ('dom', 'cpca')
-    steered = [r for r in records if r.get('vector_method') in ('dom', 'cpca')]
+    meta = _load_phase2_meta(results_dir)
+
+    # Steered conditions: vector_method in ('dom', 'cpca'), but only from
+    # sources whose Phase 2 probe gate passed. Failed-gate vectors can remain in
+    # phase3_val.json for analysis; they are not eligible for locked selection.
+    steered_all = [r for r in records if r.get('vector_method') in ('dom', 'cpca')]
+    steered = [
+        r for r in steered_all
+        if _source_gate_passed(meta, str(r.get('vector_source') or ''))
+    ]
+    out_path = os.path.join(results_dir, 'phase3_best_config.yaml')
     if not steered:
-        print(f"[PH3-select] No steered results found in {ph3_path}")
-        return {}
+        ccot_records = [r for r in records if str(r.get('condition', '')).startswith('ccot_L')]
+        if not ccot_records:
+            print(f"[PH3-select] No eligible steered or CCoT results found in {ph3_path}")
+            return {}
+        best_ccot = max(ccot_records, key=lambda r: r['accuracy'])
+        latent_match = re.search(r'_L(\d+)', best_ccot.get('condition', ''))
+        latent_tokens = int(latent_match.group(1)) if latent_match else None
+        n = best_ccot.get('n_examples', 1) or 1
+        wl = _wilson_lower(best_ccot['accuracy'], n)
+        selection = {
+            'model_tag':        model_tag,
+            'best_condition':   best_ccot['condition'],
+            'latent_tokens':    latent_tokens,
+            'ratio':            best_ccot.get('ratio'),
+            'vector_source':    None,
+            'vector_method':    'none',
+            'alpha_star':       0.0,
+            'steered_accuracy': best_ccot['accuracy'],
+            'ccot_accuracy':    best_ccot['accuracy'],
+            'flip_rate':        0.0,
+            'reasoning_tokens': best_ccot.get('reasoning_tokens'),
+            'actual_ratio':     best_ccot.get('actual_ratio'),
+            'wilson_lower_95':  wl,
+            'selection_metric': 'fallback_ccot_probe_gate',
+            'selection_reason': 'all_vectors_failed_probe_gate',
+            'excluded_vector_sources': sorted({
+                str(r.get('vector_source')) for r in steered_all if r.get('vector_source')
+            }),
+        }
+        print(f"\n[PH3-select] {model_tag}: {best_ccot['condition']} (fallback)")
+        print(
+            f"  acc={best_ccot['accuracy']:.4f}  Wilson95lo={wl:.4f}  "
+            "reason=all_vectors_failed_probe_gate"
+        )
+        _write_selection_yaml(selection, out_path)
+        print(f"  -> {out_path}")
+        return selection
 
     best = max(steered, key=lambda r: (r['accuracy'], r['flip_rate']))
 
@@ -72,16 +151,14 @@ def select_best_steered_config(
         print(f"  vs CCoT acc={ccot_acc:.4f}  "
               f"gain={best['accuracy'] - ccot_acc:+.4f}")
 
-    # Write YAML
-    out_path = os.path.join(results_dir, 'phase3_best_config.yaml')
-    try:
-        import yaml
-        with open(out_path, 'w') as f:
-            yaml.dump(selection, f, default_flow_style=False)
-    except ImportError:
-        with open(out_path, 'w') as f:
-            for k, v in selection.items():
-                f.write(f"{k}: {v}\n")
+    selection['selection_reason'] = 'best_probe_passing_steered_config'
+    selection['excluded_vector_sources'] = sorted({
+        str(r.get('vector_source'))
+        for r in steered_all
+        if r.get('vector_source') and not _source_gate_passed(meta, str(r.get('vector_source')))
+    })
+
+    _write_selection_yaml(selection, out_path)
     print(f"  -> {out_path}")
 
     return selection

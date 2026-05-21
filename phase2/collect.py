@@ -27,7 +27,7 @@ def _register_all_hooks(model) -> tuple[list, dict]:
             if 'boundary_idx' not in captured:
                 return
             bidx = captured['boundary_idx']
-            h = output[0]
+            h = output[0] if isinstance(output, tuple) else output
             # Decoder layers may return (B, S, D) or (S, D) depending on transformers version.
             if h.dim() == 3:
                 if bidx < h.shape[1]:
@@ -136,9 +136,11 @@ def collect_hidden_states(
             with torch.no_grad():
                 model(out_ids)
 
-            pred = extract_answer(
-                tokenizer.decode(out_ids[0], skip_special_tokens=True)
+            generated_text = tokenizer.decode(
+                out_ids[0][input_enc['input_ids'].shape[1]:],
+                skip_special_tokens=True,
             )
+            pred = extract_answer(generated_text)
             is_correct = (normalize_answer(pred) == gold) if pred is not None else False
 
             if is_correct:

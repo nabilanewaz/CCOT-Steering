@@ -16,7 +16,9 @@ import torch
 
 from phase1.inference import (
     compute_per_example_budgets,
+    cot_prompt,
     extract_answer,
+    extract_reasoning_span,
     latent_prompt,
     load_finetuned,
     normalize_answer,
@@ -178,8 +180,79 @@ def _eval_one(
     lat   = time.time() - t0
     found = extract_answer(text) is not None
     ok    = _score(text, gold)
-    n_tok = len(tokenizer.encode(text, add_special_tokens=False))
+    reasoning = extract_reasoning_span(text)
+    n_tok = len(tokenizer.encode(reasoning, add_special_tokens=False))
     return ok, found, n_tok, lat
+
+
+def _alpha_validation_sweep(
+    model, tokenizer, D_val: list, v_dom: torch.Tensor, L_star: int,
+    device: str, model_tag: str, source: str, latent_tokens: int,
+    learned_alpha: float, min_gain: float = 0.0025, n_sub: int = 100,
+    prompt_fn=None, boundary_fn=None, prompt_mode: str = 'ccot',
+) -> tuple[float, list[dict]]:
+    """Pick alpha by generated-answer validation, not teacher-forced loss only."""
+    if prompt_fn is None:
+        prompt_fn = lambda item: latent_prompt(item['question'], latent_tokens)
+    if boundary_fn is None:
+        boundary_fn = find_boundary_idx_ccot
+    candidates = [0.0, float(learned_alpha), 0.1, 0.5, 1.0, 2.0, 5.0, 10.0]
+    seen = set()
+    candidates = [a for a in candidates if not (round(a, 8) in seen or seen.add(round(a, 8)))]
+    D_sub = D_val[-min(n_sub, len(D_val)):]
+    rows = []
+    print(
+        f"  [α-validate] source={source} examples={len(D_sub)} "
+        f"min_gain={min_gain:.4f}",
+        flush=True,
+    )
+    for alpha in candidates:
+        correct, found, tokens, lats = [], [], [], []
+        hook_factory = None
+        if alpha != 0.0:
+            hook_factory = lambda b, a=alpha: make_dom_hook(b, v_dom, a, device)
+        for item in D_sub:
+            ok, fd, nt, lt = _eval_one(
+                model, tokenizer, item, prompt_fn(item),
+                L_star if hook_factory is not None else None, hook_factory,
+                device, 128, boundary_fn=boundary_fn,
+            )
+            correct.append(ok); found.append(fd); tokens.append(nt); lats.append(lt)
+        acc = sum(correct) / max(len(correct), 1)
+        row = {
+            'model_tag': model_tag,
+            'source': source,
+            'prompt_mode': prompt_mode,
+            'alpha': float(alpha),
+            'accuracy': float(acc),
+            'answer_found_rate': sum(found) / max(len(found), 1),
+            'reasoning_tokens': sum(tokens) / max(len(tokens), 1),
+            'latency_sec': sum(lats) / max(len(lats), 1),
+            'n_examples': len(correct),
+        }
+        rows.append(row)
+        print(f"    [α-validate] α={alpha:.4f} acc={acc:.4f}", flush=True)
+
+    baseline = next((r for r in rows if r['alpha'] == 0.0), rows[0])
+    best = max(rows, key=lambda r: (r['accuracy'], -abs(r['alpha'] - float(learned_alpha))))
+    if best['accuracy'] >= baseline['accuracy'] + min_gain:
+        selected = best['alpha']
+        reason = 'generated_validation_gain'
+    else:
+        selected = 0.0
+        reason = 'no_alpha_improvement'
+    for r in rows:
+        r['selected'] = bool(r['alpha'] == selected)
+        r['selection_reason'] = reason if r['selected'] else ''
+        r['baseline_accuracy'] = baseline['accuracy']
+        r['min_gain'] = min_gain
+    print(
+        f"  [α-validate] selected α={selected:.4f} "
+        f"reason={reason} baseline={baseline['accuracy']:.4f} "
+        f"best={best['accuracy']:.4f}",
+        flush=True,
+    )
+    return float(selected), rows
 
 
 def _build_result(
@@ -240,10 +313,46 @@ def _tune_and_save_alpha(
         'ccot': meta.get('ccot_best_layer'),
         'base': meta.get('base_best_layer'),
     }
+    source_prompt_fn = {
+        'ccot': lambda item, n=best_latent_tokens: latent_prompt(item['question'], n),
+        'base': lambda item: cot_prompt(item['question']),
+    }
+    source_boundary_fn = {
+        'ccot': find_boundary_idx_ccot,
+        'base': find_boundary_idx_base,
+    }
+
+    def _alpha_validation_cache_valid(path: str, source_name: str) -> bool:
+        if not os.path.exists(path):
+            return False
+        try:
+            with open(path) as fp:
+                payload = json.load(fp)
+            return payload.get('prompt_mode') == source_name
+        except Exception:
+            return False
+
+    def _read_valid_sweep(path: str, source_name: str):
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            with open(path) as fp:
+                payload = json.load(fp)
+            if payload.get('prompt_mode') != source_name:
+                return None
+            return payload
+        except Exception:
+            return None
 
     for source in SOURCES:
         out_path = _alpha_path(vectors_dir, source)
-        if os.path.exists(out_path):
+        validation_path = os.path.join(vectors_dir, f'{source}_alpha_validation_sweep.json')
+        results_validation_path = (
+            os.path.join(results_dir, f'{source}_alpha_validation_sweep.json')
+            if results_dir else None
+        )
+        validation_cache_valid = _alpha_validation_cache_valid(validation_path, source)
+        if os.path.exists(out_path) and validation_cache_valid:
             print(f"[PH3] alpha_star for source={source} cached: {out_path}")
             if results_dir:
                 alpha_cached = torch.load(out_path, map_location='cpu')
@@ -252,9 +361,19 @@ def _tune_and_save_alpha(
                         'model_tag': model_tag,
                         'source': source,
                         'alpha_star': float(alpha_cached.item()),
+                        'prompt_mode': source,
                         'cached_from': out_path,
                     }, fp, indent=2)
+                if os.path.exists(validation_path):
+                    with open(validation_path) as src_fp, open(results_validation_path, 'w') as dst_fp:
+                        json.dump(json.load(src_fp), dst_fp, indent=2)
             continue
+        if os.path.exists(out_path):
+            print(
+                f"[PH3] alpha_star cache lacks source-matched validation sweep for source={source}; "
+                "recomputing alpha.",
+                flush=True,
+            )
 
         v_dom  = _load_vector(vectors_dir, source, 'dom')
         L_star = source_L_star[source]
@@ -277,20 +396,19 @@ def _tune_and_save_alpha(
             if results_dir else None
         )
         active_sweep_path = sweep_path
-        if os.path.exists(sweep_path):
-            with open(sweep_path) as fp:
-                sweep_sel = json.load(fp)['selected']
-            lambda_a = sweep_sel['lambda_a']
-            lambda_m = sweep_sel['lambda_m']
-            print(f"[PH3] λ sweep cached: λ_a={lambda_a}  λ_m={lambda_m}")
-        elif results_sweep_path and os.path.exists(results_sweep_path):
-            active_sweep_path = results_sweep_path
-            with open(results_sweep_path) as fp:
-                sweep_sel = json.load(fp)['selected']
+        sweep_payload = _read_valid_sweep(sweep_path, source)
+        if sweep_payload is None and results_sweep_path:
+            sweep_payload = _read_valid_sweep(results_sweep_path, source)
+            if sweep_payload is not None:
+                active_sweep_path = results_sweep_path
+        if sweep_payload is not None:
+            sweep_sel = sweep_payload['selected']
             lambda_a = sweep_sel['lambda_a']
             lambda_m = sweep_sel['lambda_m']
             print(f"[PH3] λ sweep cached: λ_a={lambda_a}  λ_m={lambda_m}")
         else:
+            if os.path.exists(sweep_path) or (results_sweep_path and os.path.exists(results_sweep_path)):
+                print(f"[PH3] λ sweep cache stale for source={source}; recomputing.")
             from phase3.lambda_sweep import sweep_lambda_grid
             D_sub    = D_val[:min(200, len(D_val))]
             sweep_sel = sweep_lambda_grid(
@@ -298,6 +416,9 @@ def _tune_and_save_alpha(
                 latent_tokens=best_latent_tokens,
                 out_path=sweep_path,
                 max_epochs=2,
+                prompt_fn=source_prompt_fn[source],
+                boundary_fn=source_boundary_fn[source],
+                prompt_mode=source,
             )
             lambda_a = sweep_sel['lambda_a']
             lambda_m = sweep_sel['lambda_m']
@@ -319,12 +440,32 @@ def _tune_and_save_alpha(
                 print(f"  [plot/log] {e}")
 
         # ── Step 2: Full α* tuning with selected lambdas ──────────────────────
-        alpha_star, history = tune_alpha(
+        alpha_star_raw, history = tune_alpha(
             model, tok, D_val, v_dom, L_star, device,
             model_tag=model_tag, latent_tokens=best_latent_tokens,
             lambda_a=lambda_a, lambda_m=lambda_m,
+            prompt_fn=source_prompt_fn[source],
+            boundary_fn=source_boundary_fn[source],
         )
+        selected_alpha, validation_rows = _alpha_validation_sweep(
+            model, tok, D_val, v_dom, L_star, device, model_tag, source,
+            best_latent_tokens, float(alpha_star_raw.item()),
+            prompt_fn=source_prompt_fn[source],
+            boundary_fn=source_boundary_fn[source],
+            prompt_mode=source,
+        )
+        alpha_star = torch.tensor(selected_alpha, dtype=alpha_star_raw.dtype)
         torch.save(alpha_star, out_path)
+        validation_payload = {
+            'model_tag': model_tag,
+            'source': source,
+            'prompt_mode': source,
+            'learned_alpha': float(alpha_star_raw.item()),
+            'selected_alpha': float(selected_alpha),
+            'rows': validation_rows,
+        }
+        with open(validation_path, 'w') as fp:
+            json.dump(validation_payload, fp, indent=2)
         print(f"  alpha_star={alpha_star.item():.4f}  -> {out_path}")
 
         # ── Step 3: Persist history and plots ─────────────────────────────────
@@ -334,8 +475,14 @@ def _tune_and_save_alpha(
                     'model_tag': model_tag,
                     'source': source,
                     'alpha_star': float(alpha_star.item()),
+                    'learned_alpha': float(alpha_star_raw.item()),
+                    'prompt_mode': source,
                     'path': out_path,
+                    'validation_path': validation_path,
                 }, fp, indent=2)
+            if results_validation_path:
+                with open(results_validation_path, 'w') as fp:
+                    json.dump(validation_payload, fp, indent=2)
             hist_path = os.path.join(results_dir, f'{source}_alpha_history.json')
             with open(hist_path, 'w') as fp:
                 json.dump({
@@ -730,7 +877,16 @@ def run_phase3_evaluation(
     ph3_path = os.path.join(results_dir, 'phase3_val.json')
     with open(ph3_path, 'w') as f:
         json.dump([asdict(r) for r in results], f, indent=2)
+    run_meta_path = os.path.join(results_dir, 'phase3_run_meta.json')
+    with open(run_meta_path, 'w') as f:
+        json.dump({
+            'model_tag': model_tag,
+            'phase3_eval_version': 2,
+            'phase2_prompt_version': meta.get('phase2_prompt_version'),
+            'alpha_prompt_modes': {source: source for source in SOURCES},
+        }, f, indent=2)
     print(f"\nPhase 3 results -> {ph3_path}")
+    print(f"Phase 3 run metadata -> {run_meta_path}")
 
     # steered_val.json for scripts/selection.py
     steered = [r for r in results if r.vector_method in ('dom', 'cpca')]

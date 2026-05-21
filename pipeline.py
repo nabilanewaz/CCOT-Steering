@@ -14,7 +14,9 @@ Checkpoint resume: every step checks whether its output file already exists and
 skips if so — safe to re-run after interruption.
 """
 import argparse
+import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -66,7 +68,46 @@ def _phase2_ready(vectors_dir: str) -> tuple[bool, list[str]]:
         "base_dom.pt",
     ]
     missing = [name for name in required if not _done(os.path.join(vectors_dir, name))]
-    return not missing, missing
+    if missing:
+        return False, missing
+    meta_path = os.path.join(vectors_dir, "phase2_meta.json")
+    try:
+        with open(meta_path) as f:
+            meta = json.load(f)
+    except Exception:
+        return False, ["phase2_meta.json(unreadable)"]
+    if int(meta.get("phase2_prompt_version", 0)) < 2:
+        return False, ["phase2_meta.json(prompt_version<2)"]
+    if meta.get("base_prompt_mode") != "cot_prompt":
+        return False, ["phase2_meta.json(base_prompt_mode)"]
+    return True, []
+
+
+def _mirror_phase2_outputs(vectors_dir: str, results_dir: str) -> None:
+    os.makedirs(results_dir, exist_ok=True)
+    for name in ("phase2_meta.json", "ccot_diagnostics.json", "base_diagnostics.json"):
+        src = os.path.join(vectors_dir, name)
+        if not os.path.exists(src):
+            continue
+        dst_name = name
+        if name in ("ccot_diagnostics.json", "base_diagnostics.json"):
+            dst_name = f"phase2_{name}"
+        shutil.copy2(src, os.path.join(results_dir, dst_name))
+
+
+def _phase3_ready(results_dir: str) -> tuple[bool, list[str]]:
+    required = ["phase3_val.json", "phase3_run_meta.json"]
+    missing = [name for name in required if not _done(os.path.join(results_dir, name))]
+    if missing:
+        return False, missing
+    try:
+        with open(os.path.join(results_dir, "phase3_run_meta.json")) as f:
+            meta = json.load(f)
+    except Exception:
+        return False, ["phase3_run_meta.json(unreadable)"]
+    if int(meta.get("phase3_eval_version", 0)) < 2:
+        return False, ["phase3_run_meta.json(eval_version<2)"]
+    return True, []
 
 
 def _update_selected_phase3_best(model_tag: str, selection: dict) -> None:
@@ -171,6 +212,7 @@ def _run_phase2(configs_to_run, models_to_run, splits, device):
                     results_dir=res_dir,
                 )
             else:
+                _mirror_phase2_outputs(vectors_dir, res_dir)
                 print(f"[{cfg_id}][{model_tag}] Vectors exist — skipping")
 
 
@@ -188,8 +230,13 @@ def _run_phase3(configs_to_run, models_to_run, splits, device):
             vectors_dir = f"vectors/{cfg_id}/{model_tag}"
             res_dir     = f"results/{cfg_id}/{model_tag}"
 
-            out_path = os.path.join(res_dir, 'phase3_val.json')
-            if not _done(out_path):
+            phase3_ready, missing_phase3 = _phase3_ready(res_dir)
+            if not phase3_ready:
+                if missing_phase3:
+                    print(
+                        f"\n[{cfg_id}][{model_tag}] Phase 3 incomplete/stale; "
+                        f"missing: {missing_phase3}"
+                    )
                 print(f"\n[{cfg_id}][{model_tag}] Phase 3")
                 run_phase3_evaluation(
                     model_tag=model_tag,
@@ -205,6 +252,11 @@ def _run_phase3(configs_to_run, models_to_run, splits, device):
                     _update_selected_phase3_best(model_tag, selection)
             else:
                 print(f"[{cfg_id}][{model_tag}] Phase 3 val results exist — skipping")
+                best_cfg_path = os.path.join(res_dir, 'phase3_best_config.yaml')
+                if not _done(best_cfg_path):
+                    selection = select_best_steered_config(res_dir, model_tag)
+                    if selection:
+                        _update_selected_phase3_best(model_tag, selection)
 
 
 def _run_selection(models_to_run, splits):

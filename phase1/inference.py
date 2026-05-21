@@ -36,15 +36,25 @@ def normalize_answer(text: str) -> str:
         return text.lower()
 
 
+def cot_prompt(question: str) -> str:
+    """Canonical visible chain-of-thought prompt used for CoT baselines."""
+    return f"Question: {question}\n\nReasoning:"
+
+
 def extract_reasoning_span(text: str) -> str:
-    """Strip control tags and everything after 'Answer:' marker."""
-    parts = text.split('\n\nAnswer:')
-    reasoning_block = parts[0]
-    lines = reasoning_block.strip().split('\n')
+    """Return visible reasoning text, excluding answer markers/control tags."""
+    text = (text or '').strip()
+    if 'Reasoning:' in text:
+        text = text.split('Reasoning:', 1)[1].strip()
+    for marker in ('\n\nAnswer:', '\nAnswer:', 'Answer:', '####'):
+        if marker in text:
+            text = text.split(marker, 1)[0].strip()
+            break
+    lines = text.strip().split('\n')
     return '\n'.join(
         l for l in lines
         if not l.startswith('[compress:') and not l.startswith('[latents:')
-    )
+    ).strip()
 
 
 # ── Model loaders ─────────────────────────────────────────────────────────────
@@ -173,18 +183,19 @@ def run_no_cot(model, tokenizer, item: dict, device: str) -> tuple[str | None, s
 
 
 def run_cot(model, tokenizer, item: dict, device: str) -> tuple[str | None, str]:
-    enc = tokenizer(
-        f"{item['question']}\n<|start-latent|><|latent|><|latent|><|end-latent|>\n",
-        return_tensors='pt',
-    ).to(device)
+    enc = tokenizer(cot_prompt(item['question']), return_tensors='pt').to(device)
     with torch.no_grad():
         out = _generate(model, tokenizer, **enc, do_sample=False, max_new_tokens=512)
     generated = tokenizer.decode(
         out[0][enc['input_ids'].shape[1]:], skip_special_tokens=True
     )
-    parts = generated.split('####')
-    reasoning = parts[0].strip()
-    raw_answer = parts[1].strip() if len(parts) > 1 else generated
+    reasoning = extract_reasoning_span(generated)
+    if '####' in generated:
+        raw_answer = generated.split('####', 1)[1].strip()
+    elif 'Answer:' in generated:
+        raw_answer = generated.split('Answer:', 1)[1].strip()
+    else:
+        raw_answer = generated
     return extract_answer(raw_answer), reasoning
 
 
@@ -218,10 +229,7 @@ def run_trimmed_cot(cot_model, tokenizer, item: dict, token_budget: int,
     cot_model.eval()
 
     # Stage 1 — truncated reasoning
-    reasoning_enc = tokenizer(
-        f"{item['question']}\n<|start-latent|><|latent|><|latent|><|end-latent|>\n",
-        return_tensors='pt',
-    ).to(device)
+    reasoning_enc = tokenizer(cot_prompt(item['question']), return_tensors='pt').to(device)
     with torch.no_grad():
         reasoning_ids = _generate(
             cot_model,
@@ -234,9 +242,11 @@ def run_trimmed_cot(cot_model, tokenizer, item: dict, token_budget: int,
         reasoning_ids[0][reasoning_enc['input_ids'].shape[1]:],
         skip_special_tokens=True,
     ).strip()
+    reasoning_text = extract_reasoning_span(reasoning_text)
 
     # Stage 2 — answer from truncated context
-    answer_enc = tokenizer(reasoning_text + "\n#### ", return_tensors='pt').to(device)
+    answer_prompt = f"{cot_prompt(item['question'])} {reasoning_text}\n\nAnswer:"
+    answer_enc = tokenizer(answer_prompt, return_tensors='pt').to(device)
     with torch.no_grad():
         answer_ids = _generate(
             cot_model,
@@ -264,16 +274,13 @@ def compute_per_example_budgets(cot_model, tokenizer, dataset: list,
     budgets = []
     cot_model.eval()
     for item in dataset:
-        enc = tokenizer(
-            f"{item['question']}\n<|start-latent|><|latent|><|latent|><|end-latent|>\n",
-            return_tensors='pt',
-        ).to(device)
+        enc = tokenizer(cot_prompt(item['question']), return_tensors='pt').to(device)
         with torch.no_grad():
             out_ids = _generate(cot_model, tokenizer, **enc, do_sample=False, max_new_tokens=512)
         generated = tokenizer.decode(
             out_ids[0][enc['input_ids'].shape[1]:], skip_special_tokens=True
         )
-        reasoning = generated.split('\n\nAnswer:')[0].strip()
+        reasoning = extract_reasoning_span(generated)
         t_full = len(tokenizer.encode(reasoning, add_special_tokens=False))
         budgets.append(max(10, round(ratio * t_full)))
     return budgets
@@ -288,7 +295,9 @@ def measure_ccot_token_counts(ccot_model, tokenizer, dataset: list,
         enc = tokenizer(latent_prompt(item['question'], n_latents), return_tensors='pt').to(device)
         with torch.no_grad():
             out_ids = _generate(ccot_model, tokenizer, **enc, do_sample=False, max_new_tokens=256)
-        full_text = tokenizer.decode(out_ids[0], skip_special_tokens=True)
+        full_text = tokenizer.decode(
+            out_ids[0][enc['input_ids'].shape[1]:], skip_special_tokens=True
+        )
         reasoning = extract_reasoning_span(full_text)
         lengths.append(len(tokenizer.encode(reasoning, add_special_tokens=False)))
     return {
