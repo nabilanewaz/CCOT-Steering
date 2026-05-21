@@ -245,6 +245,15 @@ def _tune_and_save_alpha(
         out_path = _alpha_path(vectors_dir, source)
         if os.path.exists(out_path):
             print(f"[PH3] alpha_star for source={source} cached: {out_path}")
+            if results_dir:
+                alpha_cached = torch.load(out_path, map_location='cpu')
+                with open(os.path.join(results_dir, f'{source}_alpha_star.json'), 'w') as fp:
+                    json.dump({
+                        'model_tag': model_tag,
+                        'source': source,
+                        'alpha_star': float(alpha_cached.item()),
+                        'cached_from': out_path,
+                    }, fp, indent=2)
             continue
 
         v_dom  = _load_vector(vectors_dir, source, 'dom')
@@ -263,8 +272,20 @@ def _tune_and_save_alpha(
 
         # ── Step 1: λ sweep on 200-example subset ────────────────────────────
         sweep_path = os.path.join(vectors_dir, f'{source}_lambda_sweep.json')
+        results_sweep_path = (
+            os.path.join(results_dir, f'{source}_lambda_sweep.json')
+            if results_dir else None
+        )
+        active_sweep_path = sweep_path
         if os.path.exists(sweep_path):
             with open(sweep_path) as fp:
+                sweep_sel = json.load(fp)['selected']
+            lambda_a = sweep_sel['lambda_a']
+            lambda_m = sweep_sel['lambda_m']
+            print(f"[PH3] λ sweep cached: λ_a={lambda_a}  λ_m={lambda_m}")
+        elif results_sweep_path and os.path.exists(results_sweep_path):
+            active_sweep_path = results_sweep_path
+            with open(results_sweep_path) as fp:
                 sweep_sel = json.load(fp)['selected']
             lambda_a = sweep_sel['lambda_a']
             lambda_m = sweep_sel['lambda_m']
@@ -281,17 +302,21 @@ def _tune_and_save_alpha(
             lambda_a = sweep_sel['lambda_a']
             lambda_m = sweep_sel['lambda_m']
             # Plot heatmap if results_dir provided
-            if results_dir:
-                try:
-                    from phase3.plots import plot_lambda_sweep_heatmap
-                    with open(sweep_path) as fp:
-                        sweep_data = json.load(fp)
-                    plot_lambda_sweep_heatmap(
-                        sweep_data,
-                        os.path.join(results_dir, f'{source}_lambda_heatmap.png'),
-                    )
-                except Exception as e:
-                    print(f"  [plot] {e}")
+            active_sweep_path = sweep_path
+
+        if results_dir and active_sweep_path and os.path.exists(active_sweep_path):
+            try:
+                with open(active_sweep_path) as fp:
+                    sweep_data = json.load(fp)
+                with open(results_sweep_path, 'w') as fp:
+                    json.dump(sweep_data, fp, indent=2)
+                from phase3.plots import plot_lambda_sweep_heatmap
+                plot_lambda_sweep_heatmap(
+                    sweep_data,
+                    os.path.join(results_dir, f'{source}_lambda_heatmap.png'),
+                )
+            except Exception as e:
+                print(f"  [plot/log] {e}")
 
         # ── Step 2: Full α* tuning with selected lambdas ──────────────────────
         alpha_star, history = tune_alpha(
@@ -304,6 +329,13 @@ def _tune_and_save_alpha(
 
         # ── Step 3: Persist history and plots ─────────────────────────────────
         if results_dir:
+            with open(os.path.join(results_dir, f'{source}_alpha_star.json'), 'w') as fp:
+                json.dump({
+                    'model_tag': model_tag,
+                    'source': source,
+                    'alpha_star': float(alpha_star.item()),
+                    'path': out_path,
+                }, fp, indent=2)
             hist_path = os.path.join(results_dir, f'{source}_alpha_history.json')
             with open(hist_path, 'w') as fp:
                 json.dump({

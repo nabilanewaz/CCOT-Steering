@@ -536,10 +536,22 @@ def run_phase2_all_sources(
         'base_trainable_params':  int(base_res.get('diagnostics', {}).get('freeze', {}).get('trainable_params', 0)),
     }
     os.makedirs(vectors_dir, exist_ok=True)
+    os.makedirs(results_dir, exist_ok=True)
     meta_path = os.path.join(vectors_dir, 'phase2_meta.json')
     with open(meta_path, 'w') as f:
         json.dump(meta, f, indent=2)
+    results_meta_path = os.path.join(results_dir, 'phase2_meta.json')
+    with open(results_meta_path, 'w') as f:
+        json.dump(meta, f, indent=2)
+    for source, res in (("ccot", ccot_res), ("base", base_res)):
+        diag = res.get('diagnostics')
+        if diag:
+            diag_path = os.path.join(results_dir, f'phase2_{source}_diagnostics.json')
+            with open(diag_path, 'w') as f:
+                json.dump(diag, f, indent=2)
+            print(f"Phase 2 {source} diagnostics -> {diag_path}")
     print(f"\nPhase 2 metadata -> {meta_path}")
+    print(f"Phase 2 metadata mirror -> {results_meta_path}")
 
     total_elapsed = time.time() - phase_start
     print(f"\n{'=' * 72}")
