@@ -56,6 +56,8 @@ def cpca_full(
     Full eigendecomposition cPCA. Suitable for d <= 2560 (Phi-2, Qwen2.5-3B).
     Returns (U_L [d, r], lam_L [r]).
     """
+    H_pos_L = H_pos_L.float()
+    H_neg_L = H_neg_L.float()
     mu_pos, mu_neg = H_pos_L.mean(0), H_neg_L.mean(0)
     H_pos_c = H_pos_L - mu_pos
     H_neg_c = H_neg_L - mu_neg
@@ -87,6 +89,8 @@ def cpca_shrunk(
     cPCA with Ledoit-Wolf shrinkage. Use when n/d < 1.5 (Qwen2.5-Math-1.5B).
     Returns (U_L [d, r], lam_L [r]).
     """
+    H_pos_L = H_pos_L.float()
+    H_neg_L = H_neg_L.float()
     mu_pos, mu_neg = H_pos_L.mean(0), H_neg_L.mean(0)
     H_pos_c = (H_pos_L - mu_pos).numpy().astype(np.float32)
     H_neg_c = (H_neg_L - mu_neg).numpy().astype(np.float32)
@@ -130,6 +134,8 @@ def cpca_randomized(
     if beta_rank is None:
         beta_rank = max(r, round(r * 4 * beta))
 
+    H_pos_L = H_pos_L.float()
+    H_neg_L = H_neg_L.float()
     mu_pos, mu_neg = H_pos_L.mean(0), H_neg_L.mean(0)
     H_pos_c = (H_pos_L - mu_pos).numpy().astype(np.float32)
     H_neg_c = (H_neg_L - mu_neg).numpy().astype(np.float32)
@@ -199,7 +205,7 @@ def select_best_cpca(
     Evaluate each (k, β) by stratified 80/20 held-out probe accuracy on the
     projected space. Returns (U_best [d,k], lam_best [k], best_k, best_beta, best_acc).
     """
-    X = torch.cat([H_pos_L, H_neg_L]).numpy().astype(np.float32)
+    X = torch.cat([H_pos_L.float(), H_neg_L.float()]).numpy().astype(np.float32)
     y = np.array([1] * len(H_pos_L) + [0] * len(H_neg_L))
     X_tr, X_te, y_tr, y_te = train_test_split(
         X, y, test_size=0.2, random_state=seed, stratify=y
@@ -207,7 +213,7 @@ def select_best_cpca(
 
     scores = {}
     for (k, beta), (U, _) in sweep_results.items():
-        U_np = U.numpy()
+        U_np = U.float().numpy()
         sc   = StandardScaler()
         pr_tr = sc.fit_transform(X_tr @ U_np)
         pr_te = sc.transform(X_te @ U_np)
@@ -295,7 +301,7 @@ def weighted_subspace_merge(
     if not weighted_cols:
         raise ValueError("No subspaces available to merge.")
 
-    W = torch.cat(weighted_cols, dim=1)            # [d, r_per_layer * k]
+    W = torch.cat(weighted_cols, dim=1).float()            # [d, r_per_layer * k]
     U_final, S, _ = torch.linalg.svd(W, full_matrices=False)
     U_truth_final = U_final[:, :r_final]           # [d, r_final]
 
@@ -338,7 +344,7 @@ def compute_shuffled_cpca(
     for L in selected_layers:
         if L not in H_pos or L not in H_neg:
             continue
-        H_all = torch.cat([H_pos[L], H_neg[L]])   # [n_pos + n_neg, d]
+        H_all = torch.cat([H_pos[L].float(), H_neg[L].float()])   # [n_pos + n_neg, d]
         n_pos = H_pos[L].shape[0]
 
         g = torch.Generator()

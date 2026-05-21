@@ -26,8 +26,8 @@ def compare_methods(
         print("No selected layers in H_pos — defaulting to 'dom'")
         return 'dom', {'dom': 0.0, 'cpca': 0.0}
 
-    H_pos_sel = torch.cat([H_pos[L] for L in layers])
-    H_neg_sel = torch.cat([H_neg[L] for L in layers])
+    H_pos_sel = torch.cat([H_pos[L].float() for L in layers])
+    H_neg_sel = torch.cat([H_neg[L].float() for L in layers])
     H_all = torch.cat([H_pos_sel, H_neg_sel]).numpy().astype(np.float32)
     y     = np.array([1] * len(H_pos_sel) + [0] * len(H_neg_sel))
 
@@ -36,13 +36,13 @@ def compare_methods(
     )
 
     # Method A: 1-D projection onto v_truth (DoM)
-    v_np = v_truth.numpy().reshape(-1, 1)
+    v_np = v_truth.float().numpy().reshape(-1, 1)
     probe_dom = LogisticRegression(max_iter=500)
     probe_dom.fit(X_tr @ v_np, y_tr)
     acc_dom = float(accuracy_score(y_te, probe_dom.predict(X_te @ v_np)))
 
     # Method B: r-D projection onto U_truth subspace (cPCA)
-    U_np    = U_truth.numpy()
+    U_np    = U_truth.float().numpy()
     scaler  = StandardScaler()
     proj_tr = scaler.fit_transform(X_tr @ U_np)
     proj_te = scaler.transform(X_te @ U_np)

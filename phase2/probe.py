@@ -26,7 +26,7 @@ def score_all_layers(
     layer_scores: dict[int, float] = {}
 
     for L in sorted(H_pos.keys()):
-        X = torch.cat([H_pos[L], H_neg[L]]).numpy().astype(np.float32)
+        X = torch.cat([H_pos[L].float(), H_neg[L].float()]).numpy().astype(np.float32)
         y = np.array([1] * len(H_pos[L]) + [0] * len(H_neg[L]))
 
         X_tr, X_te, y_tr, y_te = train_test_split(

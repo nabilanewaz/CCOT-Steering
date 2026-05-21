@@ -7,8 +7,8 @@ def compute_per_layer_dom(H_pos: dict, H_neg: dict) -> dict[int, torch.Tensor]:
     """Unit-normalised DoM vector at every layer: (mean H+ − mean H−) / norm."""
     dom_vectors: dict[int, torch.Tensor] = {}
     for L in H_pos:
-        mu_pos = H_pos[L].mean(dim=0)
-        mu_neg = H_neg[L].mean(dim=0)
+        mu_pos = H_pos[L].float().mean(dim=0)
+        mu_neg = H_neg[L].float().mean(dim=0)
         v_raw  = mu_pos - mu_neg
         dom_vectors[L] = v_raw / (v_raw.norm() + 1e-8)
     return dom_vectors
@@ -87,8 +87,8 @@ def compute_shuffled_dom(
       - raw norm before normalisation (near-zero norm = labels carry no signal)
       - cosine alignment with v_truth (near zero expected for random labels)
     """
-    H_p = H_pos[best_layer]   # [n+, d]
-    H_n = H_neg[best_layer]   # [n-, d]
+    H_p = H_pos[best_layer].float()   # [n+, d]
+    H_n = H_neg[best_layer].float()   # [n-, d]
     n_pos = H_p.shape[0]
 
     g = torch.Generator()
