@@ -61,6 +61,15 @@ MODEL_ID_MAP = {
 }
 
 
+def _last_hidden_state(output) -> torch.Tensor | None:
+    h = output[0] if isinstance(output, tuple) else output
+    if h.dim() == 3:
+        return h[:, -1, :]
+    if h.dim() == 2:
+        return h[-1:, :]
+    return None
+
+
 # ── Data classes ───────────────────────────────────────────────────────────────
 
 @dataclass
@@ -622,8 +631,9 @@ def run_steered_with_metrics(
     layers = get_transformer_layers(model)
 
     def _capture(module, input, output):
-        h = output[0]
-        captured.append(h[:, -1, :].detach().clone())
+        h_last = _last_hidden_state(output)
+        if h_last is not None:
+            captured.append(h_last.detach().float().clone())
         return output
 
     handles = []
