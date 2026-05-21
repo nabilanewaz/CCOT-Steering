@@ -59,6 +59,16 @@ def _checkpoint_ready(path: str) -> bool:
     return _done(os.path.join(path, "adapter_config.json")) or _done(os.path.join(path, "config.json"))
 
 
+def _phase2_ready(vectors_dir: str) -> tuple[bool, list[str]]:
+    required = [
+        "phase2_meta.json",
+        "ccot_dom.pt",
+        "base_dom.pt",
+    ]
+    missing = [name for name in required if not _done(os.path.join(vectors_dir, name))]
+    return not missing, missing
+
+
 def _update_selected_phase3_best(model_tag: str, selection: dict) -> None:
     """Merge one model's Phase 3 best config into configs/selected.yaml."""
     path = 'configs/selected.yaml'
@@ -143,8 +153,14 @@ def _run_phase2(configs_to_run, models_to_run, splits, device):
             vectors_dir = f"vectors/{cfg_id}/{model_tag}"
             res_dir     = f"results/{cfg_id}/{model_tag}"
 
-            if not _done(os.path.join(vectors_dir, 'ccot_dom.pt')):
-                print(f"\n[{cfg_id}][{model_tag}] Phase 2: vector extraction")
+            phase2_ready, missing_phase2 = _phase2_ready(vectors_dir)
+            if not phase2_ready:
+                if missing_phase2:
+                    print(
+                        f"\n[{cfg_id}][{model_tag}] Phase 2 incomplete; "
+                        f"missing: {missing_phase2}"
+                    )
+                print(f"[{cfg_id}][{model_tag}] Phase 2: vector extraction")
                 run_phase2_all_sources(
                     model_tag=model_tag,
                     base_model_id=base_id,
