@@ -12,14 +12,16 @@ def score_all_layers(
     H_pos: dict,
     H_neg: dict,
     gate: float = PROBE_GATE,
+    enforce_gate: bool = False,
 ) -> dict[int, float]:
     """
     Fit a stratified 80/20 logistic probe on each layer's hidden states.
     Returns dict[layer -> held-out accuracy].
 
-    Raises RuntimeError if no layer exceeds `gate` (default 55%) — this
-    indicates the collected states carry no linear separability signal and
-    downstream DoM/cPCA vectors would be meaningless.
+    When `enforce_gate` is true, raises RuntimeError if no layer exceeds
+    `gate` (default 55%). By default the gate is advisory: low probe accuracy
+    is reported and saved in diagnostics, but extraction can continue with the
+    best available layer.
     """
     layer_scores: dict[int, float] = {}
 
@@ -39,7 +41,7 @@ def score_all_layers(
         layer_scores[L] = float(accuracy_score(y_te, probe.predict(X_te)))
 
     _report(layer_scores, gate)
-    _gate_check(layer_scores, gate)
+    _gate_check(layer_scores, gate, enforce_gate=enforce_gate)
     return layer_scores
 
 
@@ -52,11 +54,37 @@ def _report(layer_scores: dict[int, float], gate: float) -> None:
         print(f"  Layer {L:02d}: {acc:.3f}  {bar}{marker}")
 
 
-def _gate_check(layer_scores: dict[int, float], gate: float) -> None:
+def gate_status(layer_scores: dict[int, float], gate: float = PROBE_GATE) -> dict:
+    passing = [L for L, acc in layer_scores.items() if acc > gate]
+    best_L = max(layer_scores, key=layer_scores.get) if layer_scores else None
+    best_acc = layer_scores[best_L] if best_L is not None else 0.0
+    return {
+        "gate_passed": bool(passing),
+        "gate_threshold": float(gate),
+        "layers_passing": sorted(int(L) for L in passing),
+        "best_layer": int(best_L) if best_L is not None else None,
+        "best_acc": float(best_acc),
+    }
+
+
+def _gate_check(
+    layer_scores: dict[int, float],
+    gate: float,
+    enforce_gate: bool = False,
+) -> None:
     passing = [L for L, acc in layer_scores.items() if acc > gate]
     if not passing:
         best_L   = max(layer_scores, key=layer_scores.get)
         best_acc = layer_scores[best_L]
+        message = (
+            f"Probe gate failed: no layer exceeded {gate:.0%}. "
+            f"Best was layer {best_L} at {best_acc:.3f}. "
+            "Continuing with the best available layer; treat downstream "
+            "vectors as low-confidence."
+        )
+        if not enforce_gate:
+            print(f"WARNING: {message}")
+            return
         raise RuntimeError(
             f"Probe gate failed: no layer exceeded {gate:.0%}. "
             f"Best was layer {best_L} at {best_acc:.3f}. "

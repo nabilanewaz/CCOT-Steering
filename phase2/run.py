@@ -12,7 +12,7 @@ from phase2.loaders import (
     find_boundary_idx_base,
 )
 from phase2.collect import collect_hidden_states
-from phase2.probe import PROBE_GATE, score_all_layers
+from phase2.probe import PROBE_GATE, gate_status, score_all_layers
 from phase2.dom import (
     compute_per_layer_dom,
     compute_best_layer_dom,
@@ -174,6 +174,7 @@ def run_phase2_source(
     # ── Layer probe scores ────────────────────────────────────────────────────
     t = _step(2, "score layer probes")
     layer_scores = score_all_layers(H_pos, H_neg)
+    probe_gate_info = gate_status(layer_scores, PROBE_GATE)
     _finish_step("2_probe", t)
 
     # ── Method A: best-layer DoM ──────────────────────────────────────────────
@@ -235,8 +236,7 @@ def run_phase2_source(
             },
             "probe": {
                 "layer_scores": {str(L): float(s) for L, s in layer_scores.items()},
-                "gate_threshold": PROBE_GATE,
-                "layers_passing": sorted(int(L) for L, s in layer_scores.items() if s > PROBE_GATE),
+                **probe_gate_info,
             },
             "dom": {
                 "best_layer": int(best_layer),
@@ -307,8 +307,7 @@ def run_phase2_source(
         },
         "probe": {
             "layer_scores": {str(L): float(s) for L, s in layer_scores.items()},
-            "gate_threshold": PROBE_GATE,
-            "layers_passing": sorted(int(L) for L, s in layer_scores.items() if s > PROBE_GATE),
+            **probe_gate_info,
         },
         "dom": {
             "best_layer": int(best_layer),
