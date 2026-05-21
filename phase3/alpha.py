@@ -84,21 +84,45 @@ def tune_alpha(
 
     cache: dict = {}
 
+    def _first_hidden(output):
+        return output[0] if isinstance(output, tuple) else output
+
+    def _replace_first_hidden(output, h):
+        return (h,) + output[1:] if isinstance(output, tuple) else h
+
+    def _boundary_state(h: torch.Tensor, boundary_idx: int):
+        if h.dim() == 3:
+            if boundary_idx >= h.shape[1]:
+                return None
+            return h[:, boundary_idx, :]
+        if h.dim() == 2:
+            if boundary_idx >= h.shape[0]:
+                return None
+            return h[boundary_idx, :]
+        return None
+
+    def _write_boundary_state(h: torch.Tensor, boundary_idx: int, h_new: torch.Tensor):
+        h_out = h.clone()
+        if h.dim() == 3:
+            h_out[:, boundary_idx, :] = h_new
+        elif h.dim() == 2:
+            h_out[boundary_idx, :] = h_new
+        return h_out
+
     def steer_hook(module, input, output):
-        h = output[0]
+        h = _first_hidden(output)
         b = cache.get('boundary_idx', 0)
-        if b >= h.shape[1]:
+        h_t = _boundary_state(h, b)
+        if h_t is None:
             return output
-        h_t   = h[:, b, :]
         sigma = h_t.detach().norm(dim=-1, keepdim=True) / (h_t.shape[-1] ** 0.5)
         alpha = alpha_module()
-        delta = alpha * sigma * v        # grad flows through alpha_module → delta
-        cache['h_steered'] = h_t + delta  # grad through delta → alpha
+        delta = alpha * sigma * v        # grad flows through alpha_module -> delta
+        cache['h_steered'] = h_t + delta  # grad through delta -> alpha
         cache['h_orig']    = h_t.detach() # reference norm (no grad needed)
         cache['delta']     = delta        # keep grad so L_mag regularises alpha
-        h_out          = h.clone()
-        h_out[:, b, :] = cache['h_steered']
-        return (h_out,) + output[1:]
+        h_out = _write_boundary_state(h, b, cache['h_steered'])
+        return _replace_first_hidden(output, h_out)
 
     handle = target_layer.register_forward_hook(steer_hook)
 

@@ -411,13 +411,29 @@ def make_subspace_hook(boundary_idx: int, U_truth: torch.Tensor,
     U = U_truth.to(device)
 
     def hook(module, input, output):
-        h = output[0].clone()
-        h_t   = h[:, boundary_idx, :]
+        h = output[0] if isinstance(output, tuple) else output
+        h_out = h.clone()
+        if h.dim() == 3:
+            if boundary_idx >= h.shape[1]:
+                return output
+            h_t = h[:, boundary_idx, :]
+        elif h.dim() == 2:
+            if boundary_idx >= h.shape[0]:
+                return output
+            h_t = h[boundary_idx, :]
+        else:
+            return output
         sigma = h_t.norm(dim=-1, keepdim=True) / (h_t.shape[-1] ** 0.5)
         h_hat = h_t / (h_t.norm(dim=-1, keepdim=True) + 1e-8)
-        proj  = (U @ (U.T @ h_hat.T)).T
-        h[:, boundary_idx, :] = h_t + alpha * sigma * proj
-        return (h,) + output[1:]
+        if h_hat.dim() == 1:
+            proj = U @ (U.T @ h_hat)
+        else:
+            proj = (U @ (U.T @ h_hat.T)).T
+        if h.dim() == 3:
+            h_out[:, boundary_idx, :] = h_t + alpha * sigma * proj
+        else:
+            h_out[boundary_idx, :] = h_t + alpha * sigma * proj
+        return (h_out,) + output[1:] if isinstance(output, tuple) else h_out
 
     return hook
 
