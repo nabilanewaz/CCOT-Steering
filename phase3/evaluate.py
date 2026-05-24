@@ -33,7 +33,7 @@ from phase3.hooks import (
     run_with_hook,
 )
 
-RATIOS   = [0.5, 0.6, 0.7, 0.8, 0.9]
+RATIOS   = [0.6]  # Single ratio for faster iteration
 SOURCES  = ('ccot', 'base')
 
 
@@ -119,6 +119,14 @@ def _load_shuffled_vector(
 
 def _alpha_path(vectors_dir: str, source: str) -> str:
     return os.path.join(vectors_dir, f'{source}_alpha_star.pt')
+
+
+def _append_result(r: 'ConditionResult', results: list, results_dir: str) -> None:
+    """Append r and immediately flush interim JSON so crashes can resume."""
+    results.append(r)
+    path = os.path.join(results_dir, 'phase3_val_interim.json')
+    with open(path, 'w') as f:
+        json.dump([asdict(rr) for rr in results], f, indent=2)
 
 
 def _load_alpha(vectors_dir: str, source: str) -> float:
@@ -288,7 +296,11 @@ def _tune_and_save_alpha(
             print(f"  [CACHED] alpha_star={cached_val:.4f}  path={out_path}")
             continue
 
-        v_dom  = _load_vector(vectors_dir, source, 'dom')
+        try:
+            v_dom = _load_vector(vectors_dir, source, 'dom')
+        except FileNotFoundError:
+            print(f"  [SKIP] DoM vector missing for source={source} — skipping alpha tuning")
+            continue
         L_star = source_L_star[source]
         if L_star is None:
             try:
@@ -339,10 +351,14 @@ def _tune_and_save_alpha(
                     print(f"  [plot] {e}")
 
         # ── Step 2: Full α* tuning with selected lambdas ──────────────────────
-        t_step = time.time()
-        print(f"\n  [2/3] α* tuning  D_val={len(D_val)}  λ_a={lambda_a}  λ_m={lambda_m}…")
+        # Cap at 50 examples — α is a single scalar; gradient tuning on thousands
+        # of examples takes hours with no benefit. If both lambdas are 0, α will
+        # converge to alpha_max anyway, so we use a small subset to get there fast.
+        t_step  = time.time()
+        D_alpha = D_val[:min(50, len(D_val))]
+        print(f"\n  [2/3] α* tuning  D_val={len(D_alpha)} (cap=50)  λ_a={lambda_a}  λ_m={lambda_m}…")
         alpha_star, history = tune_alpha(
-            model, tok, D_val, v_dom, L_star, device,
+            model, tok, D_alpha, v_dom, L_star, device,
             model_tag=model_tag, ratio=best_ratio_flt,
             lambda_a=lambda_a, lambda_m=lambda_m,
         )
@@ -425,39 +441,63 @@ def run_phase3_evaluation(
     print(bar)
 
     # ── Pre-tune alpha per source ─────────────────────────────────────────────
-    _tune_and_save_alpha(model_tag, checkpoints_dir, D_val,
+    # Cap at 300 examples — α is a single scalar; full D_val is overkill.
+    D_tune = D_val[:min(300, len(D_val))]
+    _tune_and_save_alpha(model_tag, checkpoints_dir, D_tune,
                          vectors_dir, device, meta, results_dir=results_dir)
-    alphas = {s: _load_alpha(vectors_dir, s) for s in SOURCES}
+    alphas = {
+        s: _load_alpha(vectors_dir, s)
+        for s in SOURCES
+        if os.path.exists(_alpha_path(vectors_dir, s))
+    }
     print(f"\n  Alpha stars loaded: { {s: round(v, 4) for s, v in alphas.items()} }")
 
     results:    list[ConditionResult] = []
     cond_times: dict[str, float]      = {}
-    cond_idx = 0
+    cond_idx    = 0
+    _saved_map: dict[str, ConditionResult] = {}
+
+    _interim_path = os.path.join(results_dir, 'phase3_val_interim.json')
+    if os.path.exists(_interim_path):
+        with open(_interim_path) as _f:
+            _saved = json.load(_f)
+        for _d in _saved:
+            _cr = ConditionResult(**_d)
+            results.append(_cr)
+            _saved_map[_cr.condition] = _cr
+        _done_conds: set[str] = set(_saved_map)
+        print(f"  [RESUME] {len(results)} conditions already done: "
+              f"{sorted(_done_conds)}")
+    else:
+        _done_conds: set[str] = set()
 
     # ── [1] No CoT ────────────────────────────────────────────────────────────
     cond_idx += 1
-    cond_start = _cond_banner(cond_idx, f'No CoT (frozen base)  base={base_model_id}', t_phase)
-    from phase1.inference import load_base_frozen
-    print(f"    Loading frozen base model…")
-    base_model, tok_base = load_base_frozen(base_model_id, device)
+    if 'no_cot' not in _done_conds:
+        cond_start = _cond_banner(cond_idx, f'No CoT (frozen base)  base={base_model_id}', t_phase)
+        from phase1.inference import load_base_frozen
+        print(f"    Loading frozen base model…")
+        base_model, tok_base = load_base_frozen(base_model_id, device)
 
-    def _ev_no_cot(item):
-        prompt = f"Question: {item['question']}\n\nAnswer:"
-        ok, fd, _, lt = _eval_one(base_model, tok_base, item, prompt,
-                                  None, None, device, 32)
-        return ok, fd, 0, lt  # 0 reasoning tokens for no_cot
+        def _ev_no_cot(item):
+            prompt = f"Question: {item['question']}\n\nAnswer:"
+            ok, fd, _, lt = _eval_one(base_model, tok_base, item, prompt,
+                                      None, None, device, 32)
+            return ok, fd, 0, lt  # 0 reasoning tokens for no_cot
 
-    c_list, f_list, tok_list, lat_list = _eval_loop(D_val, _ev_no_cot, 'no_cot')
-    r = _build_result('no_cot', model_tag, None, None, None, None,
-                      c_list, f_list, tok_list, lat_list, None, 1.0)
-    results.append(r)
-    cond_elapsed = time.time() - cond_start
-    cond_times['no_cot'] = round(cond_elapsed, 2)
-    print(f"  ╚══ no_cot  acc={r.accuracy:.3f}  found={r.answer_found_rate:.3f}  "
-          f"({cond_elapsed:.0f}s) ══")
-    del base_model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        c_list, f_list, tok_list, lat_list = _eval_loop(D_val, _ev_no_cot, 'no_cot')
+        r = _build_result('no_cot', model_tag, None, None, None, None,
+                          c_list, f_list, tok_list, lat_list, None, 1.0)
+        _append_result(r, results, results_dir)
+        cond_elapsed = time.time() - cond_start
+        cond_times['no_cot'] = round(cond_elapsed, 2)
+        print(f"  ╚══ no_cot  acc={r.accuracy:.3f}  found={r.answer_found_rate:.3f}  "
+              f"({cond_elapsed:.0f}s) ══")
+        del base_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    else:
+        print(f"  [RESUME] [{cond_idx:>2}] no_cot — skipping (already done)")
 
     # ── Load CoT model (kept alive for Full CoT + Trimmed CoT + Trimmed+DoM) ──
     cot_ckpt = os.path.join(checkpoints_dir, 'cot')
@@ -469,38 +509,53 @@ def run_phase3_evaluation(
 
     # ── [2] Full CoT ──────────────────────────────────────────────────────────
     cond_idx += 1
-    cond_start = _cond_banner(cond_idx, 'Full CoT', t_phase)
+    if 'full_cot' not in _done_conds:
+        cond_start = _cond_banner(cond_idx, 'Full CoT', t_phase)
 
-    def _ev_full_cot(item):
-        t0 = time.time()
-        pred, reasoning = run_cot(cot_model, tok_cot, item, device)
-        lt   = time.time() - t0
-        gold = item['answer'].split('####')[1].strip()
-        ok   = normalize_answer(pred) == normalize_answer(gold) if pred else False
-        nt   = len(tok_cot.encode(reasoning, add_special_tokens=False)) if reasoning else 0
-        return ok, pred is not None, nt, lt
+        def _ev_full_cot(item):
+            t0 = time.time()
+            pred, reasoning = run_cot(cot_model, tok_cot, item, device)
+            lt   = time.time() - t0
+            gold = item['answer'].split('####')[1].strip()
+            ok   = normalize_answer(pred) == normalize_answer(gold) if pred else False
+            nt   = len(tok_cot.encode(reasoning, add_special_tokens=False)) if reasoning else 0
+            return ok, pred is not None, nt, lt
 
-    c_list, f_list, tok_list, lat_list = _eval_loop(D_val, _ev_full_cot, 'full_cot')
-    full_cot_mean_tokens = sum(tok_list) / max(len(tok_list), 1)
-    r = _build_result('full_cot', model_tag, None, None, None, None,
-                      c_list, f_list, tok_list, lat_list, None, full_cot_mean_tokens)
-    results.append(r)
-    cond_elapsed = time.time() - cond_start
-    cond_times['full_cot'] = round(cond_elapsed, 2)
-    print(f"  ╚══ full_cot  acc={r.accuracy:.3f}  mean_tok={full_cot_mean_tokens:.1f}  "
-          f"({cond_elapsed:.0f}s) ══")
+        c_list, f_list, tok_list, lat_list = _eval_loop(D_val, _ev_full_cot, 'full_cot')
+        full_cot_mean_tokens = sum(tok_list) / max(len(tok_list), 1)
+        r = _build_result('full_cot', model_tag, None, None, None, None,
+                          c_list, f_list, tok_list, lat_list, None, full_cot_mean_tokens)
+        _append_result(r, results, results_dir)
+        cond_elapsed = time.time() - cond_start
+        cond_times['full_cot'] = round(cond_elapsed, 2)
+        print(f"  ╚══ full_cot  acc={r.accuracy:.3f}  mean_tok={full_cot_mean_tokens:.1f}  "
+              f"({cond_elapsed:.0f}s) ══")
+    else:
+        full_cot_mean_tokens = _saved_map['full_cot'].reasoning_tokens
+        print(f"  [RESUME] [{cond_idx:>2}] full_cot — skipping (already done)  "
+              f"mean_tok={full_cot_mean_tokens:.1f}")
 
-    # ── Pre-compute per-example budgets for all ratios ────────────────────────
+    # ── Pre-compute per-example budgets for all ratios (cached to disk) ─────────
     print(f"\n  ── Pre-computing per-example budgets for ratios={RATIOS} ──")
     budgets_by_ratio: dict[float, list[int]] = {}
     for ratio in RATIOS:
-        t_b = time.time()
-        print(f"    R={ratio}…", end='', flush=True)
-        budgets_by_ratio[ratio] = compute_per_example_budgets(
-            cot_model, tok_cot, D_val, device, ratio
-        )
-        mean_b = sum(budgets_by_ratio[ratio]) / len(budgets_by_ratio[ratio])
-        print(f" done  mean_budget={mean_b:.0f} tok  ({time.time()-t_b:.0f}s)")
+        _rtag_b   = f"R{int(ratio * 10)}"
+        _bud_path = os.path.join(results_dir, f'phase3_budgets_{_rtag_b}.json')
+        if os.path.exists(_bud_path):
+            with open(_bud_path) as _f:
+                budgets_by_ratio[ratio] = json.load(_f)
+            mean_b = sum(budgets_by_ratio[ratio]) / len(budgets_by_ratio[ratio])
+            print(f"    R={ratio}  [CACHED]  mean_budget={mean_b:.0f} tok")
+        else:
+            t_b = time.time()
+            print(f"    R={ratio}…", end='', flush=True)
+            budgets_by_ratio[ratio] = compute_per_example_budgets(
+                cot_model, tok_cot, D_val, device, ratio
+            )
+            mean_b = sum(budgets_by_ratio[ratio]) / len(budgets_by_ratio[ratio])
+            with open(_bud_path, 'w') as _f:
+                json.dump(budgets_by_ratio[ratio], _f)
+            print(f" done  mean_budget={mean_b:.0f} tok  ({time.time()-t_b:.0f}s)")
 
     # ── Per-ratio loop ─────────────────────────────────────────────────────────
     for ratio in RATIOS:
@@ -515,29 +570,33 @@ def run_phase3_evaluation(
         print(f"{'▓'*64}")
 
         # ── Trimmed CoT ───────────────────────────────────────────────────────
+        _trim_cond = f'trimmed_{rtag}'
         cond_idx += 1
-        cond_start = _cond_banner(cond_idx, f'Trimmed CoT  R={ratio}', t_phase)
-        _budgets_iter = iter(budgets)
+        if _trim_cond not in _done_conds:
+            cond_start = _cond_banner(cond_idx, f'Trimmed CoT  R={ratio}', t_phase)
+            _budgets_iter = iter(budgets)
 
-        def _ev_trimmed(item, _bi=_budgets_iter):
-            b  = next(_bi)
-            t0 = time.time()
-            pred, reasoning = run_trimmed_cot(cot_model, tok_cot, item, b, device)
-            lt   = time.time() - t0
-            gold = item['answer'].split('####')[1].strip()
-            ok   = normalize_answer(pred) == normalize_answer(gold) if pred else False
-            nt   = len(tok_cot.encode(reasoning or '', add_special_tokens=False))
-            return ok, pred is not None, nt, lt
+            def _ev_trimmed(item, _bi=_budgets_iter):
+                b  = next(_bi)
+                t0 = time.time()
+                pred, reasoning = run_trimmed_cot(cot_model, tok_cot, item, b, device)
+                lt   = time.time() - t0
+                gold = item['answer'].split('####')[1].strip()
+                ok   = normalize_answer(pred) == normalize_answer(gold) if pred else False
+                nt   = len(tok_cot.encode(reasoning or '', add_special_tokens=False))
+                return ok, pred is not None, nt, lt
 
-        c_list, f_list, tok_list, lat_list = _eval_loop(
-            D_val, _ev_trimmed, f'trimmed_{rtag}')
-        r = _build_result(f'trimmed_{rtag}', model_tag, ratio, None, None, None,
-                          c_list, f_list, tok_list, lat_list, None, full_cot_mean_tokens)
-        results.append(r)
-        cond_elapsed = time.time() - cond_start
-        cond_times[f'trimmed_{rtag}'] = round(cond_elapsed, 2)
-        print(f"  ╚══ trimmed_{rtag}  acc={r.accuracy:.3f}  "
-              f"mean_tok={r.reasoning_tokens:.1f}  ({cond_elapsed:.0f}s) ══")
+            c_list, f_list, tok_list, lat_list = _eval_loop(
+                D_val, _ev_trimmed, _trim_cond)
+            r = _build_result(_trim_cond, model_tag, ratio, None, None, None,
+                              c_list, f_list, tok_list, lat_list, None, full_cot_mean_tokens)
+            _append_result(r, results, results_dir)
+            cond_elapsed = time.time() - cond_start
+            cond_times[_trim_cond] = round(cond_elapsed, 2)
+            print(f"  ╚══ {_trim_cond}  acc={r.accuracy:.3f}  "
+                  f"mean_tok={r.reasoning_tokens:.1f}  ({cond_elapsed:.0f}s) ══")
+        else:
+            print(f"  [RESUME] [{cond_idx:>2}] {_trim_cond} — skipping (already done)")
 
         # ── Load CCoT model ───────────────────────────────────────────────────
         ccot_ckpt = os.path.join(checkpoints_dir, f'ccot_{rtag}')
@@ -554,24 +613,38 @@ def run_phase3_evaluation(
             return f"Question: {item['question']}\n\n[compress:{_r}]\n"
 
         # ── CCoT baseline ─────────────────────────────────────────────────────
+        _ccot_cond = f'ccot_{rtag}'
+        _ccot_correct_path = os.path.join(results_dir, f'phase3_ccot_correct_{rtag}.json')
         cond_idx += 1
-        cond_start = _cond_banner(cond_idx, f'CCoT baseline  R={ratio}', t_phase)
+        if _ccot_cond not in _done_conds:
+            cond_start = _cond_banner(cond_idx, f'CCoT baseline  R={ratio}', t_phase)
 
-        def _ev_ccot(item):
-            return _eval_one(ccot_model, tok_ccot, item, _ccot_prompt(item),
-                             None, None, device, max_new_tokens)
+            def _ev_ccot(item):
+                return _eval_one(ccot_model, tok_ccot, item, _ccot_prompt(item),
+                                 None, None, device, max_new_tokens)
 
-        c_list, f_list, tok_list, lat_list = _eval_loop(
-            D_val, _ev_ccot, f'ccot_{rtag}')
-        ccot_correct = list(c_list)
-        r = _build_result(f'ccot_{rtag}', model_tag, ratio, None, None, None,
-                          c_list, f_list, tok_list, lat_list, None, full_cot_mean_tokens)
-        results.append(r)
-        cond_elapsed = time.time() - cond_start
-        cond_times[f'ccot_{rtag}'] = round(cond_elapsed, 2)
-        ccot_acc = r.accuracy
-        print(f"  ╚══ ccot_{rtag}  acc={ccot_acc:.3f}  "
-              f"mean_tok={r.reasoning_tokens:.1f}  ({cond_elapsed:.0f}s) ══")
+            c_list, f_list, tok_list, lat_list = _eval_loop(
+                D_val, _ev_ccot, _ccot_cond)
+            ccot_correct = list(c_list)
+            r = _build_result(_ccot_cond, model_tag, ratio, None, None, None,
+                              c_list, f_list, tok_list, lat_list, None, full_cot_mean_tokens)
+            _append_result(r, results, results_dir)
+            with open(_ccot_correct_path, 'w') as _f:
+                json.dump(ccot_correct, _f)
+            cond_elapsed = time.time() - cond_start
+            cond_times[_ccot_cond] = round(cond_elapsed, 2)
+            ccot_acc = r.accuracy
+            print(f"  ╚══ {_ccot_cond}  acc={ccot_acc:.3f}  "
+                  f"mean_tok={r.reasoning_tokens:.1f}  ({cond_elapsed:.0f}s) ══")
+        else:
+            ccot_acc = _saved_map[_ccot_cond].accuracy
+            if os.path.exists(_ccot_correct_path):
+                with open(_ccot_correct_path) as _f:
+                    ccot_correct = json.load(_f)
+            else:
+                ccot_correct = []
+            print(f"  [RESUME] [{cond_idx:>2}] {_ccot_cond} — skipping  "
+                  f"acc={ccot_acc:.3f}")
 
         # ── Steered conditions per source ─────────────────────────────────────
         for source in SOURCES:
@@ -602,179 +675,207 @@ def run_phase3_evaluation(
             print(f"  └──────────────────────────────────────────────────────")
 
             # ── Random Noise ──────────────────────────────────────────────────
+            _noise_cond = f'noise_{rtag}_{source}'
             cond_idx += 1
-            cond_start = _cond_banner(
-                cond_idx, f'Random Noise  R={ratio} src={source}', t_phase)
-            _noise_fac = lambda b, _a=alpha: make_noise_hook(b, _a, device)
-
-            def _ev_noise(item, _nf=_noise_fac):
-                return _eval_one(ccot_model, tok_ccot, item, _ccot_prompt(item),
-                                 L_star, _nf, device, max_new_tokens,
-                                 boundary_fn=find_boundary_idx_ccot)
-
-            c_list, f_list, tok_list, lat_list = _eval_loop(
-                D_val, _ev_noise, f'noise_{rtag}_{source}')
-            r = _build_result(
-                f'noise_{rtag}_{source}', model_tag, ratio, source, 'noise', alpha,
-                c_list, f_list, tok_list, lat_list, ccot_correct, full_cot_mean_tokens)
-            results.append(r)
-            cond_elapsed = time.time() - cond_start
-            cond_times[f'noise_{rtag}_{source}'] = round(cond_elapsed, 2)
-            print(f"  ╚══ noise_{rtag}_{source}  acc={r.accuracy:.3f}  "
-                  f"flip={r.flip_rate:.3f}  Δ={r.accuracy-ccot_acc:+.3f}  "
-                  f"({cond_elapsed:.0f}s) ══")
-
-            # ── CCoT + DoM ────────────────────────────────────────────────────
-            cond_idx += 1
-            cond_start = _cond_banner(
-                cond_idx, f'CCoT+DoM  R={ratio} src={source}', t_phase)
-            _dom_fac = lambda b, _v=v_dom, _a=alpha: make_dom_hook(b, _v, _a, device)
-
-            def _ev_dom(item, _df=_dom_fac):
-                return _eval_one(ccot_model, tok_ccot, item, _ccot_prompt(item),
-                                 L_star, _df, device, max_new_tokens,
-                                 boundary_fn=find_boundary_idx_ccot)
-
-            c_list, f_list, tok_list, lat_list = _eval_loop(
-                D_val, _ev_dom, f'dom_{rtag}_{source}')
-            r = _build_result(
-                f'dom_{rtag}_{source}', model_tag, ratio, source, 'dom', alpha,
-                c_list, f_list, tok_list, lat_list, ccot_correct, full_cot_mean_tokens)
-            results.append(r)
-            cond_elapsed = time.time() - cond_start
-            cond_times[f'dom_{rtag}_{source}'] = round(cond_elapsed, 2)
-            print(f"  ╚══ dom_{rtag}_{source}  acc={r.accuracy:.3f}  "
-                  f"flip={r.flip_rate:.3f}  Δ={r.accuracy-ccot_acc:+.3f}  "
-                  f"({cond_elapsed:.0f}s) ══")
-
-            # ── CCoT + cPCA ───────────────────────────────────────────────────
-            if has_cpca:
-                cond_idx += 1
+            if _noise_cond not in _done_conds:
                 cond_start = _cond_banner(
-                    cond_idx, f'CCoT+cPCA  R={ratio} src={source}', t_phase)
-                _cpca_fac = lambda b, _U=U_cpca, _a=alpha: make_cpca_hook(b, _U, _a, device)
+                    cond_idx, f'Random Noise  R={ratio} src={source}', t_phase)
+                _noise_fac = lambda b, _a=alpha: make_noise_hook(b, _a, device)
 
-                def _ev_cpca(item, _cf=_cpca_fac):
-                    return _eval_one(ccot_model, tok_ccot, item, _ccot_prompt(item),
-                                     L_star, _cf, device, max_new_tokens,
-                                     boundary_fn=find_boundary_idx_ccot)
-
-                c_list, f_list, tok_list, lat_list = _eval_loop(
-                    D_val, _ev_cpca, f'cpca_{rtag}_{source}')
-                r = _build_result(
-                    f'cpca_{rtag}_{source}', model_tag, ratio, source, 'cpca', alpha,
-                    c_list, f_list, tok_list, lat_list, ccot_correct, full_cot_mean_tokens)
-                results.append(r)
-                cond_elapsed = time.time() - cond_start
-                cond_times[f'cpca_{rtag}_{source}'] = round(cond_elapsed, 2)
-                print(f"  ╚══ cpca_{rtag}_{source}  acc={r.accuracy:.3f}  "
-                      f"flip={r.flip_rate:.3f}  Δ={r.accuracy-ccot_acc:+.3f}  "
-                      f"({cond_elapsed:.0f}s) ══")
-
-            # ── Control A: Shuffled DoM ───────────────────────────────────────
-            try:
-                v_shuf = _load_shuffled_vector(vectors_dir, source, 'dom')
-                cond_idx += 1
-                cond_start = _cond_banner(
-                    cond_idx,
-                    f'Shuffled DoM [ctrl-A]  R={ratio} src={source}', t_phase)
-                _sdom_fac = lambda b, _v=v_shuf, _a=alpha: make_dom_hook(b, _v, _a, device)
-
-                def _ev_shuf_dom(item, _sf=_sdom_fac):
-                    return _eval_one(ccot_model, tok_ccot, item, _ccot_prompt(item),
-                                     L_star, _sf, device, max_new_tokens,
-                                     boundary_fn=find_boundary_idx_ccot)
-
-                c_list, f_list, tok_list, lat_list = _eval_loop(
-                    D_val, _ev_shuf_dom, f'shuf_dom_{rtag}_{source}')
-                r = _build_result(
-                    f'shuf_dom_{rtag}_{source}', model_tag, ratio,
-                    source, 'shuf_dom', alpha,
-                    c_list, f_list, tok_list, lat_list, ccot_correct, full_cot_mean_tokens)
-                results.append(r)
-                cond_elapsed = time.time() - cond_start
-                cond_times[f'shuf_dom_{rtag}_{source}'] = round(cond_elapsed, 2)
-                print(f"  ╚══ shuf_dom_{rtag}_{source}  acc={r.accuracy:.3f}  "
-                      f"Δ={r.accuracy-ccot_acc:+.3f}  ({cond_elapsed:.0f}s) ══")
-            except FileNotFoundError:
-                print(f"  [SKIP] Shuffled DoM vector missing for source={source}")
-
-            # ── Control B: Negative DoM ───────────────────────────────────────
-            cond_idx += 1
-            cond_start = _cond_banner(
-                cond_idx,
-                f'Negative DoM [ctrl-B]  R={ratio} src={source}', t_phase)
-            _neg_dom_fac = lambda b, _v=v_dom, _a=alpha: make_dom_hook(b, _v, -_a, device)
-
-            def _ev_neg_dom(item, _nf=_neg_dom_fac):
-                return _eval_one(ccot_model, tok_ccot, item, _ccot_prompt(item),
-                                 L_star, _nf, device, max_new_tokens,
-                                 boundary_fn=find_boundary_idx_ccot)
-
-            c_list, f_list, tok_list, lat_list = _eval_loop(
-                D_val, _ev_neg_dom, f'neg_dom_{rtag}_{source}')
-            r = _build_result(
-                f'neg_dom_{rtag}_{source}', model_tag, ratio,
-                source, 'neg_dom', alpha,
-                c_list, f_list, tok_list, lat_list, ccot_correct, full_cot_mean_tokens)
-            results.append(r)
-            cond_elapsed = time.time() - cond_start
-            cond_times[f'neg_dom_{rtag}_{source}'] = round(cond_elapsed, 2)
-            print(f"  ╚══ neg_dom_{rtag}_{source}  acc={r.accuracy:.3f}  "
-                  f"Δ={r.accuracy-ccot_acc:+.3f}  ({cond_elapsed:.0f}s) ══")
-
-            if has_cpca:
-                # ── Control C: Negative cPCA ──────────────────────────────────
-                cond_idx += 1
-                cond_start = _cond_banner(
-                    cond_idx,
-                    f'Negative cPCA [ctrl-C]  R={ratio} src={source}', t_phase)
-                _neg_cpca_fac = lambda b, _U=U_cpca, _a=alpha: make_cpca_hook(b, _U, -_a, device)
-
-                def _ev_neg_cpca(item, _nf=_neg_cpca_fac):
+                def _ev_noise(item, _nf=_noise_fac):
                     return _eval_one(ccot_model, tok_ccot, item, _ccot_prompt(item),
                                      L_star, _nf, device, max_new_tokens,
                                      boundary_fn=find_boundary_idx_ccot)
 
                 c_list, f_list, tok_list, lat_list = _eval_loop(
-                    D_val, _ev_neg_cpca, f'neg_cpca_{rtag}_{source}')
+                    D_val, _ev_noise, _noise_cond)
                 r = _build_result(
-                    f'neg_cpca_{rtag}_{source}', model_tag, ratio,
-                    source, 'neg_cpca', alpha,
+                    _noise_cond, model_tag, ratio, source, 'noise', alpha,
                     c_list, f_list, tok_list, lat_list, ccot_correct, full_cot_mean_tokens)
-                results.append(r)
+                _append_result(r, results, results_dir)
                 cond_elapsed = time.time() - cond_start
-                cond_times[f'neg_cpca_{rtag}_{source}'] = round(cond_elapsed, 2)
-                print(f"  ╚══ neg_cpca_{rtag}_{source}  acc={r.accuracy:.3f}  "
-                      f"Δ={r.accuracy-ccot_acc:+.3f}  ({cond_elapsed:.0f}s) ══")
+                cond_times[_noise_cond] = round(cond_elapsed, 2)
+                print(f"  ╚══ {_noise_cond}  acc={r.accuracy:.3f}  "
+                      f"flip={r.flip_rate:.3f}  Δ={r.accuracy-ccot_acc:+.3f}  "
+                      f"({cond_elapsed:.0f}s) ══")
+            else:
+                print(f"  [RESUME] [{cond_idx:>2}] {_noise_cond} — skipping")
 
-                # ── Control D: Shuffled cPCA ──────────────────────────────────
-                try:
-                    U_shuf_cpca = _load_shuffled_vector(
-                        vectors_dir, source, 'cpca', r_final)
-                    cond_idx += 1
+            # ── CCoT + DoM ────────────────────────────────────────────────────
+            _dom_cond = f'dom_{rtag}_{source}'
+            cond_idx += 1
+            if _dom_cond not in _done_conds:
+                cond_start = _cond_banner(
+                    cond_idx, f'CCoT+DoM  R={ratio} src={source}', t_phase)
+                _dom_fac = lambda b, _v=v_dom, _a=alpha: make_dom_hook(b, _v, _a, device)
+
+                def _ev_dom(item, _df=_dom_fac):
+                    return _eval_one(ccot_model, tok_ccot, item, _ccot_prompt(item),
+                                     L_star, _df, device, max_new_tokens,
+                                     boundary_fn=find_boundary_idx_ccot)
+
+                c_list, f_list, tok_list, lat_list = _eval_loop(
+                    D_val, _ev_dom, _dom_cond)
+                r = _build_result(
+                    _dom_cond, model_tag, ratio, source, 'dom', alpha,
+                    c_list, f_list, tok_list, lat_list, ccot_correct, full_cot_mean_tokens)
+                _append_result(r, results, results_dir)
+                cond_elapsed = time.time() - cond_start
+                cond_times[_dom_cond] = round(cond_elapsed, 2)
+                print(f"  ╚══ {_dom_cond}  acc={r.accuracy:.3f}  "
+                      f"flip={r.flip_rate:.3f}  Δ={r.accuracy-ccot_acc:+.3f}  "
+                      f"({cond_elapsed:.0f}s) ══")
+            else:
+                print(f"  [RESUME] [{cond_idx:>2}] {_dom_cond} — skipping")
+
+            # ── CCoT + cPCA ───────────────────────────────────────────────────
+            if has_cpca:
+                _cpca_cond = f'cpca_{rtag}_{source}'
+                cond_idx += 1
+                if _cpca_cond not in _done_conds:
+                    cond_start = _cond_banner(
+                        cond_idx, f'CCoT+cPCA  R={ratio} src={source}', t_phase)
+                    _cpca_fac = lambda b, _U=U_cpca, _a=alpha: make_cpca_hook(b, _U, _a, device)
+
+                    def _ev_cpca(item, _cf=_cpca_fac):
+                        return _eval_one(ccot_model, tok_ccot, item, _ccot_prompt(item),
+                                         L_star, _cf, device, max_new_tokens,
+                                         boundary_fn=find_boundary_idx_ccot)
+
+                    c_list, f_list, tok_list, lat_list = _eval_loop(
+                        D_val, _ev_cpca, _cpca_cond)
+                    r = _build_result(
+                        _cpca_cond, model_tag, ratio, source, 'cpca', alpha,
+                        c_list, f_list, tok_list, lat_list, ccot_correct, full_cot_mean_tokens)
+                    _append_result(r, results, results_dir)
+                    cond_elapsed = time.time() - cond_start
+                    cond_times[_cpca_cond] = round(cond_elapsed, 2)
+                    print(f"  ╚══ {_cpca_cond}  acc={r.accuracy:.3f}  "
+                          f"flip={r.flip_rate:.3f}  Δ={r.accuracy-ccot_acc:+.3f}  "
+                          f"({cond_elapsed:.0f}s) ══")
+                else:
+                    print(f"  [RESUME] [{cond_idx:>2}] {_cpca_cond} — skipping")
+
+            # ── Control A: Shuffled DoM ───────────────────────────────────────
+            try:
+                v_shuf = _load_shuffled_vector(vectors_dir, source, 'dom')
+                _sdom_cond = f'shuf_dom_{rtag}_{source}'
+                cond_idx += 1
+                if _sdom_cond not in _done_conds:
                     cond_start = _cond_banner(
                         cond_idx,
-                        f'Shuffled cPCA [ctrl-D]  R={ratio} src={source}', t_phase)
-                    _scpca_fac = lambda b, _U=U_shuf_cpca, _a=alpha: (
-                        make_cpca_hook(b, _U, _a, device))
+                        f'Shuffled DoM [ctrl-A]  R={ratio} src={source}', t_phase)
+                    _sdom_fac = lambda b, _v=v_shuf, _a=alpha: make_dom_hook(b, _v, _a, device)
 
-                    def _ev_shuf_cpca(item, _sf=_scpca_fac):
+                    def _ev_shuf_dom(item, _sf=_sdom_fac):
                         return _eval_one(ccot_model, tok_ccot, item, _ccot_prompt(item),
                                          L_star, _sf, device, max_new_tokens,
                                          boundary_fn=find_boundary_idx_ccot)
 
                     c_list, f_list, tok_list, lat_list = _eval_loop(
-                        D_val, _ev_shuf_cpca, f'shuf_cpca_{rtag}_{source}')
+                        D_val, _ev_shuf_dom, _sdom_cond)
                     r = _build_result(
-                        f'shuf_cpca_{rtag}_{source}', model_tag, ratio,
-                        source, 'shuf_cpca', alpha,
+                        _sdom_cond, model_tag, ratio,
+                        source, 'shuf_dom', alpha,
                         c_list, f_list, tok_list, lat_list, ccot_correct, full_cot_mean_tokens)
-                    results.append(r)
+                    _append_result(r, results, results_dir)
                     cond_elapsed = time.time() - cond_start
-                    cond_times[f'shuf_cpca_{rtag}_{source}'] = round(cond_elapsed, 2)
-                    print(f"  ╚══ shuf_cpca_{rtag}_{source}  acc={r.accuracy:.3f}  "
+                    cond_times[_sdom_cond] = round(cond_elapsed, 2)
+                    print(f"  ╚══ {_sdom_cond}  acc={r.accuracy:.3f}  "
                           f"Δ={r.accuracy-ccot_acc:+.3f}  ({cond_elapsed:.0f}s) ══")
+                else:
+                    print(f"  [RESUME] [{cond_idx:>2}] {_sdom_cond} — skipping")
+            except FileNotFoundError:
+                print(f"  [SKIP] Shuffled DoM vector missing for source={source}")
+
+            # ── Control B: Negative DoM ───────────────────────────────────────
+            _neg_dom_cond = f'neg_dom_{rtag}_{source}'
+            cond_idx += 1
+            if _neg_dom_cond not in _done_conds:
+                cond_start = _cond_banner(
+                    cond_idx,
+                    f'Negative DoM [ctrl-B]  R={ratio} src={source}', t_phase)
+                _neg_dom_fac = lambda b, _v=v_dom, _a=alpha: make_dom_hook(b, _v, -_a, device)
+
+                def _ev_neg_dom(item, _nf=_neg_dom_fac):
+                    return _eval_one(ccot_model, tok_ccot, item, _ccot_prompt(item),
+                                     L_star, _nf, device, max_new_tokens,
+                                     boundary_fn=find_boundary_idx_ccot)
+
+                c_list, f_list, tok_list, lat_list = _eval_loop(
+                    D_val, _ev_neg_dom, _neg_dom_cond)
+                r = _build_result(
+                    _neg_dom_cond, model_tag, ratio,
+                    source, 'neg_dom', alpha,
+                    c_list, f_list, tok_list, lat_list, ccot_correct, full_cot_mean_tokens)
+                _append_result(r, results, results_dir)
+                cond_elapsed = time.time() - cond_start
+                cond_times[_neg_dom_cond] = round(cond_elapsed, 2)
+                print(f"  ╚══ {_neg_dom_cond}  acc={r.accuracy:.3f}  "
+                      f"Δ={r.accuracy-ccot_acc:+.3f}  ({cond_elapsed:.0f}s) ══")
+            else:
+                print(f"  [RESUME] [{cond_idx:>2}] {_neg_dom_cond} — skipping")
+
+            if has_cpca:
+                # ── Control C: Negative cPCA ──────────────────────────────────
+                _neg_cpca_cond = f'neg_cpca_{rtag}_{source}'
+                cond_idx += 1
+                if _neg_cpca_cond not in _done_conds:
+                    cond_start = _cond_banner(
+                        cond_idx,
+                        f'Negative cPCA [ctrl-C]  R={ratio} src={source}', t_phase)
+                    _neg_cpca_fac = lambda b, _U=U_cpca, _a=alpha: make_cpca_hook(b, _U, -_a, device)
+
+                    def _ev_neg_cpca(item, _nf=_neg_cpca_fac):
+                        return _eval_one(ccot_model, tok_ccot, item, _ccot_prompt(item),
+                                         L_star, _nf, device, max_new_tokens,
+                                         boundary_fn=find_boundary_idx_ccot)
+
+                    c_list, f_list, tok_list, lat_list = _eval_loop(
+                        D_val, _ev_neg_cpca, _neg_cpca_cond)
+                    r = _build_result(
+                        _neg_cpca_cond, model_tag, ratio,
+                        source, 'neg_cpca', alpha,
+                        c_list, f_list, tok_list, lat_list, ccot_correct, full_cot_mean_tokens)
+                    _append_result(r, results, results_dir)
+                    cond_elapsed = time.time() - cond_start
+                    cond_times[_neg_cpca_cond] = round(cond_elapsed, 2)
+                    print(f"  ╚══ {_neg_cpca_cond}  acc={r.accuracy:.3f}  "
+                          f"Δ={r.accuracy-ccot_acc:+.3f}  ({cond_elapsed:.0f}s) ══")
+                else:
+                    print(f"  [RESUME] [{cond_idx:>2}] {_neg_cpca_cond} — skipping")
+
+                # ── Control D: Shuffled cPCA ──────────────────────────────────
+                try:
+                    U_shuf_cpca = _load_shuffled_vector(
+                        vectors_dir, source, 'cpca', r_final)
+                    _scpca_cond = f'shuf_cpca_{rtag}_{source}'
+                    cond_idx += 1
+                    if _scpca_cond not in _done_conds:
+                        cond_start = _cond_banner(
+                            cond_idx,
+                            f'Shuffled cPCA [ctrl-D]  R={ratio} src={source}', t_phase)
+                        _scpca_fac = lambda b, _U=U_shuf_cpca, _a=alpha: (
+                            make_cpca_hook(b, _U, _a, device))
+
+                        def _ev_shuf_cpca(item, _sf=_scpca_fac):
+                            return _eval_one(ccot_model, tok_ccot, item, _ccot_prompt(item),
+                                             L_star, _sf, device, max_new_tokens,
+                                             boundary_fn=find_boundary_idx_ccot)
+
+                        c_list, f_list, tok_list, lat_list = _eval_loop(
+                            D_val, _ev_shuf_cpca, _scpca_cond)
+                        r = _build_result(
+                            _scpca_cond, model_tag, ratio,
+                            source, 'shuf_cpca', alpha,
+                            c_list, f_list, tok_list, lat_list, ccot_correct, full_cot_mean_tokens)
+                        _append_result(r, results, results_dir)
+                        cond_elapsed = time.time() - cond_start
+                        cond_times[_scpca_cond] = round(cond_elapsed, 2)
+                        print(f"  ╚══ {_scpca_cond}  acc={r.accuracy:.3f}  "
+                              f"Δ={r.accuracy-ccot_acc:+.3f}  ({cond_elapsed:.0f}s) ══")
+                    else:
+                        print(f"  [RESUME] [{cond_idx:>2}] {_scpca_cond} — skipping")
                 except FileNotFoundError:
                     print(f"  [SKIP] Shuffled cPCA missing for source={source}")
 
@@ -788,43 +889,42 @@ def run_phase3_evaluation(
                 L_star_base = meta.get('base_best_layer',
                                        meta.get('ccot_best_layer', 14))
 
+            _tdom_cond = f'trimmed_dom_{rtag}'
             cond_idx += 1
-            cond_start = _cond_banner(
-                cond_idx, f'Trimmed+DoM  R={ratio}  L*={L_star_base}  α={alpha_base:.4f}',
-                t_phase)
-            print(f"    mean_budget={sum(budgets)/len(budgets):.0f} tok")
-            _trim_dom_fac = lambda b, _v=v_base_dom, _a=alpha_base: (
-                make_dom_hook(b, _v, _a, device))
-            _cot_prompt_fn = lambda item: f"Question: {item['question']}\n\nReasoning:"
-            _budgets_iter2 = iter(budgets)
+            if _tdom_cond not in _done_conds:
+                cond_start = _cond_banner(
+                    cond_idx, f'Trimmed+DoM  R={ratio}  L*={L_star_base}  α={alpha_base:.4f}',
+                    t_phase)
+                print(f"    mean_budget={sum(budgets)/len(budgets):.0f} tok")
+                _trim_dom_fac = lambda b, _v=v_base_dom, _a=alpha_base: (
+                    make_dom_hook(b, _v, _a, device))
+                _cot_prompt_fn = lambda item: f"Question: {item['question']}\n\nReasoning:"
+                _budgets_iter2 = iter(budgets)
 
-            def _ev_trim_dom(item, _tf=_trim_dom_fac, _bi=_budgets_iter2):
-                b = next(_bi)
-                return _eval_one(cot_model, tok_cot, item, _cot_prompt_fn(item),
-                                 L_star_base, _tf, device, b,
-                                 boundary_fn=find_boundary_idx_base)
+                def _ev_trim_dom(item, _tf=_trim_dom_fac, _bi=_budgets_iter2):
+                    b = next(_bi)
+                    return _eval_one(cot_model, tok_cot, item, _cot_prompt_fn(item),
+                                     L_star_base, _tf, device, b,
+                                     boundary_fn=find_boundary_idx_base)
 
-            c_list, f_list, tok_list, lat_list = _eval_loop(
-                D_val, _ev_trim_dom, f'trimmed_dom_{rtag}')
-            r = _build_result(
-                f'trimmed_dom_{rtag}', model_tag, ratio, 'base', 'dom', alpha_base,
-                c_list, f_list, tok_list, lat_list, ccot_correct, full_cot_mean_tokens)
-            results.append(r)
-            cond_elapsed = time.time() - cond_start
-            cond_times[f'trimmed_dom_{rtag}'] = round(cond_elapsed, 2)
-            print(f"  ╚══ trimmed_dom_{rtag}  acc={r.accuracy:.3f}  "
-                  f"flip={r.flip_rate:.3f}  Δ={r.accuracy-ccot_acc:+.3f}  "
-                  f"({cond_elapsed:.0f}s) ══")
+                c_list, f_list, tok_list, lat_list = _eval_loop(
+                    D_val, _ev_trim_dom, _tdom_cond)
+                r = _build_result(
+                    _tdom_cond, model_tag, ratio, 'base', 'dom', alpha_base,
+                    c_list, f_list, tok_list, lat_list, ccot_correct, full_cot_mean_tokens)
+                _append_result(r, results, results_dir)
+                cond_elapsed = time.time() - cond_start
+                cond_times[_tdom_cond] = round(cond_elapsed, 2)
+                print(f"  ╚══ {_tdom_cond}  acc={r.accuracy:.3f}  "
+                      f"flip={r.flip_rate:.3f}  Δ={r.accuracy-ccot_acc:+.3f}  "
+                      f"({cond_elapsed:.0f}s) ══")
+            else:
+                print(f"  [RESUME] [{cond_idx:>2}] {_tdom_cond} — skipping")
         except FileNotFoundError:
             print(f"  [SKIP] Base DoM vector missing — skipping Trimmed+DoM at R={ratio}")
 
-        # ── Interim save after this ratio ─────────────────────────────────────
-        interim_path = os.path.join(results_dir, 'phase3_val_interim.json')
-        with open(interim_path, 'w') as f:
-            json.dump([asdict(r) for r in results], f, indent=2)
         n_this_ratio = len(results) - ratio_results_start
-        print(f"\n  [interim] {n_this_ratio} new conditions  "
-              f"{len(results)} total → {interim_path}")
+        print(f"\n  [ratio={ratio}] {n_this_ratio} conditions done  {len(results)} total")
 
         # ── Ratio summary line ────────────────────────────────────────────────
         ratio_results = results[ratio_results_start:]

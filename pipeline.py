@@ -194,10 +194,11 @@ def _run_phase3(configs_to_run, models_to_run, splits, device):
                     model_tag=model_tag,
                     base_model_id=base_id,
                     checkpoints_dir=ckpt_dir,
-                    D_val=D_val,
+                    D_val=D_val[:300],
                     vectors_dir=vectors_dir,
                     results_dir=res_dir,
                     device=device,
+                    max_new_tokens=128,
                 )
                 selection = select_best_steered_config(res_dir, model_tag)
                 if selection:

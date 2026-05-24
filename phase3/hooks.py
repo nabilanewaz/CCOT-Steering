@@ -35,7 +35,8 @@ def make_cpca_hook(boundary_idx: int, U_truth: torch.Tensor,
         h_t   = h[:, boundary_idx, :]
         sigma = h_t.norm(dim=-1, keepdim=True) / (h_t.shape[-1] ** 0.5)
         h_hat = h_t / (h_t.norm(dim=-1, keepdim=True) + 1e-8)
-        proj  = (U @ (U.T @ h_hat.T)).T
+        U_    = U.to(h_t.dtype)
+        proj  = (U_ @ (U_.T @ h_hat.T)).T
         h[:, boundary_idx, :] = h_t + alpha * sigma * proj
         return (h,) + output[1:]
 

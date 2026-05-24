@@ -708,7 +708,7 @@ def _ph4_plot_flip_heatmap(flip_matrices, model_tag, plots_dir):
         print(f"  [plot] flip_matrix_heatmap failed: {e}"); plt.close('all')
 
 
-def _ph4_plot_alpha_sweep(sweep, alpha_star, model_tag, plots_dir):
+def _ph4_plot_alpha_sweep(sweep, alpha_star, model_tag, plots_dir, suffix=''):
     plt = _mpl()
     if plt is None or not sweep:
         return
@@ -717,6 +717,7 @@ def _ph4_plot_alpha_sweep(sweep, alpha_star, model_tag, plots_dir):
         accs   = [s['accuracy'] for s in sweep]
         aligns = [s.get('truth_alignment', 0.0) for s in sweep]
         cohs   = [s.get('trajectory_coherence', 0.0) for s in sweep]
+        method_label = suffix.lstrip('_').upper() if suffix else 'DoM'
         fig, ax1 = plt.subplots(figsize=(9, 5))
         ax2 = ax1.twinx()
         l1, = ax1.plot(alphas, accs,   'b-o',  lw=2,   ms=6,  label='Accuracy')
@@ -725,15 +726,16 @@ def _ph4_plot_alpha_sweep(sweep, alpha_star, model_tag, plots_dir):
         ax1.axvline(alpha_star, color='purple', ls=':', lw=1.5, label=f'α*={alpha_star:.2f}')
         ax1.set_xlabel('α'); ax1.set_ylabel('Accuracy', color='b')
         ax2.set_ylabel('Latent score', color='gray')
-        ax1.set_title(f'Alpha Sweep on D_test — {model_tag}')
+        ax1.set_title(f'Alpha Sweep ({method_label}) on D_test — {model_tag}')
         ax1.legend(loc='lower left', fontsize=8)
         ax2.legend(handles=[l2, l3], loc='upper right', fontsize=8)
         ax1.grid(alpha=0.3); plt.tight_layout()
-        path = os.path.join(plots_dir, 'alpha_sweep.png')
+        fname = f'alpha_sweep{suffix}.png'
+        path = os.path.join(plots_dir, fname)
         plt.savefig(path, dpi=150, bbox_inches='tight'); plt.close()
-        print(f"  [plot] alpha_sweep.png → {path}")
+        print(f"  [plot] {fname} → {path}")
     except Exception as e:
-        print(f"  [plot] alpha_sweep failed: {e}"); plt.close('all')
+        print(f"  [plot] alpha_sweep{suffix} failed: {e}"); plt.close('all')
 
 
 def _ph4_plot_latency(metrics, model_tag, plots_dir):
@@ -959,10 +961,11 @@ def _save_table_file(fn, path: str, *args, **kwargs) -> None:
 
 def _save_all_ph4_tables(
     all_metrics, condition_cis, paired_cis,
-    flip_matrices, flip_grid, alpha_sweep,
+    flip_matrices, flip_grid, alpha_sweeps,
     ccot_cond, dom_cond, noise_cond,
     tables_dir, model_tag,
 ) -> None:
+    """alpha_sweeps: dict mapping method name (e.g. 'dom', 'cpca') to sweep list."""
     os.makedirs(tables_dir, exist_ok=True)
     px = os.path.join(tables_dir, model_tag)
     _save_table_file(print_accuracy_table,       f'{px}_accuracy.txt',       all_metrics)
@@ -975,12 +978,14 @@ def _save_all_ph4_tables(
                      all_metrics, flip_matrices, dom_cond, noise_cond, ccot_cond)
     _save_table_file(print_efficiency_table,     f'{px}_efficiency.txt',     all_metrics)
     _save_table_file(_print_flip_grid,           f'{px}_flip_grid.txt',      flip_grid)
-    if alpha_sweep:
-        path = f'{px}_alpha_sweep.txt'
+    for method, sweep in (alpha_sweeps or {}).items():
+        if not sweep:
+            continue
+        path = f'{px}_alpha_sweep_{method}.txt'
         with open(path, 'w', encoding='utf-8') as f:
-            f.write(f"Alpha sweep — {model_tag}\n{'─'*52}\n")
+            f.write(f"Alpha sweep ({method.upper()}) — {model_tag}\n{'─'*52}\n")
             f.write(f"{'Alpha':>8}  {'Accuracy':>9}  {'TruthAlign':>11}  {'TrajCoh':>9}\n")
-            for s in alpha_sweep:
+            for s in sweep:
                 f.write(f"{s['alpha']:>8.2f}  {s['accuracy']:>9.3f}  "
                         f"{s.get('truth_alignment', 0.0):>11.4f}  "
                         f"{s.get('trajectory_coherence', 0.0):>9.4f}\n")
@@ -1222,10 +1227,13 @@ def run_alpha_sweep_test(
     boundary_fn,
     alphas: list = None,
     n_sub: int = 100,
+    method: str = 'dom',
+    U_cpca: torch.Tensor = None,
 ) -> list[dict]:
     """
     Diagnostic α sweep on D_test subset. No hyperparameter is changed after this.
-    Uses DoM steering across a grid of alpha values.
+    method='dom'  → adds α * v_truth at L_star
+    method='cpca' → adds α * U_cpca @ U_cpca.T @ h at L_star (requires U_cpca)
     """
     if alphas is None:
         alphas = [0.0, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0]
@@ -1233,7 +1241,7 @@ def run_alpha_sweep_test(
     D_sub = D_test[:min(n_sub, len(D_test))]
     bar = '─' * 56
     print(f"\n{bar}")
-    print(f"  [PH4] α sweep on D_test subset")
+    print(f"  [PH4] α sweep on D_test subset  method={method}")
     print(f"  model_tag  : {model_tag}")
     print(f"  n_sub      : {len(D_sub)}  (of {len(D_test)})")
     print(f"  alphas     : {alphas}")
@@ -1264,7 +1272,10 @@ def run_alpha_sweep_test(
                     b_idx = boundary_fn(probe_ids, tokenizer)
                 except Exception:
                     b_idx = max(0, enc['input_ids'].shape[1] - 1)
-                hook_fn = make_dom_hook(b_idx, v_truth, a, device)
+                if method == 'cpca' and U_cpca is not None:
+                    hook_fn = make_cpca_hook(b_idx, U_cpca, a, device)
+                else:
+                    hook_fn = make_dom_hook(b_idx, v_truth, a, device)
                 ex = run_steered_with_metrics(
                     model, tokenizer, prompt, item,
                     hook_fn, L_star, v_truth, device,
@@ -1457,7 +1468,7 @@ def save_final_results(
             'flip_matrices':  [_serialize_flip_matrix(fm)
                                for fm in data['flip_matrices']],
             'flip_grid':      data.get('flip_grid', {}),
-            'alpha_sweep':    data.get('alpha_sweep', []),
+            'alpha_sweep':    data.get('alpha_sweep', {}),
             'locked_config':  data.get('locked_config', {}),
             'condition_cis':  {k: _ser_br(v)
                                for k, v in data.get('condition_cis', {}).items()},
@@ -1594,7 +1605,8 @@ def run_final_evaluation(
 
         all_preds:   dict = {}
         all_metrics: dict = {}
-        sweep        = []
+        dom_sweep    = []
+        cpca_sweep   = []
         cond_idx     = 0
 
         # ── Phase A: CoT model ─────────────────────────────────────────────────
@@ -1882,13 +1894,25 @@ def run_final_evaluation(
                     all_preds[cpca_cond]   = [e.correct for e in exs]
                     _ph4_cond_done(cpca_cond, m, cond_start)
 
-                # ── Alpha sweep (diagnostic) ──────────────────────────────────
-                sweep = run_alpha_sweep_test(
+                # ── Alpha sweep (diagnostic) — DoM ───────────────────────────
+                dom_sweep = run_alpha_sweep_test(
                     ccot_model, tok_ccot, D_test,
                     v_truth, L_star, alpha_star, device, model_tag,
                     prompt_fn=_ccot_prompt,
                     boundary_fn=find_boundary_idx_ccot,
+                    method='dom',
                 )
+                # ── Alpha sweep (diagnostic) — cPCA ──────────────────────────
+                cpca_sweep = []
+                if has_cpca and U_cpca is not None:
+                    cpca_sweep = run_alpha_sweep_test(
+                        ccot_model, tok_ccot, D_test,
+                        v_truth, L_star, alpha_star, device, model_tag,
+                        prompt_fn=_ccot_prompt,
+                        boundary_fn=find_boundary_idx_ccot,
+                        method='cpca',
+                        U_cpca=U_cpca,
+                    )
 
             del ccot_model
             if torch.cuda.is_available():
@@ -1935,7 +1959,8 @@ def run_final_evaluation(
         print(f"\n  ── Saving tables → {tables_dir}/ ──")
         _save_all_ph4_tables(
             all_metrics, condition_cis, paired_cis,
-            flip_matrices, flip_grid, sweep,
+            flip_matrices, flip_grid,
+            {'dom': dom_sweep, 'cpca': cpca_sweep},
             ccot_c, dom_c, noise_c,
             tables_dir, model_tag,
         )
@@ -1945,7 +1970,8 @@ def run_final_evaluation(
         _ph4_plot_accuracy_ci(all_metrics, condition_cis, model_tag, plots_dir)
         _ph4_plot_mechanism_gain(all_metrics, ccot_c, model_tag, plots_dir)
         _ph4_plot_flip_heatmap(flip_matrices, model_tag, plots_dir)
-        _ph4_plot_alpha_sweep(sweep, alpha_star, model_tag, plots_dir)
+        _ph4_plot_alpha_sweep(dom_sweep,  alpha_star, model_tag, plots_dir, suffix='_dom')
+        _ph4_plot_alpha_sweep(cpca_sweep, alpha_star, model_tag, plots_dir, suffix='_cpca')
         _ph4_plot_latency(all_metrics, model_tag, plots_dir)
         _ph4_plot_token_efficiency(all_metrics, model_tag, plots_dir)
         _ph4_plot_latent_metrics(all_metrics, model_tag, plots_dir)
@@ -1980,7 +2006,7 @@ def run_final_evaluation(
                 'significant': br.significant,
             } for k, br in paired_cis.items()},
             'flip_matrices': [_serialize_flip_matrix(fm) for fm in flip_matrices],
-            'alpha_sweep':   sweep,
+            'alpha_sweep':   {'dom': dom_sweep, 'cpca': cpca_sweep},
             'elapsed_s':     round(time.time() - t_model, 2),
         }
         diag_path = os.path.join(out_dir, f'{model_tag}_diagnostics.json')
@@ -1996,7 +2022,7 @@ def run_final_evaluation(
             'metrics':        all_metrics,
             'flip_matrices':  flip_matrices,
             'flip_grid':      flip_grid,
-            'alpha_sweep':    sweep,
+            'alpha_sweep':    {'dom': dom_sweep, 'cpca': cpca_sweep},
             'locked_config':  best_cfg,
             'condition_cis':  condition_cis,
             'paired_cis':     paired_cis,
