@@ -33,7 +33,7 @@ from utils.dataset_paths import (
 from phase1.compress import build_ccot_cache, load_cache
 from phase1.train import train_cot, train_ccot
 from phase1.evaluate import run_phase1_evaluation, print_comparison_table
-from phase2.run import run_phase2_all_sources
+from phase2.run import run_phase2_all_sources, run_iti_phase2
 from phase3.evaluate import run_phase3_evaluation
 from phase3.select import select_best_steered_config
 
@@ -171,6 +171,42 @@ def _run_phase2(configs_to_run, models_to_run, splits, device):
                 )
             else:
                 print(f"[{cfg_id}][{model_tag}] Vectors exist — skipping")
+
+            # Phase 2.5: ITI per-head collection (runs after standard Phase 2)
+            from phase2.loaders import load_ccot_frozen, find_boundary_idx_ccot
+            import json as _jj
+            _iti_path = os.path.join(vectors_dir, 'ccot_iti_heads.pt')
+            if not _done(_iti_path):
+                print(f"\n[{cfg_id}][{model_tag}] Phase 2.5: ITI head collection")
+                _meta_path = os.path.join(vectors_dir, 'phase2_meta.json')
+                if _done(_meta_path):
+                    with open(_meta_path) as _mf:
+                        _meta = _jj.load(_mf)
+                    _ratio_int = _meta.get('best_ccot_ratio', 6)
+                    _ccot_ckpt = os.path.join(ckpt_dir, f'ccot_R{_ratio_int}')
+                    _ccot_model, _tok = load_ccot_frozen(base_id, _ccot_ckpt, device)
+                    _prompt_fn = (
+                        lambda item, ri=_ratio_int:
+                        f"Question: {item['question']}\n\n[compress:0.{ri}]\n"
+                    )
+                    run_iti_phase2(
+                        model=_ccot_model,
+                        tokenizer=_tok,
+                        D_steer=D_steer,
+                        model_tag=model_tag,
+                        source_tag='ccot',
+                        boundary_idx_fn=find_boundary_idx_ccot,
+                        device=device,
+                        vectors_dir=vectors_dir,
+                        prompt_fn=_prompt_fn,
+                    )
+                    del _ccot_model
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                else:
+                    print(f"  [SKIP] phase2_meta.json not found — run Phase 2 first")
+            else:
+                print(f"[{cfg_id}][{model_tag}] ITI vectors exist — skipping")
 
 
 def _run_phase3(configs_to_run, models_to_run, splits, device):

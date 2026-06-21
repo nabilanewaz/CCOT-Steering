@@ -12,13 +12,14 @@ from phase2.loaders import (
     find_boundary_idx_base,
 )
 from phase2.collect import collect_hidden_states
-from phase2.probe import score_all_layers
+from phase2.probe import score_all_layers, score_all_layers_both
 from phase2.dom import (
     compute_per_layer_dom,
     compute_best_layer_dom,
     compute_shuffled_dom,
     report_cross_source_alignment,
     save_dom_vector,
+    save_multilayer_dom_vectors,
     save_shuffled_vector,
 )
 from phase2.cpca import (
@@ -68,6 +69,8 @@ def run_phase2_source(
     threshold_multiplier: float = 0.5,
     min_samples: int = 200,
     cpca_variant: str = 'full',
+    extraction: str = 'mean_gen',
+    gen_window: int = 20,
 ) -> dict:
     """
     Phase 2 extraction for a single (model, source) pair.
@@ -89,7 +92,7 @@ def run_phase2_source(
     print(f"  {header}")
     print(f"  D_steer={len(D_steer)}  N_rollouts={N}  "
           f"r_final={r_final}  min_samples={min_samples}  "
-          f"cpca_variant={cpca_variant}")
+          f"cpca_variant={cpca_variant}  extraction={extraction}  gen_window={gen_window}")
     print(f"{'═' * max(len(header), 60)}")
 
     # ── STEP 1: Collect hidden states ─────────────────────────────────────────
@@ -106,6 +109,8 @@ def run_phase2_source(
             boundary_idx_fn, source_tag,
             prompt_fn=prompt_fn,
             min_samples=min_samples,
+            extraction=extraction,
+            gen_window=gen_window,
         )
         torch.save({'H_pos': H_pos, 'H_neg': H_neg}, hstates_cache)
         print(f"  Hidden states cached -> {hstates_cache}")
@@ -125,19 +130,20 @@ def run_phase2_source(
         },
     }
 
-    # ── STEP 2: Layer probe scores ────────────────────────────────────────────
-    t_step = _step(2, N_STEPS, 'Logistic probe — scoring all layers', phase_start)
-    layer_scores = score_all_layers(H_pos, H_neg)
+    # ── STEP 2: Layer probe scores (LR + MLP) ─────────────────────────────────
+    t_step = _step(2, N_STEPS, 'LR + MLP probe — scoring all layers', phase_start)
+    layer_scores = score_all_layers_both(H_pos, H_neg)
     step_times['probe'] = round(time.time() - t_step, 2)
 
     passing_gate = [L for L, s in layer_scores.items() if s > 0.55]
     diag['probe'] = {
-        'gate_threshold':     0.55,
-        'layer_scores':       {str(L): round(s, 4) for L, s in sorted(layer_scores.items())},
-        'best_layer':         max(layer_scores, key=layer_scores.get),
-        'best_score':         round(max(layer_scores.values()), 4),
+        'gate_threshold':      0.55,
+        'layer_scores':        {str(L): round(s, 4) for L, s in sorted(layer_scores.items())},
+        'best_layer':          max(layer_scores, key=layer_scores.get),
+        'best_score':          round(max(layer_scores.values()), 4),
         'layers_passing_gate': passing_gate,
         'n_passing':           len(passing_gate),
+        'probe_method':        'max(LR, MLP)',
     }
 
     # ── STEP 3: Method A — best-layer DoM ────────────────────────────────────
@@ -211,6 +217,8 @@ def run_phase2_source(
         print("No subspaces computed — saving DoM only, skipping Method B.")
         save_dom_vector(v_truth, model_tag, source_tag, vectors_dir,
                         best_layer=best_layer)
+        save_multilayer_dom_vectors(dom_vectors, layer_scores, model_tag,
+                                    source_tag, vectors_dir, top_k=3)
         diag['winner'] = 'dom'
         diag['step_times_s'] = step_times
         _save_diagnostics(diag, vectors_dir, source_tag)
@@ -232,6 +240,8 @@ def run_phase2_source(
     )
     save_dom_vector(v_truth, model_tag, source_tag, vectors_dir,
                     best_layer=best_layer)
+    save_multilayer_dom_vectors(dom_vectors, layer_scores, model_tag,
+                                source_tag, vectors_dir, top_k=3)
     save_subspace(U_truth, selected_layers, model_tag, source_tag,
                   r_final, beta, vectors_dir,
                   layer_scores=layer_scores, sweep_meta=sweep_meta)
@@ -305,6 +315,85 @@ def run_phase2_source(
         'dom_vectors':     dom_vectors,
         'subspaces':       subspaces,
     }
+
+
+def run_iti_phase2(
+    model,
+    tokenizer,
+    D_steer: list,
+    model_tag: str,
+    source_tag: str,
+    boundary_idx_fn,
+    device: str,
+    vectors_dir: str,
+    prompt_fn=None,
+    N_rollouts: int = 10,
+    min_samples: int = 30,
+    top_k: int = 48,
+) -> dict:
+    """
+    Collect per-head attention outputs and build ITI vectors.
+
+    This is Phase 2.5: runs AFTER run_phase2_source and adds:
+      - {source}_iti_heads.pt:  top_heads, head_directions, head_sigmas, head_scores
+
+    Caches head activations to {source}_head_hstates_cache.pt.
+    """
+    from phase2.collect_heads import collect_head_activations
+    from phase2.probe_heads import probe_all_heads
+
+    print(f"\n{'═' * 64}")
+    print(f"  ITI Phase 2  [{model_tag}]  source={source_tag}")
+    print(f"  D_steer={len(D_steer)}  N_rollouts={N_rollouts}  "
+          f"min_samples={min_samples}  top_k={top_k}")
+    print(f"{'═' * 64}")
+
+    os.makedirs(vectors_dir, exist_ok=True)
+    head_cache_path = os.path.join(
+        vectors_dir, f'{source_tag}_head_hstates_cache.pt')
+    iti_out_path = os.path.join(vectors_dir, f'{source_tag}_iti_heads.pt')
+
+    # ── Step 1: Collect or load per-head activations ──────────────────────────
+    if os.path.exists(head_cache_path):
+        print(f"  Loading cached per-head activations: {head_cache_path}")
+        _c = torch.load(head_cache_path, map_location='cpu')
+        H_pos, H_neg = _c['H_pos'], _c['H_neg']
+    else:
+        t0 = time.time()
+        print(f"  Collecting per-head activations…")
+        H_pos, H_neg = collect_head_activations(
+            model, tokenizer, D_steer, device, boundary_idx_fn,
+            prompt_fn=prompt_fn,
+            N_rollouts=N_rollouts,
+            min_samples=min_samples,
+        )
+        torch.save({'H_pos': H_pos, 'H_neg': H_neg}, head_cache_path)
+        print(f"  Cached → {head_cache_path}  ({time.time()-t0:.0f}s)")
+
+    if not H_pos:
+        print("  No (layer,head) pairs had enough samples — ITI skipped.")
+        return {}
+
+    # ── Step 2: Per-head probe + top-K selection ──────────────────────────────
+    print(f"\n  Per-head probing…  ({len(H_pos)} valid pairs)")
+    top_heads, head_scores, head_directions, head_sigmas = probe_all_heads(
+        H_pos, H_neg, top_k=top_k,
+    )
+
+    # ── Step 3: Save ITI payload ──────────────────────────────────────────────
+    payload = {
+        'model_tag':       model_tag,
+        'source_tag':      source_tag,
+        'top_k':           top_k,
+        'top_heads':       top_heads,
+        'head_scores':     head_scores,
+        'head_directions': head_directions,
+        'head_sigmas':     head_sigmas,
+    }
+    torch.save(payload, iti_out_path)
+    print(f"\n  ITI vectors saved → {iti_out_path}")
+
+    return payload
 
 
 def _save_diagnostics(diag: dict, vectors_dir: str, source_tag: str) -> None:

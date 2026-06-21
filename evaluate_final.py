@@ -50,6 +50,7 @@ from phase3.hooks import (
 N_BOOTSTRAP  = 1000    # resamples for all bootstrap CIs
 CI_SEED      = 0       # fixed seed → reproducible CIs across re-runs
 CI_LEVEL     = 0.95    # 95% confidence interval
+N_PRE_INJECT = 3       # inject at boundary and this many tokens before it (0 = boundary only)
 
 MODEL_TAGS = ['llama32_3b', 'phi2', 'qwen25_3b', 'qwen25_math1.5b']
 MODEL_ID_MAP = {
@@ -283,20 +284,23 @@ def compute_paired_cis(
       - ccot vs full CoT      (compression cost)
       - trimmed vs ccot       (mechanism baseline)
     """
-    ccot_cond  = f'ccot_R{ratio_int}'
-    dom_cond   = f'dom_R{ratio_int}_{source}'
-    cpca_cond  = f'cpca_R{ratio_int}_{source}'
-    noise_cond = f'noise_R{ratio_int}_{source}'
-    trim_cond  = f'trimmed_R{ratio_int}'
+    ccot_cond    = f'ccot_R{ratio_int}'
+    dom_cond     = f'dom_R{ratio_int}_{source}'
+    cpca_cond    = f'cpca_R{ratio_int}_{source}'
+    noise_cond   = f'noise_R{ratio_int}_{source}'
+    neg_dom_cond = f'neg_dom_R{ratio_int}_{source}'
+    trim_cond    = f'trimmed_R{ratio_int}'
 
     pairs = [
-        ('dom_vs_ccot',        ccot_cond,   dom_cond),
-        ('cpca_vs_ccot',       ccot_cond,   cpca_cond),
-        ('dom_vs_noise',       noise_cond,  dom_cond),
-        ('dom_vs_full_cot',    'full_cot',  dom_cond),
-        ('ccot_vs_full_cot',   'full_cot',  ccot_cond),
-        ('noise_vs_ccot',      ccot_cond,   noise_cond),
-        ('trimmed_vs_full_cot','full_cot',  trim_cond),
+        ('dom_vs_ccot',        ccot_cond,    dom_cond),
+        ('cpca_vs_ccot',       ccot_cond,    cpca_cond),
+        ('dom_vs_noise',       noise_cond,   dom_cond),
+        ('dom_vs_neg_dom',     neg_dom_cond, dom_cond),
+        ('neg_dom_vs_ccot',    ccot_cond,    neg_dom_cond),
+        ('dom_vs_full_cot',    'full_cot',   dom_cond),
+        ('ccot_vs_full_cot',   'full_cot',   ccot_cond),
+        ('noise_vs_ccot',      ccot_cond,    noise_cond),
+        ('trimmed_vs_full_cot','full_cot',   trim_cond),
     ]
 
     cis: dict = {}
@@ -428,6 +432,8 @@ def _display_condition_name(name: str) -> str:
         return 'ccot_cpca'
     if name.startswith('trimmed_dom_R'):
         return 'trimmed_dom'
+    if name.startswith('neg_dom_R'):
+        return 'neg_dom'
     return name
 
 
@@ -438,7 +444,7 @@ def _display_pair_name(cond_a: str, cond_b: str) -> str:
 def _display_grid_order(conditions: list[str]) -> list[str]:
     preferred = [
         'no_cot', 'full_cot', 'ccot', 'trimmed_cot',
-        'random_noise', 'ccot_dom', 'ccot_cpca', 'trimmed_dom',
+        'random_noise', 'ccot_dom', 'ccot_cpca', 'neg_dom', 'trimmed_dom',
     ]
     order = []
     for name in preferred:
@@ -1170,6 +1176,7 @@ def compute_all_flip_matrices(
     cpca     = f'cpca_R{ratio_int}_{source}'
     trim_dom = f'trimmed_dom_R{ratio_int}'
     noise    = f'noise_R{ratio_int}_{source}'
+    neg_dom  = f'neg_dom_R{ratio_int}_{source}'
 
     pairs = [
         ('no_cot',   'full_cot'),
@@ -1178,6 +1185,8 @@ def compute_all_flip_matrices(
         (ccot,       trim),
         (ccot,       noise),
         (ccot,       dom),
+        (ccot,       neg_dom),
+        (dom,        neg_dom),
         (trim,       trim_dom),
         ('full_cot', dom),
         (ccot,       cpca),
@@ -1450,8 +1459,11 @@ def save_final_results(
     print(f"  tables/  → {tables_dir}/")
     print(bar)
 
-    n_test  = (next(iter(all_results.values()))['metrics']['full_cot'].n_total
-               if all_results else 0)
+    n_test  = 0
+    if all_results:
+        _first_metrics = next(iter(all_results.values()))['metrics']
+        _any_m = _first_metrics.get('full_cot') or next(iter(_first_metrics.values()), None)
+        n_test = _any_m.n_total if _any_m else 0
     summary = _build_summary(all_results, n_test)
     if provenance:
         summary = {'provenance': provenance, **summary}
@@ -1538,6 +1550,8 @@ def run_final_evaluation(
     max_new_tokens: int = 256,
     out_dir: str = 'results/final',
     models: Optional[list] = None,
+    reuse_base: bool = False,
+    base_results_dir: Optional[str] = None,
 ) -> dict:
     """
     Single-pass D_test evaluation using locked Phase 3 configs.
@@ -1609,153 +1623,200 @@ def run_final_evaluation(
         cpca_sweep   = []
         cond_idx     = 0
 
+        # ── Reuse-base: load non-steered conditions from existing JSON ─────────
+        _reuse_loaded: set  = set()
+        full_cot_counts:    list  = []
+        budgets:            list  = []
+        mean_b:             float = 0.0
+
+        if reuse_base:
+            _base_dir  = base_results_dir if base_results_dir else out_dir
+            _prev_json = os.path.join(_base_dir, f'{model_tag}_test.json')
+            if os.path.exists(_prev_json):
+                with open(_prev_json) as _f:
+                    _prev = json.load(_f)
+                # steered conditions always re-run so new α/n_pre settings take effect
+                _FRESH = ('noise_', 'dom_', 'cpca_', 'neg_dom_')
+                for _cond, _md in _prev.get('metrics', {}).items():
+                    if any(_cond.startswith(_p) for _p in _FRESH):
+                        continue
+                    all_metrics[_cond] = FinalMetrics(**_md)
+                    _nc = all_metrics[_cond].n_correct
+                    _nt = all_metrics[_cond].n_total
+                    all_preds[_cond] = [True] * _nc + [False] * (_nt - _nc)
+                    _reuse_loaded.add(_cond)
+                _fcm = all_metrics.get('full_cot')
+                _mean_rtok = round(_fcm.reasoning_tokens_mean) if _fcm else 100
+                full_cot_counts = [_mean_rtok] * n_test
+                budgets = [max(10, round(ratio * t)) for t in full_cot_counts]
+                mean_b  = sum(budgets) / max(1, len(budgets))
+                print(f"  [REUSE] Loaded {len(_reuse_loaded)} conditions: "
+                      f"{sorted(_reuse_loaded)}")
+                print(f"  [REUSE] full_cot_counts ≈ {_mean_rtok} tok/ex (mean approx)")
+            else:
+                print(f"  [REUSE] No JSON at {_prev_json} — running all conditions")
+
         # ── Phase A: CoT model ─────────────────────────────────────────────────
-        cot_ckpt = os.path.join(ckpt_dir, 'cot')
-        print(f"\n  Loading CoT model: {cot_ckpt}")
-        cot_model, tok_cot = load_finetuned(cot_ckpt, device)
-        for p in cot_model.parameters():
-            p.requires_grad = False
-        cot_model.eval()
+        _cot_conds = {'full_cot', f'trimmed_R{ratio_int}', f'trimmed_dom_R{ratio_int}'}
+        _need_cot  = bool(_cot_conds - _reuse_loaded)
+        if _need_cot:
+            cot_ckpt = os.path.join(ckpt_dir, 'cot')
+            print(f"\n  Loading CoT model: {cot_ckpt}")
+            cot_model, tok_cot = load_finetuned(cot_ckpt, device)
+            for p in cot_model.parameters():
+                p.requires_grad = False
+            cot_model.eval()
 
-        cond_idx += 1
-        _ph4_cond_banner(cond_idx, f'Precompute full-CoT token counts  n={n_test}', t_model)
-        full_cot_counts = precompute_full_cot_tokens(cot_model, tok_cot, D_test, device)
-        budgets = [max(10, round(ratio * t)) for t in full_cot_counts]
-        mean_b  = sum(budgets) / len(budgets)
-        print(f"    mean_budget={mean_b:.1f} tok  (ratio={ratio})")
+            if not full_cot_counts:
+                cond_idx += 1
+                _ph4_cond_banner(cond_idx, f'Precompute full-CoT token counts  n={n_test}', t_model)
+                full_cot_counts = precompute_full_cot_tokens(cot_model, tok_cot, D_test, device)
+                budgets = [max(10, round(ratio * t)) for t in full_cot_counts]
+                mean_b  = sum(budgets) / len(budgets)
+                print(f"    mean_budget={mean_b:.1f} tok  (ratio={ratio})")
 
-        # ── Full CoT ──────────────────────────────────────────────────────────
-        cond_idx += 1
-        cond_start = _ph4_cond_banner(cond_idx, 'Full CoT', t_model)
-        t0 = time.time()
-        examples = []
-        n_corr = 0
-        for i, item in enumerate(D_test):
-            t1 = time.time()
-            pred, reasoning = run_cot(cot_model, tok_cot, item, device)
-            gold = item['answer'].split('####')[1].strip()
-            ok   = normalize_answer(pred) == normalize_answer(gold) if pred else False
-            nt   = len(tok_cot.encode(reasoning or '', add_special_tokens=False))
-            examples.append(ExampleResult(
-                correct=ok, answer_found=pred is not None,
-                reasoning_tokens=nt, total_tokens=nt,
-                latency_sec=time.time() - t1,
-            ))
-            n_corr += ok
-            _prog(i, n_test, t0, 'full_cot', n_corr)
-        m = collect_condition_metrics(
-            examples, full_cot_counts, 'full_cot', model_tag, time.time() - t0)
-        all_metrics['full_cot'] = m
-        all_preds['full_cot']   = [e.correct for e in examples]
-        _ph4_cond_done('full_cot', m, cond_start)
+            # ── Full CoT ──────────────────────────────────────────────────────
+            if 'full_cot' not in _reuse_loaded:
+                cond_idx += 1
+                cond_start = _ph4_cond_banner(cond_idx, 'Full CoT', t_model)
+                t0 = time.time()
+                examples = []
+                n_corr = 0
+                for i, item in enumerate(D_test):
+                    t1 = time.time()
+                    pred, reasoning = run_cot(cot_model, tok_cot, item, device)
+                    gold = item['answer'].split('####')[1].strip()
+                    ok   = normalize_answer(pred) == normalize_answer(gold) if pred else False
+                    nt   = len(tok_cot.encode(reasoning or '', add_special_tokens=False))
+                    examples.append(ExampleResult(
+                        correct=ok, answer_found=pred is not None,
+                        reasoning_tokens=nt, total_tokens=nt,
+                        latency_sec=time.time() - t1,
+                    ))
+                    n_corr += ok
+                    _prog(i, n_test, t0, 'full_cot', n_corr)
+                m = collect_condition_metrics(
+                    examples, full_cot_counts, 'full_cot', model_tag, time.time() - t0)
+                all_metrics['full_cot'] = m
+                all_preds['full_cot']   = [e.correct for e in examples]
+                _ph4_cond_done('full_cot', m, cond_start)
 
-        # ── Trimmed CoT ───────────────────────────────────────────────────────
-        trim_cond = f'trimmed_R{ratio_int}'
-        cond_idx += 1
-        cond_start = _ph4_cond_banner(
-            cond_idx, f'Trimmed CoT  R={ratio}  mean_budget={mean_b:.0f}', t_model)
-        t0 = time.time()
-        examples = []
-        n_corr = 0
-        for i, item in enumerate(D_test):
-            t1 = time.time()
-            pred, reasoning = run_trimmed_cot(cot_model, tok_cot, item, budgets[i], device)
-            gold = item['answer'].split('####')[1].strip()
-            ok   = normalize_answer(pred) == normalize_answer(gold) if pred else False
-            nt   = len(tok_cot.encode(reasoning or '', add_special_tokens=False))
-            examples.append(ExampleResult(
-                correct=ok, answer_found=pred is not None,
-                reasoning_tokens=nt, total_tokens=nt,
-                latency_sec=time.time() - t1,
-            ))
-            n_corr += ok
-            _prog(i, n_test, t0, trim_cond, n_corr)
-        m = collect_condition_metrics(
-            examples, full_cot_counts, trim_cond, model_tag, time.time() - t0)
-        all_metrics[trim_cond] = m
-        all_preds[trim_cond]   = [e.correct for e in examples]
-        _ph4_cond_done(trim_cond, m, cond_start)
+            # ── Trimmed CoT ───────────────────────────────────────────────────
+            trim_cond = f'trimmed_R{ratio_int}'
+            if trim_cond not in _reuse_loaded:
+                cond_idx += 1
+                cond_start = _ph4_cond_banner(
+                    cond_idx, f'Trimmed CoT  R={ratio}  mean_budget={mean_b:.0f}', t_model)
+                t0 = time.time()
+                examples = []
+                n_corr = 0
+                for i, item in enumerate(D_test):
+                    t1 = time.time()
+                    pred, reasoning = run_trimmed_cot(cot_model, tok_cot, item, budgets[i], device)
+                    gold = item['answer'].split('####')[1].strip()
+                    ok   = normalize_answer(pred) == normalize_answer(gold) if pred else False
+                    nt   = len(tok_cot.encode(reasoning or '', add_special_tokens=False))
+                    examples.append(ExampleResult(
+                        correct=ok, answer_found=pred is not None,
+                        reasoning_tokens=nt, total_tokens=nt,
+                        latency_sec=time.time() - t1,
+                    ))
+                    n_corr += ok
+                    _prog(i, n_test, t0, trim_cond, n_corr)
+                m = collect_condition_metrics(
+                    examples, full_cot_counts, trim_cond, model_tag, time.time() - t0)
+                all_metrics[trim_cond] = m
+                all_preds[trim_cond]   = [e.correct for e in examples]
+                _ph4_cond_done(trim_cond, m, cond_start)
 
-        # ── Trimmed + DoM ─────────────────────────────────────────────────────
-        trim_dom_cond = f'trimmed_dom_R{ratio_int}'
-        cond_idx += 1
-        cond_start = _ph4_cond_banner(
-            cond_idx, f'Trimmed+DoM  R={ratio}  src=base', t_model)
-        try:
-            v_base_dom  = _load_dom(vectors_dir, 'base').to(device)
-            try:
-                L_star_base = get_injection_layer(vectors_dir, 'base')
-            except FileNotFoundError:
-                L_star_base = meta.get('base_best_layer', meta.get('ccot_best_layer', 14))
-            try:
-                alpha_base = _load_alpha_file(vectors_dir, 'base')
-            except FileNotFoundError:
-                alpha_base = alpha_star
-            print(f"    L*={L_star_base}  α={alpha_base:.4f}  "
-                  f"v_base_dom.shape={tuple(v_base_dom.shape)}")
-            cot_prompt_fn = lambda item: f"Question: {item['question']}\n\nReasoning:"
+            # ── Trimmed + DoM ─────────────────────────────────────────────────
+            trim_dom_cond = f'trimmed_dom_R{ratio_int}'
+            if trim_dom_cond not in _reuse_loaded:
+                cond_idx += 1
+                cond_start = _ph4_cond_banner(
+                    cond_idx, f'Trimmed+DoM  R={ratio}  src=base', t_model)
+                try:
+                    v_base_dom  = _load_dom(vectors_dir, 'base').to(device)
+                    try:
+                        L_star_base = get_injection_layer(vectors_dir, 'base')
+                    except FileNotFoundError:
+                        L_star_base = meta.get('base_best_layer', meta.get('ccot_best_layer', 14))
+                    try:
+                        alpha_base = _load_alpha_file(vectors_dir, 'base')
+                    except FileNotFoundError:
+                        alpha_base = alpha_star
+                    print(f"    L*={L_star_base}  α={alpha_base:.4f}  "
+                          f"v_base_dom.shape={tuple(v_base_dom.shape)}")
+                    cot_prompt_fn = lambda item: f"Question: {item['question']}\n\nReasoning:"
+                    t0 = time.time()
+                    examples = []
+                    n_corr = 0
+                    for i, item in enumerate(D_test):
+                        prompt = cot_prompt_fn(item)
+                        enc = tok_cot(prompt, return_tensors='pt').to(device)
+                        with torch.no_grad():
+                            probe_ids = cot_model.generate(
+                                **enc, do_sample=False, max_new_tokens=128,
+                                pad_token_id=tok_cot.eos_token_id,
+                            )
+                        try:
+                            b_idx = find_boundary_idx_base(probe_ids, tok_cot)
+                        except Exception:
+                            b_idx = max(0, enc['input_ids'].shape[1] - 1)
+                        hook_fn = make_dom_hook(b_idx, v_base_dom, alpha_base, device)
+                        ex = run_steered_with_metrics(
+                            cot_model, tok_cot, prompt, item, hook_fn,
+                            L_star_base, v_base_dom, device, budgets[i],
+                        )
+                        examples.append(ex)
+                        n_corr += ex.correct
+                        _prog(i, n_test, t0, trim_dom_cond, n_corr)
+                    m = collect_condition_metrics(
+                        examples, full_cot_counts, trim_dom_cond, model_tag, time.time() - t0)
+                    all_metrics[trim_dom_cond] = m
+                    all_preds[trim_dom_cond]   = [e.correct for e in examples]
+                    _ph4_cond_done(trim_dom_cond, m, cond_start)
+                except FileNotFoundError as exc:
+                    print(f"  [SKIP] {trim_dom_cond}: {exc}")
+
+            del cot_model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        # Ensure full_cot_counts / budgets are populated even if CoT block was skipped
+        if not full_cot_counts:
+            full_cot_counts = [100] * n_test
+            budgets = [max(10, round(ratio * t)) for t in full_cot_counts]
+            mean_b  = sum(budgets) / max(1, len(budgets))
+
+        # ── Phase B: No CoT (frozen base) ─────────────────────────────────────
+        if 'no_cot' not in _reuse_loaded:
+            cond_idx += 1
+            cond_start = _ph4_cond_banner(cond_idx, f'No CoT  base={base_model_id}', t_model)
+            base_model, tok_base = load_base_frozen(base_model_id, device)
             t0 = time.time()
             examples = []
             n_corr = 0
             for i, item in enumerate(D_test):
-                prompt = cot_prompt_fn(item)
-                enc = tok_cot(prompt, return_tensors='pt').to(device)
-                with torch.no_grad():
-                    probe_ids = cot_model.generate(
-                        **enc, do_sample=False, max_new_tokens=128,
-                        pad_token_id=tok_cot.eos_token_id,
-                    )
-                try:
-                    b_idx = find_boundary_idx_base(probe_ids, tok_cot)
-                except Exception:
-                    b_idx = max(0, enc['input_ids'].shape[1] - 1)
-                hook_fn = make_dom_hook(b_idx, v_base_dom, alpha_base, device)
-                ex = run_steered_with_metrics(
-                    cot_model, tok_cot, prompt, item, hook_fn,
-                    L_star_base, v_base_dom, device, budgets[i],
-                )
-                examples.append(ex)
-                n_corr += ex.correct
-                _prog(i, n_test, t0, trim_dom_cond, n_corr)
+                t1 = time.time()
+                pred, _ = run_no_cot(base_model, tok_base, item, device)
+                gold = item['answer'].split('####')[1].strip()
+                ok   = normalize_answer(pred) == normalize_answer(gold) if pred else False
+                examples.append(ExampleResult(
+                    correct=ok, answer_found=pred is not None,
+                    reasoning_tokens=0, total_tokens=0,
+                    latency_sec=time.time() - t1,
+                ))
+                n_corr += ok
+                _prog(i, n_test, t0, 'no_cot', n_corr)
             m = collect_condition_metrics(
-                examples, full_cot_counts, trim_dom_cond, model_tag, time.time() - t0)
-            all_metrics[trim_dom_cond] = m
-            all_preds[trim_dom_cond]   = [e.correct for e in examples]
-            _ph4_cond_done(trim_dom_cond, m, cond_start)
-        except FileNotFoundError as exc:
-            print(f"  [SKIP] {trim_dom_cond}: {exc}")
-
-        del cot_model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        # ── Phase B: No CoT (frozen base) ─────────────────────────────────────
-        cond_idx += 1
-        cond_start = _ph4_cond_banner(cond_idx, f'No CoT  base={base_model_id}', t_model)
-        base_model, tok_base = load_base_frozen(base_model_id, device)
-        t0 = time.time()
-        examples = []
-        n_corr = 0
-        for i, item in enumerate(D_test):
-            t1 = time.time()
-            pred, _ = run_no_cot(base_model, tok_base, item, device)
-            gold = item['answer'].split('####')[1].strip()
-            ok   = normalize_answer(pred) == normalize_answer(gold) if pred else False
-            examples.append(ExampleResult(
-                correct=ok, answer_found=pred is not None,
-                reasoning_tokens=0, total_tokens=0,
-                latency_sec=time.time() - t1,
-            ))
-            n_corr += ok
-            _prog(i, n_test, t0, 'no_cot', n_corr)
-        m = collect_condition_metrics(
-            examples, full_cot_counts, 'no_cot', model_tag, time.time() - t0)
-        all_metrics['no_cot'] = m
-        all_preds['no_cot']   = [e.correct for e in examples]
-        _ph4_cond_done('no_cot', m, cond_start)
-        del base_model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+                examples, full_cot_counts, 'no_cot', model_tag, time.time() - t0)
+            all_metrics['no_cot'] = m
+            all_preds['no_cot']   = [e.correct for e in examples]
+            _ph4_cond_done('no_cot', m, cond_start)
+            del base_model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # ── Phase C: CCoT model (locked ratio) ────────────────────────────────
         ccot_ckpt = os.path.join(ckpt_dir, f'ccot_R{ratio_int}')
@@ -1829,39 +1890,41 @@ def run_final_evaluation(
 
                 # ── CCoT baseline ─────────────────────────────────────────────
                 ccot_cond = f'ccot_R{ratio_int}'
-                cond_idx += 1
-                cond_start = _ph4_cond_banner(
-                    cond_idx, f'CCoT baseline  R={ratio}', t_model)
-                t0 = time.time()
-                examples = []
-                n_corr = 0
-                for i, item in enumerate(D_test):
-                    prompt = _ccot_prompt(item)
-                    ex = run_steered_with_metrics(
-                        ccot_model, tok_ccot, prompt, item, None,
-                        L_star, v_truth, device, max_new_tokens,
-                    )
-                    examples.append(ex)
-                    n_corr += ex.correct
-                    _prog(i, n_test, t0, ccot_cond, n_corr)
-                m = collect_condition_metrics(
-                    examples, full_cot_counts, ccot_cond, model_tag, time.time() - t0)
-                all_metrics[ccot_cond] = m
-                all_preds[ccot_cond]   = [e.correct for e in examples]
-                _ph4_cond_done(ccot_cond, m, cond_start)
+                if ccot_cond not in _reuse_loaded:
+                    cond_idx += 1
+                    cond_start = _ph4_cond_banner(
+                        cond_idx, f'CCoT baseline  R={ratio}', t_model)
+                    t0 = time.time()
+                    examples = []
+                    n_corr = 0
+                    for i, item in enumerate(D_test):
+                        prompt = _ccot_prompt(item)
+                        ex = run_steered_with_metrics(
+                            ccot_model, tok_ccot, prompt, item, None,
+                            L_star, v_truth, device, max_new_tokens,
+                        )
+                        examples.append(ex)
+                        n_corr += ex.correct
+                        _prog(i, n_test, t0, ccot_cond, n_corr)
+                    m = collect_condition_metrics(
+                        examples, full_cot_counts, ccot_cond, model_tag, time.time() - t0)
+                    all_metrics[ccot_cond] = m
+                    all_preds[ccot_cond]   = [e.correct for e in examples]
+                    _ph4_cond_done(ccot_cond, m, cond_start)
 
                 # ── Random Noise ──────────────────────────────────────────────
                 noise_cond = f'noise_R{ratio_int}_{source}'
-                cond_idx += 1
-                cond_start = _ph4_cond_banner(
-                    cond_idx, f'Random Noise  R={ratio} src={source}', t_model)
-                exs, m = _make_steered_examples(
-                    lambda b: make_noise_hook(b, alpha_star, device),
-                    find_boundary_idx_ccot, noise_cond,
-                )
-                all_metrics[noise_cond] = m
-                all_preds[noise_cond]   = [e.correct for e in exs]
-                _ph4_cond_done(noise_cond, m, cond_start)
+                if noise_cond not in _reuse_loaded:
+                    cond_idx += 1
+                    cond_start = _ph4_cond_banner(
+                        cond_idx, f'Random Noise  R={ratio} src={source}', t_model)
+                    exs, m = _make_steered_examples(
+                        lambda b: make_noise_hook(b, alpha_star, device, N_PRE_INJECT),
+                        find_boundary_idx_ccot, noise_cond,
+                    )
+                    all_metrics[noise_cond] = m
+                    all_preds[noise_cond]   = [e.correct for e in exs]
+                    _ph4_cond_done(noise_cond, m, cond_start)
 
                 # ── CCoT + DoM ────────────────────────────────────────────────
                 dom_cond = f'dom_R{ratio_int}_{source}'
@@ -1870,7 +1933,7 @@ def run_final_evaluation(
                     cond_idx,
                     f'CCoT+DoM  R={ratio} src={source}  α={alpha_star:.4f}', t_model)
                 exs, m = _make_steered_examples(
-                    lambda b: make_dom_hook(b, v_truth, alpha_star, device),
+                    lambda b: make_dom_hook(b, v_truth, alpha_star, device, N_PRE_INJECT),
                     find_boundary_idx_ccot, dom_cond,
                 )
                 all_metrics[dom_cond] = m
@@ -1887,12 +1950,29 @@ def run_final_evaluation(
                         cond_idx,
                         f'CCoT+cPCA  R={ratio} src={source}  α={alpha_star:.4f}', t_model)
                     exs, m = _make_steered_examples(
-                        lambda b: make_cpca_hook(b, U_cpca, alpha_star, device),
+                        lambda b: make_cpca_hook(b, U_cpca, alpha_star, device, N_PRE_INJECT),
                         find_boundary_idx_ccot, cpca_cond,
                     )
                     all_metrics[cpca_cond] = m
                     all_preds[cpca_cond]   = [e.correct for e in exs]
                     _ph4_cond_done(cpca_cond, m, cond_start)
+
+                # ── CCoT + Negative DoM (anti-truth control) ──────────────────
+                neg_dom_cond = f'neg_dom_R{ratio_int}_{source}'
+                cond_idx += 1
+                cond_start = _ph4_cond_banner(
+                    cond_idx,
+                    f'CCoT+NegDoM  R={ratio} src={source}  α=-{alpha_star:.4f}', t_model)
+                v_neg = -v_truth
+                exs, m = _make_steered_examples(
+                    lambda b: make_dom_hook(b, v_neg, alpha_star, device, N_PRE_INJECT),
+                    find_boundary_idx_ccot, neg_dom_cond,
+                )
+                all_metrics[neg_dom_cond] = m
+                all_preds[neg_dom_cond]   = [e.correct for e in exs]
+                _ph4_cond_done(neg_dom_cond, m, cond_start)
+                print(f"    NegDoM truth_align={m.truth_alignment:.4f}  "
+                      f"traj_coh={m.trajectory_coherence:.4f}")
 
                 # ── Alpha sweep (diagnostic) — DoM ───────────────────────────
                 dom_sweep = run_alpha_sweep_test(
@@ -2077,6 +2157,17 @@ def main():
              '"qwen25_math1.5b" or "llama32_3b,phi2". '
              'Default: all four backbones.',
     )
+    parser.add_argument(
+        '--reuse-base', action='store_true',
+        help='Load no_cot/full_cot/trimmed/ccot results from existing JSON '
+             'and only re-run steered conditions (noise/dom/cpca). '
+             'Use --base-results-dir to point at a previous run.',
+    )
+    parser.add_argument(
+        '--base-results-dir', default=None,
+        help='Directory containing a previous Phase 4 JSON to reuse '
+             '(default: same as --results-dir). Only used with --reuse-base.',
+    )
     args, _unknown = parser.parse_known_args()
 
     # ── Startup banner ────────────────────────────────────────────────────────
@@ -2113,6 +2204,8 @@ def main():
         max_new_tokens=args.max_new_tokens,
         out_dir=args.results_dir,
         models=args.models.split(',') if args.models else None,
+        reuse_base=args.reuse_base,
+        base_results_dir=args.base_results_dir,
     )
     provenance = {
         'eval_dataset':              get_active_dataset_id(),

@@ -14,8 +14,11 @@ from phase2.balance import (
 def _register_all_hooks(model) -> tuple[list, dict]:
     """
     Register a forward hook on every transformer layer.
-    The hook captures hidden[boundary_idx] only if 'boundary_idx' is set in
-    the shared `captured` dict, so it is a no-op during model.generate().
+
+    Supports two extraction modes via the shared `captured` dict:
+      - 'boundary_idx': captures hidden state at a single position
+      - 'boundary_range': captures mean hidden state over a token range [start, end)
+    Hooks are no-ops during model.generate() (neither key is set then).
     """
     layers = get_transformer_layers(model)
     captured: dict = {}
@@ -23,12 +26,16 @@ def _register_all_hooks(model) -> tuple[list, dict]:
 
     def make_hook(L: int):
         def hook(module, input, output):
-            if 'boundary_idx' not in captured:
-                return
-            bidx = captured['boundary_idx']
             h = output[0]
-            if bidx < h.shape[1]:
-                captured[L] = h[:, bidx, :].detach().cpu()
+            if 'boundary_idx' in captured:
+                bidx = captured['boundary_idx']
+                if bidx < h.shape[1]:
+                    captured[L] = h[:, bidx, :].detach().cpu()
+            elif 'boundary_range' in captured:
+                start, end = captured['boundary_range']
+                end = min(end, h.shape[1])
+                if start < end:
+                    captured[L] = h[:, start:end, :].mean(dim=1).detach().cpu()
         return hook
 
     for L, layer in enumerate(layers):
@@ -47,11 +54,18 @@ def collect_hidden_states(
     source_tag: str,
     prompt_fn: Callable = None,
     min_samples: int = 200,
+    extraction: str = 'mean_gen',
+    gen_window: int = 20,
 ) -> tuple[dict, dict]:
     """
     Run the frozen model N times per D_steer question (temperature=1.0),
     classify each rollout as correct/incorrect, and accumulate per-layer
-    hidden states at the reasoning-boundary token.
+    hidden states at the extraction position.
+
+    extraction:
+      'boundary'  — hidden state at the token returned by boundary_idx_fn (original)
+      'mean_gen'  — mean hidden state over the first gen_window generated tokens
+      'first_gen' — hidden state at the first generated token
 
     Returns:
         H_pos: dict[layer -> Tensor (n+, d)]
@@ -78,6 +92,7 @@ def collect_hidden_states(
     for item_idx, item in enumerate(D_steer):
         prompt = prompt_fn(item)
         input_enc = tokenizer(prompt, return_tensors='pt').to(device)
+        prompt_len = input_enc['input_ids'].shape[1]
         gold = normalize_answer(item['answer'].split('####')[1].strip())
 
         # Per-question local buffers — only merged into the global pool if
@@ -89,10 +104,11 @@ def collect_hidden_states(
         for _ in range(N):
             # Clear state from the previous rollout
             captured.pop('boundary_idx', None)
+            captured.pop('boundary_range', None)
             for L in range(num_layers):
                 captured.pop(L, None)
 
-            # Sampling rollout — hooks are no-ops here (boundary_idx not set)
+            # Sampling rollout — hooks are no-ops here (no key set)
             with torch.no_grad():
                 out_ids = model.generate(
                     **input_enc,
@@ -101,13 +117,24 @@ def collect_hidden_states(
                     max_new_tokens=256,
                 )
 
-            try:
-                bidx = boundary_idx_fn(out_ids, tokenizer)
-            except ValueError:
-                continue
+            gen_len = out_ids.shape[1] - prompt_len
 
-            # Set boundary, then re-run full forward pass to trigger hooks
-            captured['boundary_idx'] = bidx
+            if extraction == 'mean_gen':
+                if gen_len < 3:
+                    continue
+                end = min(prompt_len + gen_window, out_ids.shape[1])
+                captured['boundary_range'] = (prompt_len, end)
+            elif extraction == 'first_gen':
+                if gen_len < 1:
+                    continue
+                captured['boundary_idx'] = prompt_len
+            else:  # 'boundary'
+                try:
+                    captured['boundary_idx'] = boundary_idx_fn(out_ids, tokenizer)
+                except ValueError:
+                    continue
+
+            # Re-run full forward pass to trigger hooks at extraction position
             with torch.no_grad():
                 model(out_ids)
 

@@ -142,6 +142,36 @@ def save_shuffled_vector(
     return path
 
 
+def save_multilayer_dom_vectors(
+    dom_vectors: dict,
+    layer_scores: dict,
+    model_tag: str,
+    source: str,
+    vectors_dir: str,
+    top_k: int = 3,
+) -> tuple:
+    """Save DoM vectors for the top-k layers by probe accuracy."""
+    candidates  = [L for L in dom_vectors if L in layer_scores]
+    top_layers  = sorted(candidates, key=lambda L: layer_scores.get(L, 0.0), reverse=True)[:top_k]
+    payload = {
+        'top_layers':    top_layers,
+        'layer_vectors': {L: dom_vectors[L] for L in top_layers},
+        'layer_scores':  {L: round(layer_scores.get(L, 0.0), 4) for L in top_layers},
+        'top_k':         top_k,
+        'method':        'multilayer_dom',
+        'model_tag':     model_tag,
+        'source':        source,
+    }
+    os.makedirs(vectors_dir, exist_ok=True)
+    path = os.path.join(vectors_dir, f'{source}_multilayer_dom.pt')
+    torch.save(payload, path)
+    print(f"Saved multi-layer DoM -> {path}  top_layers={top_layers}")
+    for L in top_layers:
+        print(f"  L={L:02d}  probe_acc={layer_scores.get(L, 0):.4f}  "
+              f"v_norm={dom_vectors[L].norm().item():.6f}")
+    return path, top_layers
+
+
 def save_dom_vector(
     v_truth: torch.Tensor,
     model_tag: str,

@@ -31,10 +31,21 @@ from phase3.hooks import (
     make_dom_hook,
     make_noise_hook,
     run_with_hook,
+    run_with_multihook,
+    run_with_iti,
 )
 
 RATIOS   = [0.6]  # Single ratio for faster iteration
 SOURCES  = ('ccot', 'base')
+
+# Conditions to skip entirely (for fast testing). Set to frozenset() to run all.
+SKIP_CONDITIONS: frozenset = frozenset({
+    'no_cot',
+    'full_cot',
+    'trimmed_R6',
+    'noise_R6_ccot',
+    'noise_R6_base',
+})
 
 
 # ── Data types ─────────────────────────────────────────────────────────────────
@@ -303,10 +314,7 @@ def _tune_and_save_alpha(
             continue
         L_star = source_L_star[source]
         if L_star is None:
-            try:
-                L_star = get_injection_layer(vectors_dir, source)
-            except FileNotFoundError:
-                L_star = meta.get('ccot_best_layer', 14)
+            L_star = meta.get('ccot_best_layer', 18)
 
         print(f"  Checkpoint   : {source_ckpt[source]}")
         print(f"  L* = {L_star}   v_dom.shape = {tuple(v_dom.shape)}")
@@ -452,6 +460,20 @@ def run_phase3_evaluation(
     }
     print(f"\n  Alpha stars loaded: { {s: round(v, 4) for s, v in alphas.items()} }")
 
+    # ── Pre-sweep ITI alpha per source ────────────────────────────────────────
+    print(f"\n  ── ITI Alpha Sweep ──")
+    for s in SOURCES:
+        _iti_alpha_out = os.path.join(results_dir, f'iti_alpha_diagnostic_{s}.json')
+        if os.path.exists(_iti_alpha_out):
+            print(f"  [CACHED] ITI alpha sweep for source={s}")
+        elif os.path.exists(os.path.join(vectors_dir, f'{s}_iti_heads.pt')):
+            _eval_iti_alpha_sweep(
+                model_tag, checkpoints_dir, D_val[:min(50, len(D_val))],
+                vectors_dir, meta, results_dir, device, source=s, n_sub=50,
+            )
+        else:
+            print(f"  [SKIP] No ITI vectors for source={s}")
+
     results:    list[ConditionResult] = []
     cond_times: dict[str, float]      = {}
     cond_idx    = 0
@@ -470,6 +492,10 @@ def run_phase3_evaluation(
               f"{sorted(_done_conds)}")
     else:
         _done_conds: set[str] = set()
+
+    if SKIP_CONDITIONS:
+        _done_conds |= SKIP_CONDITIONS
+        print(f"  [SKIP] Conditions bypassed: {sorted(SKIP_CONDITIONS)}")
 
     # ── [1] No CoT ────────────────────────────────────────────────────────────
     cond_idx += 1
@@ -531,7 +557,8 @@ def run_phase3_evaluation(
         print(f"  ╚══ full_cot  acc={r.accuracy:.3f}  mean_tok={full_cot_mean_tokens:.1f}  "
               f"({cond_elapsed:.0f}s) ══")
     else:
-        full_cot_mean_tokens = _saved_map['full_cot'].reasoning_tokens
+        _fc = _saved_map.get('full_cot')
+        full_cot_mean_tokens = _fc.reasoning_tokens if _fc else 113.5
         print(f"  [RESUME] [{cond_idx:>2}] full_cot — skipping (already done)  "
               f"mean_tok={full_cot_mean_tokens:.1f}")
 
@@ -648,12 +675,13 @@ def run_phase3_evaluation(
 
         # ── Steered conditions per source ─────────────────────────────────────
         for source in SOURCES:
+            if source not in alphas:
+                print(f"  [SKIP] No alpha_star for source={source} — skipping all {source} conditions")
+                continue
             alpha = alphas[source]
-            try:
-                L_star = get_injection_layer(vectors_dir, source)
-            except FileNotFoundError:
-                L_star = meta.get(f'{source}_best_layer',
-                                  meta.get('ccot_best_layer', 14))
+            # Always use the best-probe layer (where alpha was tuned) not cPCA selected_layers[0],
+            # which may be a lower-scoring layer due to cPCA threshold ordering.
+            L_star = meta.get(f'{source}_best_layer', meta.get('ccot_best_layer', 18))
 
             print(f"\n  ┌── Source={source}  L*={L_star}  α={alpha:.4f} ──")
 
@@ -755,6 +783,116 @@ def run_phase3_evaluation(
                           f"({cond_elapsed:.0f}s) ══")
                 else:
                     print(f"  [RESUME] [{cond_idx:>2}] {_cpca_cond} — skipping")
+
+            # ── CCoT + Multi-Layer DoM ────────────────────────────────────────
+            _ml_path = os.path.join(vectors_dir, f'{source}_multilayer_dom.pt')
+            if os.path.exists(_ml_path):
+                _ml_cond = f'multilayer_dom_{rtag}_{source}'
+                cond_idx += 1
+                if _ml_cond not in _done_conds:
+                    cond_start = _cond_banner(
+                        cond_idx, f'CCoT+MultiLayerDoM  R={ratio} src={source}', t_phase)
+                    _ml_data = torch.load(_ml_path, map_location='cpu')
+                    _ml_layer_vectors = _ml_data['layer_vectors']
+                    _top_layers = _ml_data['top_layers']
+                    print(f"  │   multi-layer DoM: layers={_top_layers}")
+
+                    def _ev_ml_dom(item, _mlv=_ml_layer_vectors, _a=alpha):
+                        gold   = item['answer'].split('####')[1].strip()
+                        prompt = _ccot_prompt(item)
+                        t0     = time.time()
+                        enc    = tok_ccot(prompt, return_tensors='pt').to(device)
+                        with torch.no_grad():
+                            probe_ids = ccot_model.generate(
+                                **enc, do_sample=False, max_new_tokens=128,
+                                pad_token_id=tok_ccot.eos_token_id,
+                            )
+                        try:
+                            b_idx = find_boundary_idx_ccot(probe_ids, tok_ccot)
+                        except Exception:
+                            b_idx = max(0, enc['input_ids'].shape[1] - 1)
+                        hook_pairs = [
+                            (L, make_dom_hook(b_idx, v, _a, device))
+                            for L, v in _mlv.items()
+                        ]
+                        text = run_with_multihook(ccot_model, tok_ccot, prompt,
+                                                  hook_pairs, device, max_new_tokens)
+                        lat  = time.time() - t0
+                        ok   = _score(text, gold)
+                        fd   = extract_answer(text) is not None
+                        nt   = len(tok_ccot.encode(text, add_special_tokens=False))
+                        return ok, fd, nt, lat
+
+                    c_list, f_list, tok_list, lat_list = _eval_loop(
+                        D_val, _ev_ml_dom, _ml_cond)
+                    r = _build_result(
+                        _ml_cond, model_tag, ratio, source, 'multilayer_dom', alpha,
+                        c_list, f_list, tok_list, lat_list, ccot_correct, full_cot_mean_tokens)
+                    _append_result(r, results, results_dir)
+                    cond_elapsed = time.time() - cond_start
+                    cond_times[_ml_cond] = round(cond_elapsed, 2)
+                    print(f"  ╚══ {_ml_cond}  acc={r.accuracy:.3f}  "
+                          f"flip={r.flip_rate:.3f}  Δ={r.accuracy-ccot_acc:+.3f}  "
+                          f"({cond_elapsed:.0f}s) ══")
+                else:
+                    print(f"  [RESUME] [{cond_idx:>2}] {_ml_cond} — skipping")
+
+            # ── ITI (attention-head-level steering) ───────────────────────────
+            _iti_path = os.path.join(vectors_dir, f'{source}_iti_heads.pt')
+            if os.path.exists(_iti_path):
+                _iti_cond = f'iti_{rtag}_{source}'
+                cond_idx += 1
+                if _iti_cond not in _done_conds:
+                    cond_start = _cond_banner(
+                        cond_idx, f'CCoT+ITI  R={ratio} src={source}', t_phase)
+                    _iti_data = torch.load(_iti_path, map_location='cpu')
+                    _iti_top_heads  = _iti_data['top_heads']
+                    _iti_directions = _iti_data['head_directions']
+                    _iti_sigmas     = _iti_data['head_sigmas']
+                    _iti_top_k      = len(_iti_top_heads)
+
+                    # Find best ITI alpha from sweep, or use sensible default
+                    _iti_alpha_path = os.path.join(
+                        results_dir, f'iti_alpha_diagnostic_{source}.json')
+                    if os.path.exists(_iti_alpha_path):
+                        import json as _jj
+                        with open(_iti_alpha_path) as _jf:
+                            _iti_alpha = _jj.load(_jf).get('best_alpha', 5.0)
+                    else:
+                        _iti_alpha = 5.0
+                    print(f"  │   ITI top_k={_iti_top_k}  alpha={_iti_alpha}")
+
+                    def _ev_iti(item,
+                                _th=_iti_top_heads,
+                                _hd=_iti_directions,
+                                _hs=_iti_sigmas,
+                                _a=_iti_alpha):
+                        gold = item['answer'].split('####')[1].strip()
+                        prompt = _ccot_prompt(item)
+                        t0 = time.time()
+                        text = run_with_iti(
+                            ccot_model, tok_ccot, prompt,
+                            _th, _hd, _hs, _a, device, max_new_tokens,
+                        )
+                        lat = time.time() - t0
+                        ok  = _score(text, gold)
+                        fd  = extract_answer(text) is not None
+                        nt  = len(tok_ccot.encode(text, add_special_tokens=False))
+                        return ok, fd, nt, lat
+
+                    c_list, f_list, tok_list, lat_list = _eval_loop(
+                        D_val, _ev_iti, _iti_cond)
+                    r = _build_result(
+                        _iti_cond, model_tag, ratio, source, 'iti', _iti_alpha,
+                        c_list, f_list, tok_list, lat_list, ccot_correct, full_cot_mean_tokens)
+                    _append_result(r, results, results_dir)
+                    cond_elapsed = time.time() - cond_start
+                    cond_times[_iti_cond] = round(cond_elapsed, 2)
+                    print(f"  ╚══ {_iti_cond}  acc={r.accuracy:.3f}  "
+                          f"flip={r.flip_rate:.3f}  Δ={r.accuracy-ccot_acc:+.3f}  "
+                          f"({cond_elapsed:.0f}s) ══")
+                else:
+                    print(f"  [RESUME] [{cond_idx:>2}] {_iti_cond} — skipping")
 
             # ── Control A: Shuffled DoM ───────────────────────────────────────
             try:
@@ -883,11 +1021,7 @@ def run_phase3_evaluation(
         try:
             v_base_dom = _load_vector(vectors_dir, 'base', 'dom')
             alpha_base = alphas.get('base', alphas.get('ccot'))
-            try:
-                L_star_base = get_injection_layer(vectors_dir, 'base')
-            except FileNotFoundError:
-                L_star_base = meta.get('base_best_layer',
-                                       meta.get('ccot_best_layer', 14))
+            L_star_base = meta.get('base_best_layer', meta.get('ccot_best_layer', 18))
 
             _tdom_cond = f'trimmed_dom_{rtag}'
             cond_idx += 1
@@ -928,10 +1062,15 @@ def run_phase3_evaluation(
 
         # ── Ratio summary line ────────────────────────────────────────────────
         ratio_results = results[ratio_results_start:]
-        best_r = max(ratio_results, key=lambda r: r.accuracy)
-        print(f"  [ratio={ratio}] best={best_r.condition}  "
-              f"acc={best_r.accuracy:.3f}  "
-              f"elapsed={time.time()-t_phase:.0f}s total")
+        if not ratio_results:
+            ratio_results = [r for r in results if r.ratio == ratio]
+        if ratio_results:
+            best_r = max(ratio_results, key=lambda r: r.accuracy)
+            print(f"  [ratio={ratio}] best={best_r.condition}  "
+                  f"acc={best_r.accuracy:.3f}  "
+                  f"elapsed={time.time()-t_phase:.0f}s total")
+        else:
+            print(f"  [ratio={ratio}] no results for this ratio")
 
         del ccot_model
         if torch.cuda.is_available():
@@ -955,7 +1094,7 @@ def run_phase3_evaluation(
     print(f"\n  Phase 3 results → {ph3_path}  ({len(results)} conditions)")
 
     # ── steered_val.json for scripts/selection.py ─────────────────────────────
-    steered   = [r for r in results if r.vector_method in ('dom', 'cpca')]
+    steered   = [r for r in results if r.vector_method in ('dom', 'cpca', 'multilayer_dom', 'iti')]
     max_probe = meta.get('ccot_max_probe_score', 0.0)
     best_s    = max(steered, key=lambda r: (r.accuracy, r.flip_rate)) if steered else None
     sv = {
@@ -1026,6 +1165,87 @@ def run_phase3_evaluation(
     return results
 
 
+# ── ITI evaluation helper ──────────────────────────────────────────────────────
+
+def _load_iti_vectors(vectors_dir: str, source: str) -> dict:
+    path = os.path.join(vectors_dir, f'{source}_iti_heads.pt')
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"ITI vectors missing: {path}")
+    return torch.load(path, map_location='cpu')
+
+
+def _eval_iti_alpha_sweep(
+    model_tag: str,
+    checkpoints_dir: str,
+    D_val: list,
+    vectors_dir: str,
+    meta: dict,
+    results_dir: str,
+    device: str,
+    source: str = 'ccot',
+    n_sub: int = 50,
+) -> float:
+    """
+    Sweep alpha ∈ {0.5, 1, 2, 5, 10, 20} for the ITI condition on a D_val subset.
+    Returns the best alpha found.  Saves iti_alpha_diagnostic.json.
+    """
+    alphas = [0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 20.0]
+    D_sub = D_val[:min(n_sub, len(D_val))]
+    ratio_int = meta['best_ccot_ratio']
+    ratio = ratio_int / 10.0
+
+    try:
+        iti_data = _load_iti_vectors(vectors_dir, source)
+    except FileNotFoundError:
+        print(f"  [ITI alpha sweep skip] ITI vectors not found for source={source}")
+        return 5.0
+
+    top_heads       = iti_data['top_heads']
+    head_directions = iti_data['head_directions']
+    head_sigmas     = iti_data['head_sigmas']
+
+    ckpt = os.path.join(checkpoints_dir, f'ccot_R{ratio_int}')
+    if not os.path.exists(os.path.join(ckpt, 'adapter_config.json')):
+        return 5.0
+
+    model, tok = load_finetuned(ckpt, device)
+    for p in model.parameters():
+        p.requires_grad = False
+    model.eval()
+
+    prompt_fn = lambda item: f"Question: {item['question']}\n\n[compress:{ratio}]\n"
+
+    sweep_results = []
+    best_alpha, best_acc = alphas[0], 0.0
+
+    for a in alphas:
+        c_list = []
+        for item in D_sub:
+            gold = item['answer'].split('####')[1].strip()
+            text = run_with_iti(
+                model, tok, prompt_fn(item),
+                top_heads, head_directions, head_sigmas,
+                alpha=a, device=device, max_new_tokens=256,
+            )
+            c_list.append(_score(text, gold))
+        acc = sum(c_list) / len(c_list)
+        sweep_results.append({'alpha': a, 'accuracy': acc})
+        print(f"  [ITI α-sweep] α={a:>5.1f}  acc={acc:.3f}")
+        if acc > best_acc:
+            best_acc, best_alpha = acc, a
+
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    out = os.path.join(results_dir, f'iti_alpha_diagnostic_{source}.json')
+    with open(out, 'w') as f:
+        json.dump({'source': source, 'sweep': sweep_results, 'best_alpha': best_alpha,
+                   'top_k': len(top_heads)}, f, indent=2)
+    print(f"  ITI alpha sweep → {out}  best_alpha={best_alpha}  best_acc={best_acc:.3f}")
+    return best_alpha
+
+
 # ── Diagnostic alpha sweep ─────────────────────────────────────────────────────
 
 def _run_diagnostic_sweep(
@@ -1039,11 +1259,11 @@ def _run_diagnostic_sweep(
     ratio_int = meta['best_ccot_ratio']
 
     try:
-        v_dom  = _load_vector(vectors_dir, source, 'dom')
-        L_star = get_injection_layer(vectors_dir, source)
+        v_dom = _load_vector(vectors_dir, source, 'dom')
     except FileNotFoundError:
-        print("  [sweep skip] Missing vector or cPCA file.")
+        print("  [sweep skip] Missing DoM vector.")
         return
+    L_star = meta.get('ccot_best_layer', 18)
 
     ckpt   = os.path.join(checkpoints_dir, f'ccot_R{ratio_int}')
     if not os.path.exists(os.path.join(ckpt, 'adapter_config.json')):
@@ -1139,9 +1359,9 @@ def _print_phase3_table(results: list[ConditionResult]):
             if prefix in res_map:
                 print("  " + _row(res_map[prefix]))
 
-        # Main steered (dom, cpca) per source
+        # Main steered (dom, cpca, multilayer_dom, iti) per source
         for src in SOURCES:
-            for method in ('dom', 'cpca'):
+            for method in ('dom', 'cpca', 'multilayer_dom', 'iti'):
                 key = f'{method}_{rtag}_{src}'
                 if key in res_map:
                     r = res_map[key]
@@ -1178,7 +1398,7 @@ def _print_phase3_table(results: list[ConditionResult]):
         base_acc = base_acc.accuracy
         best_steer = max(
             (res_map[k] for k in res_map
-             if k.startswith(('dom_', 'cpca_')) and f'_{rtag}_' in k),
+             if k.startswith(('dom_', 'cpca_', 'multilayer_dom_')) and f'_{rtag}_' in k),
             key=lambda r: r.accuracy,
             default=None,
         )

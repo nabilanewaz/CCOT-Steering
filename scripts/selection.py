@@ -23,10 +23,13 @@ def _n_items(value) -> int:
 
 
 def compute_config_score(results_dir: str, model_tags: list,
-                          cfg_id: str) -> dict:
+                          cfg_id: str) -> dict | None:
     scores = {}
     for model_tag in model_tags:
         path = os.path.join(results_dir, cfg_id, model_tag, 'steered_val.json')
+        if not os.path.exists(path):
+            print(f"  [SKIP] {path} not found — model not yet complete for {cfg_id}")
+            continue
         m   = load_json(path)
         n   = m['n_examples']
         cor = round(m['steered_accuracy'] * n)
@@ -40,6 +43,9 @@ def compute_config_score(results_dir: str, model_tags: list,
             'probe_acc': m.get('probe_accuracy', 0.0),
         }
 
+    if not scores:
+        return None
+
     mean_acc   = float(np.mean([s['accuracy']  for s in scores.values()]))
     mean_lower = float(np.mean([s['ci_lower']  for s in scores.values()]))
     mean_flip  = float(np.mean([s['flip_rate'] for s in scores.values()]))
@@ -52,6 +58,7 @@ def compute_config_score(results_dir: str, model_tags: list,
         'mean_lower': mean_lower,
         'mean_flip':  mean_flip,
         'mean_probe': mean_probe,
+        'n_models':   len(scores),
     }
 
 
@@ -66,11 +73,19 @@ def print_selection_table(scores: dict):
 
 
 def select_best_config(splits: dict, results_dir: str, model_tags: list) -> tuple:
-    scores = {
-        cfg: compute_config_score(results_dir, model_tags, cfg)
-        for cfg in splits.keys()
-    }
+    all_scores = {}
+    for cfg in splits.keys():
+        score = compute_config_score(results_dir, model_tags, cfg)
+        if score is not None:
+            all_scores[cfg] = score
 
+    if not all_scores:
+        raise RuntimeError(
+            "No steered_val.json found for any config/model combination. "
+            "Run Phase 3 for at least one model before selection."
+        )
+
+    scores = all_scores
     print_selection_table(scores)
 
     winner = max(scores, key=lambda c: scores[c]['mean_lower'])

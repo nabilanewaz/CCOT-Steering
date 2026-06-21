@@ -31,11 +31,11 @@ MODEL_PHASE2_CONFIG = {
     'qwen25_math1.5b': {
         'N': 10,
         'cpca_variant':         'shrunk',
-        'r_per_layer':          2,
-        'r_final':              6,
+        'r_per_layer':          3,
+        'r_final':              8,
         'beta':                 0.5,
-        'threshold_multiplier': 0.6,
-        'min_samples':          300,
+        'threshold_multiplier': 0.4,
+        'min_samples':          200,
     },
 }
 
