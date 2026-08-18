@@ -34,6 +34,7 @@ from phase2.cpca import (
 )
 from phase2.compare import compare_methods, select_best_source_method
 from phase1.inference import cot_prompt, latent_prompt
+from utils.experiment_config import require_exact_count
 
 _CPCA_FN_MAP = {
     'full':       cpca_full,
@@ -136,6 +137,8 @@ def run_phase2_source(
         "phase2_prompt_version": 2,
         "prompt_mode": prompt_mode,
         "answer_label_source": "generated_text_only",
+        "n_steer": len(D_steer),
+        "n_rollouts": N,
     }
     cache = None
     if os.path.exists(hstates_cache):
@@ -437,6 +440,7 @@ def run_phase2_all_sources(
     Load Source A (best CCoT checkpoint) and Source B (CoT checkpoint),
     run Phase 2 extraction for both, save vectors, and write phase2_meta.json.
     """
+    require_exact_count(D_steer, "D_steer")
     phase_start = time.time()
     cfg = get_model_config(model_tag)
     best_latent_tokens = pick_best_ccot_latent_tokens(results_dir, model_tag)
@@ -528,6 +532,7 @@ def run_phase2_all_sources(
 
     meta = {
         'model_tag':              model_tag,
+        'n_steer':                len(D_steer),
         'phase2_prompt_version':  2,
         'ccot_prompt_mode':       'latent_prompt',
         'base_prompt_mode':       'cot_prompt',

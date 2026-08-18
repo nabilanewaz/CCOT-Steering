@@ -3,6 +3,8 @@ from math import sqrt
 import numpy as np
 import os
 
+from utils.experiment_config import samples_per_phase
+
 
 def wilson_ci(correct: int, n: int, z: float = 1.96) -> tuple:
     p_hat  = correct / n
@@ -98,7 +100,8 @@ def select_best_config(splits: dict, results_dir: str, model_tags: list) -> tupl
             'n_train':          _n_items(splits[winner]['D_train']),
             'n_steer':          _n_items(splits[winner]['D_steer']),
             'n_val':            _n_items(splits[winner]['D_val']),
-            'n_test':           None,
+            'n_test':           samples_per_phase(),
+            'samples_per_phase': samples_per_phase(),
             'selection_metric': 'mean_wilson_lower_steered_val_accuracy',
             'selection_value':  round(scores[winner]['mean_lower'], 4),
             'flip_rate':        round(scores[winner]['mean_flip'],  4),
@@ -126,7 +129,7 @@ if __name__ == '__main__':
             splits = json.load(f)
     else:
         splits = {
-            'S2': {'D_train': 4484, 'D_steer': 1495, 'D_val': 1495},
+            'S2': {'D_train': 300, 'D_steer': 300, 'D_val': 300},
         }
 
     MODEL_TAGS = ['llama32_3b', 'phi2', 'qwen25_0.5b', 'qwen25_3b', 'qwen25_math1.5b']

@@ -22,6 +22,14 @@ class Coconut(torch.nn.Module):
         self.last_generation_latents = []
         self.last_trajectory_faithfulness = 0.0
 
+    @property
+    def config(self):
+        return self.base_causallm.config
+
+    @property
+    def generation_config(self):
+        return self.base_causallm.generation_config
+
     def _process_kv(self, kv_cache, keep_len):
         if kv_cache is None:
             return None
@@ -88,16 +96,18 @@ class Coconut(torch.nn.Module):
     def forward(
         self,
         input_ids,
-        attention_mask,
+        attention_mask=None,
         labels=None,
         steering_vector=None,
         alpha=0.0,
         gamma=1.0,
         steering_mode="vector",
         collect_steering_stats=False,
-        detach_latents=True,
+        detach_latents=False,
         use_kv_cache=True,
     ):
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
         latent_sequence = []
         self.last_steering_stats = []
         latent_indices = (input_ids == self.latent_token_id).nonzero()
@@ -129,11 +139,12 @@ class Coconut(torch.nn.Module):
                     steering_mode,
                     collect_steering_stats,
                 )
-                latent_sequence.append(hidden_states.detach() if detach_latents else hidden_states)
+                latent_value = hidden_states.detach() if detach_latents else hidden_states
+                latent_sequence.append(latent_value)
                 inputs_embeds = inputs_embeds.clone()
                 filling_indices = [(i, l[pass_idx]) for i, l in enumerate(latent_lists) if len(l) > pass_idx]
                 for batch_idx, token_idx in filling_indices:
-                    inputs_embeds[batch_idx, token_idx] = hidden_states[batch_idx, -1]
+                    inputs_embeds[batch_idx, token_idx] = latent_value[batch_idx, -1]
 
             outputs = self.base_causallm(
                 inputs_embeds=inputs_embeds,
@@ -169,12 +180,13 @@ class Coconut(torch.nn.Module):
                     steering_mode,
                     collect_steering_stats,
                 )
-                latent_sequence.append(hidden_states.detach() if detach_latents else hidden_states)
+                latent_value = hidden_states.detach() if detach_latents else hidden_states
+                latent_sequence.append(latent_value)
                 kv_cache = outputs.past_key_values
                 inputs_embeds = inputs_embeds.clone()
                 filling_indices = [(i, l[pass_idx]) for i, l in enumerate(latent_lists) if len(l) > pass_idx]
                 for batch_idx, token_idx in filling_indices:
-                    inputs_embeds[batch_idx, token_idx] = hidden_states[batch_idx, -1]
+                    inputs_embeds[batch_idx, token_idx] = latent_value[batch_idx, -1]
 
             final_cache = self._process_kv(kv_cache, next_compute_range[0])
             outputs = self.base_causallm(
@@ -197,9 +209,34 @@ class Coconut(torch.nn.Module):
             )
         return Outputs(loss, inputs_embeds, logits, latent_sequence)
 
+    def generate(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        max_new_tokens=128,
+        do_sample=False,
+        temperature=1.0,
+        **kwargs,
+    ):
+        if input_ids is None:
+            raise ValueError("Coconut.generate requires input_ids")
+        sampling_temperature = temperature if do_sample else 0.0
+        output_ids, _, _ = self.generate_with_latents(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            temperature=sampling_temperature,
+            steering_vector=kwargs.pop("steering_vector", None),
+            alpha=kwargs.pop("alpha", 0.0),
+            gamma=kwargs.pop("gamma", 1.0),
+            steering_mode=kwargs.pop("steering_mode", "vector"),
+        )
+        return output_ids
+
     def generate_with_latents(
         self,
         input_ids,
+        attention_mask=None,
         max_new_tokens=128,
         temperature=0.0,
         steering_vector=None,
@@ -207,46 +244,54 @@ class Coconut(torch.nn.Module):
         gamma=1.0,
         steering_mode="vector",
     ):
+        if input_ids.shape[0] != 1:
+            raise ValueError("Coconut generation currently requires batch_size=1")
         self.eval()
-        tokens = input_ids.tolist()[0]
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
         with torch.no_grad():
             outputs = self.forward(
                 input_ids=input_ids,
-                attention_mask=torch.ones_like(input_ids),
+                attention_mask=attention_mask,
                 steering_vector=steering_vector,
                 alpha=alpha,
                 gamma=gamma,
                 steering_mode=steering_mode,
+                use_kv_cache=False,
             )
+
         latent_steps = [h[:, -1, :].detach().cpu() for h in outputs.latent_sequence]
         self.last_generation_latents = latent_steps
         mean_latent = torch.mean(torch.stack(latent_steps), dim=0) if latent_steps else None
-        scores = []
-        if len(latent_steps) > 1:
-            for h_prev, h_next in zip(latent_steps[:-1], latent_steps[1:]):
-                scores.append(F.cosine_similarity(h_prev, h_next, dim=-1).item())
+        scores = [
+            F.cosine_similarity(h_prev, h_next, dim=-1).item()
+            for h_prev, h_next in zip(latent_steps[:-1], latent_steps[1:])
+        ]
         self.last_trajectory_faithfulness = float(np.mean(scores)) if scores else 0.0
 
-        if temperature > 0:
-            scaled = outputs.logits[:, -1, :] / temperature
-            probs = torch.nn.functional.softmax(scaled, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1).item()
-        else:
-            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1).item()
-        tokens.append(next_token)
-        curr_input_ids = torch.tensor([tokens], device=input_ids.device)
-
+        generated_ids = input_ids.clone()
+        inputs_embeds = outputs.inputs_embeds
+        logits = outputs.logits
         for _ in range(max_new_tokens):
-            with torch.no_grad():
-                out = self.base_causallm(input_ids=curr_input_ids)
             if temperature > 0:
-                scaled = out.logits[:, -1, :] / temperature
-                probs = torch.nn.functional.softmax(scaled, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1).item()
+                probs = torch.softmax(logits[:, -1, :] / temperature, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
             else:
-                next_token = torch.argmax(out.logits[:, -1, :], dim=-1).item()
-            if next_token == self.eos_token_id:
+                next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+            generated_ids = torch.cat([generated_ids, next_token], dim=1)
+            if self.eos_token_id is not None and next_token.item() == self.eos_token_id:
                 break
-            tokens.append(next_token)
-            curr_input_ids = torch.tensor([tokens], device=input_ids.device)
-        return torch.tensor([tokens]), mean_latent, self.last_trajectory_faithfulness
+
+            next_embed = self.embedding(next_token)
+            inputs_embeds = torch.cat([inputs_embeds, next_embed], dim=1)
+            with torch.no_grad():
+                next_outputs = self.base_causallm(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=torch.ones(
+                        inputs_embeds.shape[:2], dtype=torch.long, device=input_ids.device
+                    ),
+                    use_cache=False,
+                )
+            logits = next_outputs.logits
+
+        return generated_ids, mean_latent, self.last_trajectory_faithfulness

@@ -11,31 +11,30 @@ from transformers.data.data_collator import pad_without_fast_tokenizer_warning
 from tqdm.auto import tqdm
 
 from phase1.data import get_hf_dataset
+from phase1.inference import extract_answer, normalize_answer
 from phase1.modeling import Coconut
+from utils.experiment_config import require_exact_count
 from utils.torch_compat import patch_transformers_custom_op_registration
 
 MODEL_HPARAMS = {
-    "llama32_3b": {"lr": 1e-5, "batch": 1, "grad_accum": 64, "epochs": 20},
-    "phi2": {"lr": 1e-5, "batch": 1, "grad_accum": 64, "epochs": 20},
-    "qwen25_0.5b": {"lr": 1e-5, "batch": 1, "grad_accum": 64, "epochs": 20},
-    "qwen25_3b": {"lr": 1e-5, "batch": 1, "grad_accum": 64, "epochs": 20},
-    "qwen25_math1.5b": {"lr": 1e-5, "latent_lr": 3e-6, "batch": 1, "grad_accum": 128, "epochs": 20},
+    "llama32_3b": {"lr": 1e-4, "batch": 1, "grad_accum": 128, "epochs": 30},
+    "phi2": {"lr": 1e-4, "batch": 1, "grad_accum": 128, "epochs": 30},
+    "qwen25_0.5b": {"lr": 1e-4, "batch": 1, "grad_accum": 128, "epochs": 30},
+    "qwen25_3b": {"lr": 1e-4, "batch": 1, "grad_accum": 128, "epochs": 30},
+    "qwen25_math1.5b": {"lr": 1e-4, "batch": 1, "grad_accum": 128, "epochs": 30},
 }
-_DEFAULT_HP = {"lr": 1e-5, "batch": 1, "grad_accum": 64, "epochs": 20}
+_DEFAULT_HP = {"lr": 1e-4, "batch": 1, "grad_accum": 128, "epochs": 30}
 MAX_SEQ_LEN = 512
 MAX_LATENT_TOKENS = 6
 C_THOUGHT = 2
-HYBRID_MODE = True
+MAX_LATENT_STAGE = 3
 LATENT_TOKEN_COUNTS = [3, 4, 6]
 CANONICAL_DIRNAME = "_coconut_phase1"
 BEST_DIRNAME = "_coconut_phase1_best"
 LATENT_ONLY_BEST_DIRNAME = "_coconut_phase1_best_latent_only"
-EPOCH9_DIRNAME = "_coconut_phase1_epoch9"
-EARLY_STOP_PATIENCE = 2
-EARLY_STOP_MIN_DELTA = 0.002
-EARLY_STOP_MIN_EPOCH = 20
-EPOCH9_SNAPSHOT_EPOCH = 9
-BEST_CHECKPOINT_MIN_STAGE = 3
+COT_BEST_DIRNAME = "_coconut_phase1_cot_best"
+CURRICULUM_VERSION = "paper_gsm8k_c2_stage0_6_stage123_3_final_to_30_v1"
+BEST_CHECKPOINT_MIN_STAGE = 4
 LATENT_ONLY_CHECKPOINT_MIN_STAGE = 4
 TRAIN_USE_KV_CACHE = False
 TRAIN_DETACH_LATENTS = False
@@ -97,7 +96,8 @@ def _init_model(base_model_id: str, device: str):
 
     with torch.no_grad():
         input_embeds = model.get_input_embeddings()
-        init_id = tokenizer.encode("The", add_special_tokens=False)[0]
+        # Match the reference implementation's initialization for new tokens.
+        init_id = tokenizer.encode("<<", add_special_tokens=False)[0]
         init_ids = [latent_id, start_id, end_id]
         if added_pad:
             init_ids.append(tokenizer.pad_token_id)
@@ -149,33 +149,24 @@ def _get_stage_info(epoch: int) -> tuple[int, bool, bool]:
 
 
 def _build_stage_dataset(base_dataset, stage: int, drop_remaining: bool, start_id: int, latent_id: int, end_id: int):
+    if stage < 0 or stage > MAX_LATENT_STAGE + 1:
+        raise ValueError(f"Invalid Coconut curriculum stage: {stage}")
+
     def _process(sample):
-        if len(sample["steps_tokenized"]) > 0 and HYBRID_MODE:
-            skeleton = sample["steps_tokenized"][0]
-            remaining = sample["steps_tokenized"][1:]
+        question = sample["question_tokenized"]
+        if stage == 0:
+            reasoning = list(itertools.chain.from_iterable(sample["steps_tokenized"]))
+            tokens = question + reasoning + sample["answer_tokenized"]
+            mask_len = len(question)
         else:
-            skeleton = []
-            remaining = sample["steps_tokenized"]
+            fully_latent = drop_remaining or stage > MAX_LATENT_STAGE
+            n_latent_tokens = MAX_LATENT_TOKENS if fully_latent else stage * C_THOUGHT
+            kept_steps = [] if fully_latent else sample["steps_tokenized"][stage:]
+            reasoning = list(itertools.chain.from_iterable(kept_steps))
+            prefix = question + [start_id] + [latent_id] * n_latent_tokens + [end_id]
+            tokens = prefix + reasoning + sample["answer_tokenized"]
+            mask_len = len(prefix)
 
-        steps_to_drop = min(stage, len(remaining))
-        if drop_remaining:
-            kept_remaining_steps = []
-            n_latent_tokens = MAX_LATENT_TOKENS
-        else:
-            kept_remaining_steps = remaining[steps_to_drop:]
-            n_latent_tokens = steps_to_drop * C_THOUGHT
-
-        kept_remaining_text = list(itertools.chain.from_iterable(kept_remaining_steps))
-        tokens = (
-            sample["question_tokenized"]
-            + skeleton
-            + [start_id]
-            + [latent_id] * n_latent_tokens
-            + [end_id]
-            + kept_remaining_text
-            + sample["answer_tokenized"]
-        )
-        mask_len = len(sample["question_tokenized"]) + len(skeleton) + n_latent_tokens + 2
         labels = [-100] * mask_len + tokens[mask_len:]
         tokens = tokens[:MAX_SEQ_LEN]
         labels = labels[:MAX_SEQ_LEN]
@@ -192,17 +183,23 @@ def _save_coconut_checkpoint(
     role: str,
     epoch: int | None = None,
     val_accuracy: float | None = None,
+    uses_coconut_wrapper: bool = True,
 ) -> None:
     os.makedirs(output_dir, exist_ok=True)
     coconut_model.base_causallm.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
     meta = {
-        "architecture": "coconut",
+        "architecture": "coconut" if uses_coconut_wrapper else "causal_lm_cot",
         "base_model_id": base_model_id,
         "latent_start_token": "<|start-latent|>",
         "latent_token": "<|latent|>",
         "latent_end_token": "<|end-latent|>",
         "checkpoint_role": role,
+        "uses_coconut_wrapper": uses_coconut_wrapper,
+        "curriculum_version": CURRICULUM_VERSION,
+        "c_thought": C_THOUGHT,
+        "max_latent_stage": MAX_LATENT_STAGE,
+        "final_latent_tokens": MAX_LATENT_TOKENS,
     }
     if epoch is not None:
         meta["epoch"] = epoch
@@ -213,21 +210,17 @@ def _save_coconut_checkpoint(
         f.write("\n")
 
 
-def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, model_tag: str):
+def _run_coconut_training(base_model_id: str, D_train: list, D_val: list, output_dir: str, model_tag: str):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     hp = dict(MODEL_HPARAMS.get(model_tag, _DEFAULT_HP))
-    hp["epochs"] = min(hp["epochs"], 20)
     coconut_model, tokenizer, latent_id, start_id, end_id = _init_model(base_model_id, device)
 
-    raw_ds = _to_coconut_examples(D_train)
-    n_val = max(1, int(round(len(raw_ds) * 0.1))) if len(raw_ds) > 1 else 0
-    train_raw = raw_ds[:-n_val] if n_val else raw_ds
-    val_raw = raw_ds[-n_val:] if n_val else []
+    train_raw = _to_coconut_examples(D_train)
+    val_raw = _to_coconut_examples(D_val)
     ds = get_hf_dataset(train_raw, tokenizer)
     collator = MyCollator(tokenizer, latent_id=latent_id)
 
     optimizer = None
-    scheduler = None
     loss_history = []
     losses_per_stage = {i: [] for i in range(5)}
     stage_transition_epochs = []
@@ -237,25 +230,19 @@ def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, mo
     checkpoint_root = os.path.dirname(output_dir)
     best_dir = os.path.join(checkpoint_root, BEST_DIRNAME)
     latent_only_best_dir = os.path.join(checkpoint_root, LATENT_ONLY_BEST_DIRNAME)
-    epoch9_dir = os.path.join(checkpoint_root, EPOCH9_DIRNAME)
+    cot_best_dir = os.path.join(checkpoint_root, COT_BEST_DIRNAME)
     best_val_acc = -float("inf")
     best_epoch = None
     best_stage = None
     latent_only_best_val_acc = -float("inf")
     latent_only_best_epoch = None
     latent_only_best_stage = None
-    warmup_best_val_acc = -float("inf")
-    warmup_best_epoch = None
-    early_stop_best_acc = -float("inf")
-    early_stop_bad_epochs = 0
-    early_stopped = False
-    early_stop_epoch = None
+    cot_best_val_acc = -float("inf")
+    cot_best_epoch = None
     skipped_nonfinite_losses = 0
     skipped_nonfinite_steps = 0
 
-    def _phase1_val_accuracy() -> float:
-        if not val_raw:
-            return 0.0
+    def _phase1_val_accuracy(stage: int, drop_remaining: bool) -> float:
         coconut_model.eval()
         correct = 0
         tqdm.write(f"[phase1][{model_tag}] running validation on {len(val_raw)} examples...")
@@ -266,10 +253,15 @@ def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, mo
             dynamic_ncols=True,
         )
         for sample in val_iter:
-            prompt = (
-                sample["question"] + "\n<|start-latent|>"
-                + "<|latent|>" * MAX_LATENT_TOKENS + "<|end-latent|>"
-            )
+            if stage == 0:
+                prompt = sample["question"] + "\n"
+            else:
+                fully_latent = drop_remaining or stage > MAX_LATENT_STAGE
+                n_latents = MAX_LATENT_TOKENS if fully_latent else stage * C_THOUGHT
+                prompt = (
+                    sample["question"] + "\n<|start-latent|>"
+                    + "<|latent|>" * n_latents + "<|end-latent|>"
+                )
             inp = tokenizer.encode(prompt, return_tensors="pt").to(device)
             with torch.no_grad():
                 out_ids, _, _ = coconut_model.generate_with_latents(
@@ -277,9 +269,12 @@ def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, mo
                     max_new_tokens=64,
                     temperature=0.0,
                 )
-            decoded = tokenizer.decode(out_ids[0], skip_special_tokens=True)
-            pred = sample["answer"].replace(",", "").strip()
-            if pred and pred in decoded.replace(",", ""):
+            generated = tokenizer.decode(
+                out_ids[0][inp.shape[1]:], skip_special_tokens=True
+            )
+            pred = normalize_answer(extract_answer(generated))
+            gold = normalize_answer(sample["answer"])
+            if pred and pred == gold:
                 correct += 1
             val_iter.set_postfix({"acc": f"{correct / max(1, val_iter.n):.4f}"})
         return correct / max(len(val_raw), 1)
@@ -290,16 +285,9 @@ def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, mo
         train_loader = DataLoader(train_ds, batch_size=hp["batch"], collate_fn=collator, shuffle=True)
         if optimizer is None or reset_opt:
             stage_transition_epochs.append(epoch)
-            stage_lr = hp["lr"] if stage == 0 else hp.get("latent_lr", hp["lr"] * 0.5)
-            optimizer = torch.optim.AdamW(coconut_model.parameters(), lr=stage_lr, weight_decay=0.01, eps=1e-8)
-            epochs_in_stage = 3 if stage < 4 else max(1, hp["epochs"] - epoch)
-            total_steps = max(1, (len(train_loader) * epochs_in_stage) // hp["grad_accum"])
-            warmup_steps = max(10, int(total_steps * 0.1))
-            def _lr_lambda(step: int):
-                if step < warmup_steps:
-                    return float(step) / max(1, warmup_steps)
-                return max(0.0, float(total_steps - step) / max(1, total_steps - warmup_steps))
-            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
+            optimizer = torch.optim.AdamW(
+                coconut_model.parameters(), lr=hp["lr"], weight_decay=0.01, eps=1e-8
+            )
 
         coconut_model.train()
         optimizer.zero_grad(set_to_none=True)
@@ -308,6 +296,7 @@ def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, mo
         finite_loss_steps = 0
         epoch_skipped_losses = 0
         epoch_skipped_steps = 0
+        accumulated_steps = 0
         for step, batch in enumerate(pbar):
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
@@ -325,6 +314,7 @@ def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, mo
                 skipped_nonfinite_losses += 1
                 epoch_skipped_losses += 1
                 optimizer.zero_grad(set_to_none=True)
+                accumulated_steps = 0
                 pbar.set_postfix({
                     "loss": total_loss / max(finite_loss_steps, 1),
                     "skipped": epoch_skipped_losses,
@@ -333,15 +323,23 @@ def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, mo
             loss.backward()
             total_loss += float(loss.item() * hp["grad_accum"])
             finite_loss_steps += 1
-            if finite_loss_steps % hp["grad_accum"] == 0:
+            accumulated_steps += 1
+            accumulation_boundary = accumulated_steps == hp["grad_accum"]
+            last_batch = step + 1 == len(train_loader)
+            if accumulation_boundary or (last_batch and accumulated_steps > 0):
+                if accumulated_steps < hp["grad_accum"]:
+                    scale = hp["grad_accum"] / accumulated_steps
+                    for param in coconut_model.parameters():
+                        if param.grad is not None:
+                            param.grad.mul_(scale)
                 grad_norm = torch.nn.utils.clip_grad_norm_(coconut_model.parameters(), max_norm=1.0)
                 if torch.isfinite(grad_norm):
                     optimizer.step()
-                    scheduler.step()
                 else:
                     skipped_nonfinite_steps += 1
                     epoch_skipped_steps += 1
                 optimizer.zero_grad(set_to_none=True)
+                accumulated_steps = 0
             pbar.set_postfix({
                 "loss": total_loss / max(finite_loss_steps, 1),
                 "skipped": epoch_skipped_losses + epoch_skipped_steps,
@@ -364,12 +362,26 @@ def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, mo
                     dim=-1,
                 ).item()
                 drift_by_token[name].append(drift)
-        val_acc = _phase1_val_accuracy()
+        val_acc = _phase1_val_accuracy(stage, drop_remaining)
         val_acc_history.append(val_acc)
         epoch_number = epoch + 1
-        if val_acc > warmup_best_val_acc:
-            warmup_best_val_acc = val_acc
-            warmup_best_epoch = epoch_number
+        if stage == 0 and val_acc > cot_best_val_acc:
+            cot_best_val_acc = val_acc
+            cot_best_epoch = epoch_number
+            _save_coconut_checkpoint(
+                coconut_model,
+                tokenizer,
+                cot_best_dir,
+                base_model_id,
+                role="cot_stage0_best",
+                epoch=epoch_number,
+                val_accuracy=val_acc,
+                uses_coconut_wrapper=False,
+            )
+            tqdm.write(
+                f"[phase1][{model_tag}] best CoT checkpoint saved -> {cot_best_dir} "
+                f"(epoch={epoch_number} val_acc={val_acc:.4f})"
+            )
         eligible_for_best = stage >= BEST_CHECKPOINT_MIN_STAGE
         if eligible_for_best and val_acc > best_val_acc:
             best_val_acc = val_acc
@@ -406,20 +418,6 @@ def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, mo
                 f"[phase1][{model_tag}] best latent-only checkpoint saved -> {latent_only_best_dir} "
                 f"(epoch={epoch_number} stage={stage} val_acc={val_acc:.4f})"
             )
-        if epoch_number == EPOCH9_SNAPSHOT_EPOCH:
-            _save_coconut_checkpoint(
-                coconut_model,
-                tokenizer,
-                epoch9_dir,
-                base_model_id,
-                role="epoch9",
-                epoch=epoch_number,
-                val_accuracy=val_acc,
-            )
-            tqdm.write(
-                f"[phase1][{model_tag}] epoch 9 checkpoint saved -> {epoch9_dir} "
-                f"(val_acc={val_acc:.4f})"
-            )
         tqdm.write(
             f"[phase1][{model_tag}] epoch={epoch_number}/{hp['epochs']} "
             f"stage={stage} train_loss={epoch_avg_loss:.4f} "
@@ -427,26 +425,6 @@ def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, mo
             f"skipped_nonfinite={epoch_skipped_losses + epoch_skipped_steps} "
             f"(train_n={len(train_raw)} val_n={len(val_raw)})"
         )
-
-        if val_acc > early_stop_best_acc + EARLY_STOP_MIN_DELTA:
-            early_stop_best_acc = val_acc
-            early_stop_bad_epochs = 0
-        else:
-            early_stop_bad_epochs += 1
-
-        if (
-            epoch_number >= EARLY_STOP_MIN_EPOCH
-            and epoch_number < hp["epochs"]
-            and early_stop_bad_epochs >= EARLY_STOP_PATIENCE
-        ):
-            early_stopped = True
-            early_stop_epoch = epoch_number
-            tqdm.write(
-                f"[phase1][{model_tag}] early stopping at epoch {epoch_number}: "
-                f"best_val_acc={best_val_acc:.4f} best_epoch={best_epoch} "
-                f"patience={EARLY_STOP_PATIENCE} min_delta={EARLY_STOP_MIN_DELTA}"
-            )
-            break
 
     _save_coconut_checkpoint(
         coconut_model,
@@ -496,27 +474,32 @@ def _run_coconut_training(base_model_id: str, D_train: list, output_dir: str, mo
         "embedding_drift": drift_by_token,
         "n_train": len(train_raw),
         "n_val": len(val_raw),
+        "n_phase_examples": len(train_raw),
+        "n_validation_examples": len(val_raw),
+        "validation_source": "D_val",
         "epochs": hp["epochs"],
         "completed_epochs": len(loss_history),
-        "early_stopped": early_stopped,
-        "early_stop_epoch": early_stop_epoch,
-        "early_stop_patience": EARLY_STOP_PATIENCE,
-        "early_stop_min_delta": EARLY_STOP_MIN_DELTA,
-        "early_stop_min_epoch": EARLY_STOP_MIN_EPOCH,
+        "fixed_epoch_schedule": True,
+        "learning_rate": hp["lr"],
+        "effective_batch_size": hp["batch"] * hp["grad_accum"],
+        "curriculum_version": CURRICULUM_VERSION,
+        "c_thought": C_THOUGHT,
+        "max_latent_stage": MAX_LATENT_STAGE,
+        "final_latent_tokens": MAX_LATENT_TOKENS,
         "best_val_accuracy": best_val_acc if best_epoch is not None else None,
         "best_epoch": best_epoch,
         "best_stage": best_stage,
         "best_checkpoint_min_stage": BEST_CHECKPOINT_MIN_STAGE,
-        "best_checkpoint_policy": "full_latent_budget_stage3_plus",
+        "best_checkpoint_policy": "fully_latent_stage4_only",
         "latent_only_best_val_accuracy": latent_only_best_val_acc if latent_only_best_epoch is not None else None,
         "latent_only_best_epoch": latent_only_best_epoch,
         "latent_only_best_stage": latent_only_best_stage,
         "latent_only_checkpoint_min_stage": LATENT_ONLY_CHECKPOINT_MIN_STAGE,
         "latent_only_best_checkpoint_dir": latent_only_best_dir,
-        "warmup_best_val_accuracy": warmup_best_val_acc if warmup_best_epoch is not None else None,
-        "warmup_best_epoch": warmup_best_epoch,
+        "cot_best_val_accuracy": cot_best_val_acc if cot_best_epoch is not None else None,
+        "cot_best_epoch": cot_best_epoch,
+        "cot_best_checkpoint_dir": cot_best_dir,
         "best_checkpoint_dir": best_dir,
-        "epoch9_checkpoint_dir": epoch9_dir,
         "train_use_kv_cache": TRAIN_USE_KV_CACHE,
         "train_detach_latents": TRAIN_DETACH_LATENTS,
         "skipped_nonfinite_losses": skipped_nonfinite_losses,
@@ -591,39 +574,46 @@ def _materialize_alias_dir(src_dir: str, dst_dir: str) -> None:
 def export_compat_checkpoints(
     checkpoints_dir: str,
     latent_token_counts: list[int] = LATENT_TOKEN_COUNTS,
-    source_dirname: str = BEST_DIRNAME,
 ) -> None:
-    source_dir = os.path.join(checkpoints_dir, source_dirname)
-    if not os.path.exists(os.path.join(source_dir, "config.json")):
-        fallback_dir = os.path.join(checkpoints_dir, CANONICAL_DIRNAME)
-        if not os.path.exists(os.path.join(fallback_dir, "config.json")):
-            raise FileNotFoundError(
-                f"No Coconut checkpoint found: {source_dir} or {fallback_dir}"
-            )
-        print(f"Best Coconut checkpoint not found -> {source_dir}; exporting aliases from {fallback_dir}")
-        source_dir = fallback_dir
-        source_dirname = CANONICAL_DIRNAME
+    coconut_source = os.path.join(checkpoints_dir, BEST_DIRNAME)
+    cot_source = os.path.join(checkpoints_dir, COT_BEST_DIRNAME)
+    source_specs = ((coconut_source, True), (cot_source, False))
+    for source, expected_wrapper in source_specs:
+        config_path = os.path.join(source, "config.json")
+        meta_path = os.path.join(source, "coconut_meta.json")
+        if not os.path.exists(config_path) or not os.path.exists(meta_path):
+            raise FileNotFoundError(f"Required Phase 1 checkpoint not found: {source}")
+        with open(meta_path, encoding="utf-8") as f:
+            checkpoint_meta = json.load(f)
+        if (
+            checkpoint_meta.get("curriculum_version") != CURRICULUM_VERSION
+            or checkpoint_meta.get("uses_coconut_wrapper") is not expected_wrapper
+        ):
+            raise RuntimeError(f"Stale or mislabeled Phase 1 checkpoint: {source}")
 
-    cot_dir = os.path.join(checkpoints_dir, "cot")
-    _materialize_alias_dir(source_dir, cot_dir)
+    _materialize_alias_dir(cot_source, os.path.join(checkpoints_dir, "cot"))
     for n_latents in latent_token_counts:
         ccot_dir = os.path.join(checkpoints_dir, f"ccot_L{int(n_latents)}")
-        _materialize_alias_dir(source_dir, ccot_dir)
+        _materialize_alias_dir(coconut_source, ccot_dir)
 
     meta_path = os.path.join(checkpoints_dir, "compat_export_meta.json")
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(
             {
-                "source": source_dirname,
+                "cot_source": COT_BEST_DIRNAME,
+                "coconut_source": BEST_DIRNAME,
                 "latent_token_counts": latent_token_counts,
                 "exported_dirs": ["cot"] + [f"ccot_L{int(n)}" for n in latent_token_counts],
             },
             f,
             indent=2,
         )
+        f.write("\n")
 
 
-def _phase1_training_current(results_dir: str) -> bool:
+def _phase1_training_current(
+    results_dir: str, n_phase_examples: int, n_validation_examples: int
+) -> bool:
     metrics_path = os.path.join(results_dir, "phase1_training_metrics.json")
     if not os.path.exists(metrics_path):
         return False
@@ -633,17 +623,27 @@ def _phase1_training_current(results_dir: str) -> bool:
     except (OSError, json.JSONDecodeError):
         return False
     return (
-        metrics.get("train_use_kv_cache") == TRAIN_USE_KV_CACHE
+        metrics.get("n_phase_examples") == n_phase_examples
+        and metrics.get("n_train") == n_phase_examples
+        and metrics.get("n_validation_examples") == n_validation_examples
+        and metrics.get("n_val") == n_validation_examples
+        and metrics.get("validation_source") == "D_val"
+        and metrics.get("curriculum_version") == CURRICULUM_VERSION
+        and metrics.get("epochs") == 30
+        and metrics.get("completed_epochs") == 30
+        and metrics.get("fixed_epoch_schedule") is True
+        and metrics.get("learning_rate") == 1e-4
+        and metrics.get("effective_batch_size") == 128
+        and metrics.get("c_thought") == C_THOUGHT
+        and metrics.get("max_latent_stage") == MAX_LATENT_STAGE
+        and metrics.get("final_latent_tokens") == MAX_LATENT_TOKENS
+        and metrics.get("train_use_kv_cache") == TRAIN_USE_KV_CACHE
         and metrics.get("train_detach_latents") == TRAIN_DETACH_LATENTS
         and metrics.get("best_checkpoint_min_stage") == BEST_CHECKPOINT_MIN_STAGE
-        and metrics.get("best_checkpoint_policy") == "full_latent_budget_stage3_plus"
-        and metrics.get("latent_only_checkpoint_min_stage") == LATENT_ONLY_CHECKPOINT_MIN_STAGE
-        and metrics.get("early_stop_min_epoch") == EARLY_STOP_MIN_EPOCH
-        and metrics.get("completed_epochs") == metrics.get("epochs")
-        and metrics.get("best_stage") is not None
-        and metrics.get("best_stage") >= BEST_CHECKPOINT_MIN_STAGE
-        and metrics.get("latent_only_best_stage") is not None
-        and metrics.get("latent_only_best_stage") >= LATENT_ONLY_CHECKPOINT_MIN_STAGE
+        and metrics.get("best_checkpoint_policy") == "fully_latent_stage4_only"
+        and metrics.get("best_stage") == MAX_LATENT_STAGE + 1
+        and metrics.get("latent_only_best_stage") == MAX_LATENT_STAGE + 1
+        and metrics.get("cot_best_epoch") is not None
     )
 
 
@@ -663,30 +663,37 @@ def _remove_phase1_eval_artifacts(results_dir: str) -> None:
 def train_coconut_phase1(
     base_model_id: str,
     D_train: list,
+    D_val: list,
     checkpoints_dir: str,
     results_dir: str,
     model_tag: str,
     latent_token_counts: list[int] = LATENT_TOKEN_COUNTS,
 ):
+    require_exact_count(D_train, "D_train")
+    require_exact_count(D_val, "D_val")
     canonical_dir = os.path.join(checkpoints_dir, CANONICAL_DIRNAME)
     best_dir = os.path.join(checkpoints_dir, BEST_DIRNAME)
     latent_only_best_dir = os.path.join(checkpoints_dir, LATENT_ONLY_BEST_DIRNAME)
-    epoch9_dir = os.path.join(checkpoints_dir, EPOCH9_DIRNAME)
+    cot_best_dir = os.path.join(checkpoints_dir, COT_BEST_DIRNAME)
     required_markers = [
         os.path.join(canonical_dir, "config.json"),
         os.path.join(best_dir, "config.json"),
         os.path.join(latent_only_best_dir, "config.json"),
-        os.path.join(epoch9_dir, "config.json"),
+        os.path.join(cot_best_dir, "config.json"),
+        os.path.join(canonical_dir, "coconut_meta.json"),
+        os.path.join(best_dir, "coconut_meta.json"),
+        os.path.join(latent_only_best_dir, "coconut_meta.json"),
+        os.path.join(cot_best_dir, "coconut_meta.json"),
     ]
     checkpoints_ready = all(os.path.exists(path) for path in required_markers)
-    training_current = _phase1_training_current(results_dir)
+    training_current = _phase1_training_current(results_dir, len(D_train), len(D_val))
     if not checkpoints_ready or not training_current:
         if checkpoints_ready and not training_current:
             print(
                 "Phase 1 checkpoints exist but were produced with stale stability/curriculum "
                 "settings; retraining."
             )
-        metrics = _run_coconut_training(base_model_id, D_train, canonical_dir, model_tag)
+        metrics = _run_coconut_training(base_model_id, D_train, D_val, canonical_dir, model_tag)
         os.makedirs(results_dir, exist_ok=True)
         with open(os.path.join(results_dir, "phase1_training_metrics.json"), "w", encoding="utf-8") as f:
             json.dump(metrics, f, indent=2)
@@ -698,22 +705,23 @@ def train_coconut_phase1(
     else:
         print(
             "Phase 1 checkpoints exist -> "
-            f"{canonical_dir}, {best_dir}, {latent_only_best_dir}, {epoch9_dir} (skipping retrain)"
+            f"{canonical_dir}, {best_dir}, {latent_only_best_dir}, {cot_best_dir} (skipping retrain)"
         )
 
     export_compat_checkpoints(checkpoints_dir, latent_token_counts=latent_token_counts)
 
 
-def train_cot(base_model_id: str, D_train: list, output_dir: str, model_tag: str, lora_r: int = 16, lora_alpha: int = 32):
+def train_cot(base_model_id: str, D_train: list, D_val: list, output_dir: str, model_tag: str, lora_r: int = 16, lora_alpha: int = 32):
     del lora_r, lora_alpha
     checkpoints_dir = os.path.dirname(output_dir)
     results_dir = os.path.join("results", checkpoints_dir.split("/")[-2], checkpoints_dir.split("/")[-1])
-    train_coconut_phase1(base_model_id, D_train, checkpoints_dir, results_dir, model_tag)
+    train_coconut_phase1(base_model_id, D_train, D_val, checkpoints_dir, results_dir, model_tag)
 
 
 def train_ccot(
     base_model_id: str,
     D_train: list,
+    D_val: list,
     compressed_cache: list,
     latent_tokens: int,
     output_dir: str,
@@ -724,4 +732,4 @@ def train_ccot(
     del compressed_cache, latent_tokens, lora_r, lora_alpha
     checkpoints_dir = os.path.dirname(output_dir)
     results_dir = os.path.join("results", checkpoints_dir.split("/")[-2], checkpoints_dir.split("/")[-1])
-    train_coconut_phase1(base_model_id, D_train, checkpoints_dir, results_dir, model_tag)
+    train_coconut_phase1(base_model_id, D_train, D_val, checkpoints_dir, results_dir, model_tag)

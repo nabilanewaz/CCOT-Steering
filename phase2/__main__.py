@@ -4,11 +4,17 @@ import json
 import torch
 
 from phase2.run import run_phase2_all_sources
+from utils.experiment_config import require_exact_count, samples_per_phase
 
 
 def _load_jsonl(path: str) -> list:
 	with open(path, encoding='utf-8') as f:
-		return [json.loads(line) for line in f]
+		examples = [json.loads(line) for line in f]
+	if len(examples) < samples_per_phase():
+		raise ValueError(f"{path} has fewer than {samples_per_phase()} examples")
+	examples = examples[:samples_per_phase()]
+	require_exact_count(examples, "D_steer")
+	return examples
 
 
 def main():

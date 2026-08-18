@@ -14,6 +14,8 @@ from phase1.inference import (
     run_ccot,
     normalize_answer,
 )
+from utils.experiment_config import require_exact_count
+
 
 LATENT_TOKEN_COUNTS = [3, 4, 6]
 
@@ -119,6 +121,7 @@ def run_phase1_evaluation(
     best count by validation accuracy, then evaluates a compact comparison set:
     no_cot and ccot_L{best}. All metrics and predictions are saved in results_dir.
     """
+    require_exact_count(D_val, "D_val")
     os.makedirs(results_dir, exist_ok=True)
     latent_results: list[ConditionMetrics] = []
     comparison_results: list[ConditionMetrics] = []

@@ -22,6 +22,7 @@ import torch.nn.functional as F
 
 from utils.data import load_test_set
 from utils.dataset_paths import get_active_dataset_id, init_project_dataset
+from utils.experiment_config import require_exact_count, samples_per_phase
 from phase1.inference import (
     extract_answer,
     extract_reasoning_span,
@@ -865,17 +866,18 @@ def run_alpha_sweep_test(
     prompt_fn,
     boundary_fn,
     alphas: list = None,
-    n_sub: int = 100,
+    n_sub: int | None = None,
 ) -> list[dict]:
     """
-    Diagnostic α sweep on D_test subset. No hyperparameter is changed after this.
+    Diagnostic alpha sweep on all 300 D_test examples. No hyperparameter is changed after this.
     Uses DoM steering across a grid of alpha values.
     """
     if alphas is None:
         alphas = [0.0, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0]
 
+    n_sub = samples_per_phase() if n_sub is None else n_sub
     D_sub = D_test[:min(n_sub, len(D_test))]
-    print(f"\n[PH4] α sweep on D_test subset ({len(D_sub)} examples)...")
+    print(f"\n[PH4] alpha sweep on D_test ({len(D_sub)} examples)...")
 
     sweep = []
     for a in alphas:
@@ -1141,6 +1143,7 @@ def run_final_evaluation(
     Single-pass D_test evaluation using locked Phase 3 configs.
     Must be called exactly once from this file. D_test is never re-loaded.
     """
+    require_exact_count(D_test, "D_test")
     winning_config = cfg['winning_config']
     phase3_best = _load_phase3_best_configs(cfg, winning_config, results_base)
     all_results:  dict = {}
@@ -1607,6 +1610,7 @@ def main():
         'steering_artifact_policy': 'frozen_from_gsm8k_pipeline',
         'winning_config': winning,
         'models': models_to_run,
+        'n_test': len(D_test),
         'vectors_base': 'vectors',
         'checkpoints_base': 'checkpoints',
     }

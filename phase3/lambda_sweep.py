@@ -32,7 +32,7 @@ def sweep_lambda_grid(
     prompt_mode: str = 'ccot',
 ) -> dict:
     """
-    Run tune_alpha for all 16 (λ_a, λ_m) combinations on D_sub (≤200 examples).
+    Run tune_alpha for all 16 (λ_a, λ_m) combinations on D_sub.
     Selects the combination minimising ES val loss subject to no norm collapse.
     Saves full grid to out_path.
 
@@ -115,6 +115,7 @@ def sweep_lambda_grid(
     payload  = {
         'model_tag': model_tag,
         'prompt_mode': prompt_mode,
+        'n_val': len(D_sub),
         'selected':  selected,
         'grid':      rows,
     }

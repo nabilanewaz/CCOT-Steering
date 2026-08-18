@@ -38,10 +38,7 @@ def main():
     except FileNotFoundError:
         print(f"[warn] Train pool not found at {pool} — using placeholder split counts.")
         splits = {
-            'S1': {'D_train': [None] * 5231, 'D_steer': [None] * 747,  'D_val': [None] * 1495},
-            'S2': {'D_train': [None] * 4484, 'D_steer': [None] * 1495, 'D_val': [None] * 1495},
-            'S3': {'D_train': [None] * 4484, 'D_steer': [None] * 747,  'D_val': [None] * 2242},
-            'S4': {'D_train': [None] * 3737, 'D_steer': [None] * 1495, 'D_val': [None] * 2242},
+            'S2': {'D_train': [None] * 300, 'D_steer': [None] * 300, 'D_val': [None] * 300},
         }
 
     winner, scores = select_best_config(splits, args.results, model_tags)

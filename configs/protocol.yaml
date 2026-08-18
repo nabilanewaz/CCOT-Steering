@@ -4,8 +4,8 @@ seed: 42
 train_pool: null   # resolved at runtime via utils/dataset_paths (CCOT_DATASET / configs/active_dataset.txt)
 test_path:  null   # resolved at runtime; never opened outside evaluate_final.py
 
-split: S2          # fixed 60% train / 20% steer / 20% val
-split_ratios: [0.60, 0.20, 0.20]
+split: S2
+samples_per_phase: 300  # exact count for D_train, D_steer, D_val, and D_test
 
 # ── Models ────────────────────────────────────────────────────────────────
 model_tags:

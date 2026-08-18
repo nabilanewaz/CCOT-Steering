@@ -5,6 +5,8 @@ import re
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from phase1.modeling import Coconut
 from utils.torch_compat import patch_transformers_custom_op_registration
 
 
@@ -132,11 +134,17 @@ def load_base_frozen(base_model_id: str, device: str):
 
 
 def load_finetuned(checkpoint_dir: str, device: str):
-    """Load a LoRA-fine-tuned model from a directory saved by PeftModel.save_pretrained."""
+    """Load a full or LoRA checkpoint, restoring Coconut recurrence from metadata."""
     patch_transformers_custom_op_registration()
     tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
+    meta_path = os.path.join(checkpoint_dir, "coconut_meta.json")
+    checkpoint_meta = {}
+    if os.path.exists(meta_path):
+        with open(meta_path, encoding="utf-8") as f:
+            checkpoint_meta = json.load(f)
 
     adapter_cfg_path = os.path.join(checkpoint_dir, 'adapter_config.json')
     if os.path.exists(adapter_cfg_path):
@@ -156,8 +164,19 @@ def load_finetuned(checkpoint_dir: str, device: str):
         )
         model = PeftModel.from_pretrained(base, checkpoint_dir)
     else:
+        trust = _trust(checkpoint_meta.get("base_model_id", checkpoint_dir))
         model = AutoModelForCausalLM.from_pretrained(
-            checkpoint_dir, torch_dtype='auto'
+            checkpoint_dir, torch_dtype="auto", trust_remote_code=trust
+        )
+
+    if checkpoint_meta.get("uses_coconut_wrapper"):
+        latent_id, start_id, end_id = tokenizer.convert_tokens_to_ids([
+            checkpoint_meta.get("latent_token", "<|latent|>"),
+            checkpoint_meta.get("latent_start_token", "<|start-latent|>"),
+            checkpoint_meta.get("latent_end_token", "<|end-latent|>"),
+        ])
+        model = Coconut(
+            model, latent_id, start_id, end_id, tokenizer.eos_token_id
         )
 
     model = model.to(device)

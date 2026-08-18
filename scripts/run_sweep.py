@@ -25,8 +25,9 @@ from phase1.evaluate import run_phase1_evaluation, print_comparison_table
 from phase2.run import run_phase2_all_sources
 from phase3.evaluate import run_phase3_evaluation
 from phase3.select import select_best_steered_config
+from utils.experiment_config import samples_per_phase
 
-CFG_ID     = 'S2'   # fixed 60/20/20 split
+CFG_ID     = 'S2'   # fixed 300/300/300 train, steer, and validation split
 MODEL_TAGS = ['llama32_3b', 'phi2', 'qwen25_0.5b', 'qwen25_3b', 'qwen25_math1.5b']
 LATENT_TOKEN_COUNTS = [3, 4, 6]
 
@@ -37,9 +38,6 @@ MODEL_ID_MAP = {
     'qwen25_3b':       'Qwen/Qwen2.5-3B',
     'qwen25_math1.5b': 'Qwen/Qwen2.5-Math-1.5B',
 }
-
-def _checkpoint_ready(path: str) -> bool:
-    return os.path.exists(os.path.join(path, "adapter_config.json")) or os.path.exists(os.path.join(path, "config.json"))
 
 
 def _update_selected_phase3_best(model_tag: str, selection: dict) -> None:
@@ -55,6 +53,7 @@ def _update_selected_phase3_best(model_tag: str, selection: dict) -> None:
     phase3_best[model_tag] = selection
     cfg['phase3_best'] = phase3_best
     cfg['winning_config'] = 'S2'
+    cfg['samples_per_phase'] = samples_per_phase()
 
     os.makedirs('configs', exist_ok=True)
     with open(selected_path, 'w') as f:
@@ -89,22 +88,15 @@ def main():
             results_dir   = f"results/{CFG_ID}/{model_tag}"
 
             # ── Phase 1 training (single Coconut run + compat export) ────────
-            cot_out = os.path.join(ckpt_dir, 'cot')
-            all_latent_ready = all(
-                _checkpoint_ready(os.path.join(ckpt_dir, f"ccot_L{int(n)}"))
-                for n in LATENT_TOKEN_COUNTS
+            train_coconut_phase1(
+                base_model_id=base_model_id,
+                D_train=D_train,
+                D_val=D_val,
+                checkpoints_dir=ckpt_dir,
+                results_dir=results_dir,
+                model_tag=model_tag,
+                latent_token_counts=LATENT_TOKEN_COUNTS,
             )
-            if not (_checkpoint_ready(cot_out) and all_latent_ready):
-                train_coconut_phase1(
-                    base_model_id=base_model_id,
-                    D_train=D_train,
-                    checkpoints_dir=ckpt_dir,
-                    results_dir=results_dir,
-                    model_tag=model_tag,
-                    latent_token_counts=LATENT_TOKEN_COUNTS,
-                )
-            else:
-                print(f"[PH1] Coconut latent checkpoints exist, skipping: {ckpt_dir}")
 
             # ── Phase 1 evaluation ────────────────────────────────────────────
             phase1_results = run_phase1_evaluation(

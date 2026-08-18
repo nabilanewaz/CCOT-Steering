@@ -1,7 +1,8 @@
 # Execution Commands — CCoT Steering Pipeline
 
-All commands are run from the **project root** (`d:\Thesis\CCOT-Steering`).  
-Dataset used throughout: **GSM8K** (replace `gsm8k` with `svamp` or `prontoqa` for other datasets).  
+All commands are run from the **project root** (`d:\Thesis\CCOT-Steering`).
+Dataset used throughout: **GSM8K** (replace `gsm8k` with `svamp` or `prontoqa` for other datasets).
+Runtime protocol: **300 examples per phase data role** (D_train, D_steer, D_val, D_test).
 GPU is assumed (`cuda`). Append `--device cpu` to any `pipeline.py` command if needed.
 
 ---
@@ -14,7 +15,7 @@ pip install -r requirements.txt
 
 ## 1. Download Dataset
 
-Downloads the raw dataset and writes `gsm8k/train.jsonl` and `gsm8k/test.jsonl`.  
+Downloads the raw dataset and writes `gsm8k/train.jsonl` and `gsm8k/test.jsonl`.
 Run once per dataset. Persists the active dataset choice to `configs/active_dataset.txt`.
 
 ```bash
@@ -32,7 +33,7 @@ python download_dataset.py --dataset prontoqa
 
 ## 2. Verify Data Isolation (pre-flight check)
 
-Confirms D\_train / D\_steer / D\_val have zero overlap with D\_test by item ID.  
+Confirms D\_train / D\_steer / D\_val have zero overlap with D\_test by item ID.
 Run once after downloading, and again before Phase 4.
 
 ```bash
@@ -62,11 +63,11 @@ python preprocess_compress.py --dataset gsm8k
 ## 4. Phase 1 — Coconut Training and Evaluation
 
 Runs Coconut latent curriculum training and exports compatible checkpoints to
-`cot/` and `ccot_R{5..9}/` paths per backbone.  
+`cot/` and `ccot_L{3,4,6}/` paths per backbone.
 Evaluates all on D\_val and writes `results/S2/<model>/phase1_val.json`.
 
-This phase is now a **single 50-epoch Coconut run per model** with full stage
-progression (`0-5`, `6-8`, `9-11`, `12-14`, `15-49`) and monitoring outputs.
+This phase is now a **single 30-epoch Coconut run per model** with full stage
+progression (`0-5`, `6-8`, `9-11`, `12-14`, `15-29`) and monitoring outputs.
 
 **All four backbones (recommended):**
 
@@ -83,7 +84,7 @@ python pipeline.py --phase 1 --model qwen25_3b
 python pipeline.py --phase 1 --model qwen25_math1.5b
 ```
 
-Checkpoint output: `checkpoints/S2/<model>/cot/` and `checkpoints/S2/<model>/ccot_R{5..9}/` (full-model format)
+Checkpoint output: `checkpoints/S2/<model>/cot/` and `checkpoints/S2/<model>/ccot_L{3,4,6}/` (full-model format)
 
 Monitoring output:
 - `results/S2/<model>/phase1_training_metrics.json`
@@ -95,8 +96,8 @@ Monitoring output:
 
 ## 5. Phase 2 — Truth Vector Extraction
 
-Collects hidden states from D\_steer, runs probing, computes DoM and cPCA vectors,  
-and also produces the shuffled-label control vectors.  
+Collects hidden states from D\_steer, runs probing, computes DoM and cPCA vectors,
+and also produces the shuffled-label control vectors.
 Writes to `vectors/S2/<model>/`.
 
 **All four backbones:**
@@ -121,8 +122,8 @@ Key output files per model:
 
 ## 6. Phase 3 — α-Tuning and Steered Evaluation
 
-Runs the λ sweep, learns α\* via AdamW, evaluates all steered conditions on D\_val  
-(including control conditions), and selects the best steered config per backbone.  
+Runs the λ sweep, learns α\* via AdamW, evaluates all steered conditions on D\_val
+(including control conditions), and selects the best steered config per backbone.
 Updates `configs/selected.yaml`.
 
 **All four backbones:**
@@ -152,8 +153,8 @@ After Phase 3 completes, `configs/selected.yaml` is written automatically with `
 
 ## 7. Phase 4 — Final Evaluation on D\_test
 
-**Run once. D\_test is opened exactly once here and nowhere else.**  
-Uses the locked configs from `configs/selected.yaml`.  
+**Run once. D\_test is opened exactly once here and nowhere else.**
+Uses the locked configs from `configs/selected.yaml`.
 Writes results to `results/final/`.
 
 ```bash
@@ -202,8 +203,8 @@ python scripts/run_sweep.py --dataset gsm8k
 
 ## 9. Phase 5 — SVAMP Transfer Evaluation (optional)
 
-Evaluates the **frozen GSM8K** steering vectors on SVAMP D\_test.  
-No re-tuning of v\_truth or α\* is performed.  
+Evaluates the **frozen GSM8K** steering vectors on SVAMP D\_test.
+No re-tuning of v\_truth or α\* is performed.
 Requires Phase 4 to have completed first (`configs/selected.yaml` must exist).
 
 ```bash
@@ -248,7 +249,7 @@ python verify_isolation.py
 1. python download_dataset.py --dataset gsm8k
 2. python verify_isolation.py
 3. python preprocess_compress.py
-4. python pipeline.py --phase 1        # single Coconut 50-epoch train + compatibility export + eval on D_val
+4. python pipeline.py --phase 1        # single Coconut 30-epoch train + compatibility export + eval on D_val
 5. python pipeline.py --phase 2        # extract truth vectors
 6. python pipeline.py --phase 3        # tune alpha, steered eval on D_val
 7. python verify_isolation.py          # confirm isolation before opening D_test

@@ -3,6 +3,8 @@ import random
 import os
 from typing import Dict
 
+from utils.experiment_config import samples_per_phase
+
 
 def build_all_splits(pool_path: str, seed: int = 42, out_dir: str = None) -> Dict:
     with open(pool_path) as f:
@@ -10,19 +12,23 @@ def build_all_splits(pool_path: str, seed: int = 42, out_dir: str = None) -> Dic
 
     random.seed(seed)
     random.shuffle(pool)
-    n = len(pool)
+    n_each = samples_per_phase()
+    required = n_each * 3
+    if len(pool) < required:
+        raise ValueError(
+            f"Train pool {pool_path!r} needs at least {required} examples to build "
+            f"three disjoint {n_each}-example splits; found {len(pool)}"
+        )
 
-    # Fixed split: 60% train / 20% steer / 20% val
-    n_tr = round(n * 0.60)
-    n_st = round(n * 0.20)
+    # One seeded shuffle, then three disjoint, fixed-size phase datasets.
     splits = {
         'S2': {
-            'D_train': pool[:n_tr],
-            'D_steer': pool[n_tr : n_tr + n_st],
-            'D_val':   pool[n_tr + n_st:],
+            'D_train': pool[:n_each],
+            'D_steer': pool[n_each : 2 * n_each],
+            'D_val':   pool[2 * n_each : 3 * n_each],
         }
     }
-    print(f"S2: train={n_tr}  steer={n_st}  val={len(splits['S2']['D_val'])}")
+    print(f"S2: train={n_each}  steer={n_each}  val={n_each}")
 
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)

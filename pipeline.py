@@ -25,6 +25,7 @@ import yaml
 
 from scripts.build_splits import build_all_splits
 from scripts.selection import select_best_config
+from utils.experiment_config import samples_per_phase
 from utils.dataset_paths import (
     get_active_dataset_id,
     get_test_path,
@@ -57,11 +58,8 @@ MODEL_ID_MAP = {
 def _done(path: str) -> bool:
     return os.path.exists(path)
 
-def _checkpoint_ready(path: str) -> bool:
-    return _done(os.path.join(path, "adapter_config.json")) or _done(os.path.join(path, "config.json"))
 
-
-def _phase2_ready(vectors_dir: str) -> tuple[bool, list[str]]:
+def _phase2_ready(vectors_dir: str, expected_n_steer: int) -> tuple[bool, list[str]]:
     required = [
         "phase2_meta.json",
         "ccot_dom.pt",
@@ -80,6 +78,8 @@ def _phase2_ready(vectors_dir: str) -> tuple[bool, list[str]]:
         return False, ["phase2_meta.json(prompt_version<2)"]
     if meta.get("base_prompt_mode") != "cot_prompt":
         return False, ["phase2_meta.json(base_prompt_mode)"]
+    if meta.get("n_steer") != expected_n_steer:
+        return False, [f"phase2_meta.json(n_steer!={expected_n_steer})"]
     return True, []
 
 
@@ -95,7 +95,7 @@ def _mirror_phase2_outputs(vectors_dir: str, results_dir: str) -> None:
         shutil.copy2(src, os.path.join(results_dir, dst_name))
 
 
-def _phase3_ready(results_dir: str) -> tuple[bool, list[str]]:
+def _phase3_ready(results_dir: str, expected_n_val: int) -> tuple[bool, list[str]]:
     required = ["phase3_val.json", "phase3_run_meta.json"]
     missing = [name for name in required if not _done(os.path.join(results_dir, name))]
     if missing:
@@ -107,6 +107,8 @@ def _phase3_ready(results_dir: str) -> tuple[bool, list[str]]:
         return False, ["phase3_run_meta.json(unreadable)"]
     if int(meta.get("phase3_eval_version", 0)) < 2:
         return False, ["phase3_run_meta.json(eval_version<2)"]
+    if meta.get("n_val") != expected_n_val:
+        return False, [f"phase3_run_meta.json(n_val!={expected_n_val})"]
     return True, []
 
 
@@ -121,6 +123,7 @@ def _update_selected_phase3_best(model_tag: str, selection: dict) -> None:
     phase3_best[model_tag] = selection
     cfg['phase3_best'] = phase3_best
     cfg['winning_config'] = 'S2'
+    cfg['samples_per_phase'] = samples_per_phase()
     os.makedirs('configs', exist_ok=True)
     with open(path, 'w') as f:
         yaml.safe_dump(cfg, f, sort_keys=False)
@@ -141,23 +144,16 @@ def _run_phase1(configs_to_run, models_to_run, splits, device):
             ckpt_dir = f"checkpoints/{cfg_id}/{model_tag}"
             res_dir  = f"results/{cfg_id}/{model_tag}"
 
-            cot_out = os.path.join(ckpt_dir, 'cot')
-            all_latent_ready = all(
-                _checkpoint_ready(os.path.join(ckpt_dir, f"ccot_L{int(n)}"))
-                for n in LATENT_TOKEN_COUNTS
+            print(f"\n[{cfg_id}][{model_tag}] Coconut phase1 training/resume check")
+            train_coconut_phase1(
+                base_model_id=base_id,
+                D_train=D_train,
+                D_val=D_val,
+                checkpoints_dir=ckpt_dir,
+                results_dir=res_dir,
+                model_tag=model_tag,
+                latent_token_counts=LATENT_TOKEN_COUNTS,
             )
-            if not (_checkpoint_ready(cot_out) and all_latent_ready):
-                print(f"\n[{cfg_id}][{model_tag}] Coconut phase1 single-run (20 epochs) + latent export")
-                train_coconut_phase1(
-                    base_model_id=base_id,
-                    D_train=D_train,
-                    checkpoints_dir=ckpt_dir,
-                    results_dir=res_dir,
-                    model_tag=model_tag,
-                    latent_token_counts=LATENT_TOKEN_COUNTS,
-                )
-            else:
-                print(f"[{cfg_id}][{model_tag}] Coconut latent checkpoints exist — skipping")
 
             # Phase 1 evaluation
             phase1_eval_paths = [
@@ -194,7 +190,7 @@ def _run_phase2(configs_to_run, models_to_run, splits, device):
             vectors_dir = f"vectors/{cfg_id}/{model_tag}"
             res_dir     = f"results/{cfg_id}/{model_tag}"
 
-            phase2_ready, missing_phase2 = _phase2_ready(vectors_dir)
+            phase2_ready, missing_phase2 = _phase2_ready(vectors_dir, len(D_steer))
             if not phase2_ready:
                 if missing_phase2:
                     print(
@@ -230,7 +226,7 @@ def _run_phase3(configs_to_run, models_to_run, splits, device):
             vectors_dir = f"vectors/{cfg_id}/{model_tag}"
             res_dir     = f"results/{cfg_id}/{model_tag}"
 
-            phase3_ready, missing_phase3 = _phase3_ready(res_dir)
+            phase3_ready, missing_phase3 = _phase3_ready(res_dir, len(D_val))
             if not phase3_ready:
                 if missing_phase3:
                     print(

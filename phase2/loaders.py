@@ -1,7 +1,6 @@
-import os
-
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from phase1.inference import load_finetuned
 from utils.torch_compat import patch_transformers_custom_op_registration
 
 
@@ -23,6 +22,8 @@ def _sync_pad_token_id(model, tokenizer) -> None:
 
 def get_transformer_layers(model):
     """Return the transformer layer list regardless of PEFT wrapping."""
+    if hasattr(model, "base_causallm"):
+        return get_transformer_layers(model.base_causallm)
     try:
         from peft import PeftModel as _PeftModel
     except ImportError:
@@ -38,35 +39,9 @@ def get_transformer_layers(model):
 
 
 def load_ccot_frozen(base_model_id: str, lora_adapter_path: str, device: str):
-    """Load Source A checkpoint (LoRA adapter or full Coconut checkpoint), frozen."""
-    patch_transformers_custom_op_registration()
-    trust = _needs_trust(base_model_id)
-    tokenizer = AutoTokenizer.from_pretrained(lora_adapter_path, trust_remote_code=trust)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    adapter_cfg = f"{lora_adapter_path}/adapter_config.json"
-    if os.path.exists(adapter_cfg):
-        try:
-            from peft import PeftModel
-        except Exception as e:
-            raise RuntimeError(
-                f"Checkpoint at {lora_adapter_path} is a LoRA adapter but `peft` failed to import. "
-                "Install compatible `peft`/`transformers` versions or use a full-model checkpoint."
-            ) from e
-        base = AutoModelForCausalLM.from_pretrained(
-            base_model_id, torch_dtype=torch.float32,
-            device_map=device, trust_remote_code=trust,
-        )
-        model = PeftModel.from_pretrained(base, lora_adapter_path)
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            lora_adapter_path,
-            torch_dtype=torch.float32,
-            device_map=device,
-            trust_remote_code=trust,
-        )
-
+    """Load and freeze Source A, preserving Coconut recurrent inference."""
+    del base_model_id
+    model, tokenizer = load_finetuned(lora_adapter_path, device)
     for param in model.parameters():
         param.requires_grad = False
     model.eval()

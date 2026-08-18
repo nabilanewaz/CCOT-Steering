@@ -1,6 +1,8 @@
 import json
 import os
 
+from utils.experiment_config import require_exact_count
+
 
 def compress_reasoning(reasoning: str, ratio: float, compressor) -> str:
     if compressor is None:
@@ -22,12 +24,21 @@ def build_ccot_cache(D_train: list, ratios: list, cache_dir: str, compressor=Non
     but phase orchestration still expects cache/<cfg>/compressed_R*.jsonl files.
     We therefore emit deterministic placeholder records preserving the old schema.
     """
+    require_exact_count(D_train, "D_train")
     os.makedirs(cache_dir, exist_ok=True)
+    expected_ids = [item.get("id", "") for item in D_train]
     for ratio in ratios:
         cache_path = os.path.join(cache_dir, f"compressed_R{int(ratio * 10)}.jsonl")
         if os.path.exists(cache_path):
-            print(f"Cache exists for R={ratio}, skipping.")
-            continue
+            try:
+                cached = load_cache(cache_path)
+                cache_ids = [item.get("id", "") for item in cached]
+            except (OSError, json.JSONDecodeError):
+                cache_ids = []
+            if cache_ids == expected_ids:
+                print(f"Cache is current for R={ratio}, skipping.")
+                continue
+            print(f"Cache is stale for R={ratio}; rebuilding.")
         print(f"Compressing at R={ratio}...")
         with open(cache_path, 'w', encoding='utf-8') as f:
             for item in D_train:

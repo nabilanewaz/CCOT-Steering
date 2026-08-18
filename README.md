@@ -15,6 +15,9 @@ pip install -r requirements.txt
 # Download GSM8K (7,473 train + 1,319 test)
 python download_gsm8k.py
 
+# Runtime selection is fixed at 300 examples for each data role.
+# D_train=300, D_steer=300, D_val=300, D_test=300.
+
 # Verify data isolation (no train/val/test overlap)
 python verify_isolation.py
 ```
@@ -70,7 +73,7 @@ project/
 │   ├── R5.jsonl  ├── R6.jsonl  ├── R7.jsonl  ├── R8.jsonl  └── R9.jsonl
 ├── checkpoints/{S1,S2,S3,S4}/{model}/
 │   ├── cot/                    # Coconut compatibility export (shared weights)
-│   ├── ccot_R5/ ├── ccot_R6/ ├── ccot_R7/ ├── ccot_R8/ └── ccot_R9/
+│   ├── ccot_L3/ ├── ccot_L4/ └── ccot_L6/
 ├── vectors/{S1,S2,S3,S4}/{model}/
 │   ├── ccot_dom.pt             # Source A: DoM vector
 │   ├── ccot_cpca_r10.pt        # Source A: cPCA subspace [d, r_final]
@@ -110,41 +113,26 @@ project/
 
 ### Phase 1: Coconut Training Baselines
 
-Phase 1 now uses Coconut latent curriculum training (native full-model fine-tuning),
-with full 50-epoch stage schedule and internal monitoring.
-To preserve the rest of the pipeline, checkpoints are still exported to:
-`checkpoints/{config}/{model}/cot/` and `checkpoints/{config}/{model}/ccot_R{5,6,7,8,9}/`.
+Phase 1 uses Coconut full-model curriculum training for 30 epochs. It trains
+on all 300 `D_train` rows and monitors the active curriculum stage on all 300
+disjoint `D_val` rows. See
+[`PHASE1_COCONUT_PAPER_AUDIT.md`](PHASE1_COCONUT_PAPER_AUDIT.md) for the
+paper comparison and intentional deviations.
 
 ```bash
-# Called automatically by pipeline.py or scripts/run_sweep.py
-# Manual: python -m phase1 --stage cot --config S1 --model llama32_3b
+python pipeline.py --phase 1 --config S2 --model llama32_3b
 ```
 
-- Full-model checkpoint saved → `checkpoints/{config}/{model}/cot/`
-- Time: ~2h per model (A100)
+The single curriculum run exports distinct compatibility checkpoints:
 
-**Compatibility Export for CCoT Ratio Paths**
+- `checkpoints/{config}/{model}/cot/` from the best visible-CoT Stage 0 epoch
+- `checkpoints/{config}/{model}/ccot_L{3,4,6}/` from the best fully latent Stage 4 epoch
+- `results/{config}/{model}/phase1_training_metrics.json` with schedule and count provenance
+- `plots/{config}/{model}/phase1/` with loss, validation, and embedding-drift curves
 
-For downstream compatibility, a single trained checkpoint is exported under each
-ratio directory expected by phase2/phase3:
-
-```bash
-# Called automatically; manual:
-# python -m phase1 --stage ccot --config S1 --model llama32_3b --ratio 0.7
-```
-
-- Full-model checkpoints saved → `checkpoints/{config}/{model}/ccot_R{5,6,7,8,9}/`
-- Training metrics → `results/{config}/{model}/phase1_training_metrics.json`
-- Monitoring plots → `plots/{config}/{model}/phase1/{stage_loss_curve,embedding_drift,val_accuracy}.png`
-- Time: ~8h for all 5 ratios (A100)
-
-**Phase 1 Evaluation**
-
-Run 12 conditions on D_val: no_cot, full_cot, trimmed_cot (per ratio), ccot (per ratio).
-
-- Results saved → `results/{config}/{model}/phase1_val.json`
-- Accuracy, token count, latency per condition
-- Time: ~1h (A100)
+Phase 1 evaluation sweeps recurrent Coconut with 3, 4, and 6 latent tokens on
+`D_val`, records `phase1_best_latent.json`, then writes the compact no-CoT versus
+best-CCoT comparison to `phase1_val.json`.
 
 ### Phase 2: Truth Vector Extraction
 
@@ -289,7 +277,7 @@ If interrupted, restart the same command — it resumes from the last completed 
 To force re-run, delete the checkpoint:
 
 ```bash
-rm -rf checkpoints/S2/llama32_3b/ccot_R7/
+rm -rf checkpoints/S2/llama32_3b/ccot_L4/
 python pipeline.py --phase 1 --config S2 --model llama32_3b
 ```
 
@@ -300,7 +288,7 @@ python pipeline.py --phase 1 --config S2 --model llama32_3b
 | Task | Per Model | All 4 Models |
 |------|-----------|--------------|
 | Phase 1: Coconut training (single run) | 10h | 40h |
-| Phase 1: Compatibility export (cot + ccot_R5..R9) | <5m | <20m |
+| Phase 1: Compatibility export (cot + ccot_L3,L4,L6) | <5m | <20m |
 | Phase 1: Eval (D_val) | 1h | 4h |
 | Phase 2: Extraction (2 sources) | 3h | 12h |
 | Phase 3: α-tuning + steered eval | 3h | 12h |

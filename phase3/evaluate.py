@@ -36,6 +36,8 @@ from phase3.hooks import (
     run_with_hook,
 )
 
+from utils.experiment_config import require_exact_count, samples_per_phase
+
 LATENT_TOKEN_COUNTS = [3, 4, 6]
 SOURCES  = ('ccot', 'base')
 
@@ -188,7 +190,7 @@ def _eval_one(
 def _alpha_validation_sweep(
     model, tokenizer, D_val: list, v_dom: torch.Tensor, L_star: int,
     device: str, model_tag: str, source: str, latent_tokens: int,
-    learned_alpha: float, min_gain: float = 0.0025, n_sub: int = 100,
+    learned_alpha: float, min_gain: float = 0.0025, n_sub: int | None = None,
     prompt_fn=None, boundary_fn=None, prompt_mode: str = 'ccot',
 ) -> tuple[float, list[dict]]:
     """Pick alpha by generated-answer validation, not teacher-forced loss only."""
@@ -199,6 +201,7 @@ def _alpha_validation_sweep(
     candidates = [0.0, float(learned_alpha), 0.1, 0.5, 1.0, 2.0, 5.0, 10.0]
     seen = set()
     candidates = [a for a in candidates if not (round(a, 8) in seen or seen.add(round(a, 8)))]
+    n_sub = samples_per_phase() if n_sub is None else n_sub
     D_sub = D_val[-min(n_sub, len(D_val)):]
     rows = []
     print(
@@ -298,7 +301,7 @@ def _tune_and_save_alpha(
 ) -> None:
     """
     For each source:
-      1. Run λ sweep on a 200-example D_val subset to select (λ_a, λ_m).
+      1. Run the λ sweep on all 300 D_val examples to select (λ_a, λ_m).
       2. Run full gradient-based α* tuning with the selected lambdas.
       3. Save alpha_star, training history JSON, and loss-curve PNG.
     Results are cached per source — rerun is skipped if alpha_star file exists.
@@ -328,7 +331,10 @@ def _tune_and_save_alpha(
         try:
             with open(path) as fp:
                 payload = json.load(fp)
-            return payload.get('prompt_mode') == source_name
+            return (
+                payload.get('prompt_mode') == source_name
+                and payload.get('n_val') == len(D_val)
+            )
         except Exception:
             return False
 
@@ -338,7 +344,10 @@ def _tune_and_save_alpha(
         try:
             with open(path) as fp:
                 payload = json.load(fp)
-            if payload.get('prompt_mode') != source_name:
+            if (
+                payload.get('prompt_mode') != source_name
+                or payload.get('n_val') != len(D_val)
+            ):
                 return None
             return payload
         except Exception:
@@ -389,7 +398,7 @@ def _tune_and_save_alpha(
             p.requires_grad = False
         model.eval()
 
-        # ── Step 1: λ sweep on 200-example subset ────────────────────────────
+        # Step 1: lambda sweep on the full 300-example D_val.
         sweep_path = os.path.join(vectors_dir, f'{source}_lambda_sweep.json')
         results_sweep_path = (
             os.path.join(results_dir, f'{source}_lambda_sweep.json')
@@ -410,7 +419,7 @@ def _tune_and_save_alpha(
             if os.path.exists(sweep_path) or (results_sweep_path and os.path.exists(results_sweep_path)):
                 print(f"[PH3] λ sweep cache stale for source={source}; recomputing.")
             from phase3.lambda_sweep import sweep_lambda_grid
-            D_sub    = D_val[:min(200, len(D_val))]
+            D_sub = D_val
             sweep_sel = sweep_lambda_grid(
                 model, tok, D_sub, v_dom, L_star, device, model_tag,
                 latent_tokens=best_latent_tokens,
@@ -462,6 +471,7 @@ def _tune_and_save_alpha(
             'prompt_mode': source,
             'learned_alpha': float(alpha_star_raw.item()),
             'selected_alpha': float(selected_alpha),
+            'n_val': len(D_val),
             'rows': validation_rows,
         }
         with open(validation_path, 'w') as fp:
@@ -522,6 +532,7 @@ def run_phase3_evaluation(
     Evaluate all Phase 3 conditions on D_val.
     Writes phase3_val.json, steered_val.json, alpha_diagnostic.json.
     """
+    require_exact_count(D_val, "D_val")
     os.makedirs(results_dir, exist_ok=True)
     meta    = _load_meta(vectors_dir)
     r_final = meta.get('ccot_r_final', 10)
@@ -882,6 +893,7 @@ def run_phase3_evaluation(
         json.dump({
             'model_tag': model_tag,
             'phase3_eval_version': 2,
+            'n_val': len(D_val),
             'phase2_prompt_version': meta.get('phase2_prompt_version'),
             'alpha_prompt_modes': {source: source for source in SOURCES},
         }, f, indent=2)
@@ -911,11 +923,12 @@ def run_phase3_evaluation(
 
 def _run_diagnostic_sweep(
     model_tag, checkpoints_dir, D_val, vectors_dir, meta, results_dir, device,
-    n_sub: int = 50,
+    n_sub: int | None = None,
 ) -> None:
-    """Sweep alpha ∈ {0,.1,.5,1,2,5,10,20,50} on a D_val subset and save JSON."""
+    """Sweep alpha ∈ {0,.1,.5,1,2,5,10,20,50} on all 300 D_val examples and save JSON."""
     alphas  = [0.0, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0]
-    D_sub   = D_val[:min(n_sub, len(D_val))]
+    n_sub = samples_per_phase() if n_sub is None else n_sub
+    D_sub = D_val[:min(n_sub, len(D_val))]
     source  = 'ccot'
     latent_tokens = int(meta.get('best_ccot_latent_tokens') or 4)
 
