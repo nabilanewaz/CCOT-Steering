@@ -43,6 +43,7 @@ export CCOT_DATASET="$DATASET"
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 export MPLBACKEND=Agg
+export PIP_NO_CACHE_DIR="${PIP_NO_CACHE_DIR:-1}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 RUN_ID="$(date '+%Y%m%d_%H%M%S')"

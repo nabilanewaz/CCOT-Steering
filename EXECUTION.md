@@ -86,6 +86,10 @@ python pipeline.py --phase 1 --model qwen25_math1.5b
 
 Checkpoint output: `checkpoints/S2/<model>/cot/` and `checkpoints/S2/<model>/ccot_L{3,4,6}/` (full-model format)
 
+Only the selected CoT and best latent checkpoints occupy full-model disk
+space. Canonical, latent-only, and latent-budget compatibility paths use
+filesystem aliases to those selected weights.
+
 Monitoring output:
 - `results/S2/<model>/phase1_training_metrics.json`
 - `plots/S2/<model>/phase1/stage_loss_curve.png`

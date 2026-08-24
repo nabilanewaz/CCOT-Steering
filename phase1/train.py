@@ -36,6 +36,7 @@ COT_BEST_DIRNAME = "_coconut_phase1_cot_best"
 CURRICULUM_VERSION = "paper_gsm8k_c2_stage0_6_stage123_3_final_to_30_v1"
 VALIDATION_EPOCHS = (6, 10, 20, 30)
 VALIDATION_SCHEDULE_VERSION = "stage0_end_then_every_10_v1"
+CHECKPOINT_STORAGE_VERSION = "shared_best_aliases_v1"
 BEST_CHECKPOINT_MIN_STAGE = 4
 LATENT_ONLY_CHECKPOINT_MIN_STAGE = 4
 TRAIN_USE_KV_CACHE = False
@@ -191,6 +192,30 @@ def _save_coconut_checkpoint(
     val_accuracy: float | None = None,
     uses_coconut_wrapper: bool = True,
 ) -> None:
+    parent_dir = os.path.dirname(output_dir) or "."
+    os.makedirs(parent_dir, exist_ok=True)
+    estimated_bytes = sum(
+        tensor.numel() * tensor.element_size()
+        for tensor in itertools.chain(
+            coconut_model.base_causallm.parameters(),
+            coconut_model.base_causallm.buffers(),
+        )
+    )
+    existing_bytes = _allocated_path_bytes(output_dir)
+    free_bytes = shutil.disk_usage(parent_dir).free
+    reserve_bytes = max(512 * 1024**2, estimated_bytes // 20)
+    required_bytes = estimated_bytes + reserve_bytes
+    available_bytes = free_bytes + existing_bytes
+    gib = 1024**3
+    if available_bytes < required_bytes:
+        raise RuntimeError(
+            "Insufficient disk space for checkpoint replacement: "
+            f"path={output_dir} available_after_replacing={available_bytes / gib:.2f} GiB "
+            f"required={required_bytes / gib:.2f} GiB. "
+            "Remove stale checkpoints or enlarge the volume before rerunning."
+        )
+
+    _remove_checkpoint_path(output_dir)
     os.makedirs(output_dir, exist_ok=True)
     coconut_model.base_causallm.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
@@ -241,9 +266,6 @@ def _run_coconut_training(base_model_id: str, D_train: list, D_val: list, output
     best_val_acc = -float("inf")
     best_epoch = None
     best_stage = None
-    latent_only_best_val_acc = -float("inf")
-    latent_only_best_epoch = None
-    latent_only_best_stage = None
     cot_best_val_acc = -float("inf")
     cot_best_epoch = None
     skipped_nonfinite_losses = 0
@@ -417,24 +439,6 @@ def _run_coconut_training(base_model_id: str, D_train: list, D_val: list, output
                 f"[phase1][{model_tag}] best checkpoint saved -> {best_dir} "
                 f"(epoch={epoch_number} stage={stage} val_acc={val_acc:.4f})"
             )
-        eligible_for_latent_only_best = stage >= LATENT_ONLY_CHECKPOINT_MIN_STAGE
-        if eligible_for_latent_only_best and val_acc > latent_only_best_val_acc:
-            latent_only_best_val_acc = val_acc
-            latent_only_best_epoch = epoch_number
-            latent_only_best_stage = stage
-            _save_coconut_checkpoint(
-                coconut_model,
-                tokenizer,
-                latent_only_best_dir,
-                base_model_id,
-                role="best_latent_only",
-                epoch=epoch_number,
-                val_accuracy=val_acc,
-            )
-            tqdm.write(
-                f"[phase1][{model_tag}] best latent-only checkpoint saved -> {latent_only_best_dir} "
-                f"(epoch={epoch_number} stage={stage} val_acc={val_acc:.4f})"
-            )
         tqdm.write(
             f"[phase1][{model_tag}] epoch={epoch_number}/{hp['epochs']} "
             f"stage={stage} train_loss={epoch_avg_loss:.4f} "
@@ -443,16 +447,6 @@ def _run_coconut_training(base_model_id: str, D_train: list, D_val: list, output
             f"(train_n={len(train_raw)} val_n={len(val_raw)})"
         )
 
-    _save_coconut_checkpoint(
-        coconut_model,
-        tokenizer,
-        output_dir,
-        base_model_id,
-        role="final",
-        epoch=len(loss_history),
-        val_accuracy=val_acc_history[-1] if val_acc_history else None,
-    )
-    print(f"Coconut final model saved -> {output_dir}")
     if best_epoch is None:
         tqdm.write(
             f"[phase1][{model_tag}] WARNING: no finite eligible latent-stage best checkpoint "
@@ -468,21 +462,14 @@ def _run_coconut_training(base_model_id: str, D_train: list, D_val: list, output
             val_accuracy=val_acc_history[-1] if val_acc_history else None,
         )
         print(f"Coconut best model saved -> {best_dir}")
-    if latent_only_best_epoch is None:
-        tqdm.write(
-            f"[phase1][{model_tag}] WARNING: no finite latent-only checkpoint "
-            f"was found; falling back to final checkpoint for latent-only export."
-        )
-        _save_coconut_checkpoint(
-            coconut_model,
-            tokenizer,
-            latent_only_best_dir,
-            base_model_id,
-            role="best_latent_only",
-            epoch=len(loss_history),
-            val_accuracy=val_acc_history[-1] if val_acc_history else None,
-        )
-        print(f"Coconut latent-only best model saved -> {latent_only_best_dir}")
+
+    # These compatibility paths intentionally share the selected best latent
+    # checkpoint. Keeping physical copies of a 3B model here can exhaust the
+    # training volume before the final checkpoint update completes.
+    _materialize_alias_dir(best_dir, latent_only_best_dir)
+    _materialize_alias_dir(best_dir, output_dir)
+    print(f"Coconut selected-best alias created -> {output_dir}")
+    print(f"Coconut latent-only alias created -> {latent_only_best_dir}")
     return {
         "loss_history": loss_history,
         "losses_per_stage": losses_per_stage,
@@ -511,15 +498,18 @@ def _run_coconut_training(base_model_id: str, D_train: list, D_val: list, output
         "best_stage": best_stage,
         "best_checkpoint_min_stage": BEST_CHECKPOINT_MIN_STAGE,
         "best_checkpoint_policy": "fully_latent_stage4_only",
-        "latent_only_best_val_accuracy": latent_only_best_val_acc if latent_only_best_epoch is not None else None,
-        "latent_only_best_epoch": latent_only_best_epoch,
-        "latent_only_best_stage": latent_only_best_stage,
+        "latent_only_best_val_accuracy": best_val_acc if best_epoch is not None else None,
+        "latent_only_best_epoch": best_epoch,
+        "latent_only_best_stage": best_stage,
         "latent_only_checkpoint_min_stage": LATENT_ONLY_CHECKPOINT_MIN_STAGE,
         "latent_only_best_checkpoint_dir": latent_only_best_dir,
         "cot_best_val_accuracy": cot_best_val_acc if cot_best_epoch is not None else None,
         "cot_best_epoch": cot_best_epoch,
         "cot_best_checkpoint_dir": cot_best_dir,
         "best_checkpoint_dir": best_dir,
+        "checkpoint_storage_version": CHECKPOINT_STORAGE_VERSION,
+        "canonical_checkpoint_policy": "alias_to_selected_best",
+        "latent_only_checkpoint_policy": "alias_to_selected_best",
         "train_use_kv_cache": TRAIN_USE_KV_CACHE,
         "train_detach_latents": TRAIN_DETACH_LATENTS,
         "skipped_nonfinite_losses": skipped_nonfinite_losses,
@@ -574,7 +564,28 @@ def _plot_curves(metrics: dict, phase1_plot_dir: str) -> None:
     plt.close()
 
 
+def _allocated_path_bytes(path: str) -> int:
+    if not os.path.lexists(path):
+        return 0
+    stat = os.lstat(path)
+    allocated = getattr(stat, "st_blocks", 0) * 512 or stat.st_size
+    if not os.path.isdir(path) or os.path.islink(path):
+        return allocated
+    with os.scandir(path) as entries:
+        return allocated + sum(_allocated_path_bytes(entry.path) for entry in entries)
+
+
+def _remove_checkpoint_path(path: str) -> None:
+    if os.path.islink(path) or os.path.isfile(path):
+        os.unlink(path)
+    elif os.path.isdir(path):
+        shutil.rmtree(path)
+
+
 def _materialize_alias_dir(src_dir: str, dst_dir: str) -> None:
+    if os.path.abspath(src_dir) == os.path.abspath(dst_dir):
+        raise ValueError(f"Checkpoint alias source and destination are identical: {src_dir}")
+    _remove_checkpoint_path(dst_dir)
     os.makedirs(dst_dir, exist_ok=True)
     for name in os.listdir(src_dir):
         src = os.path.join(src_dir, name)
@@ -592,6 +603,25 @@ def _materialize_alias_dir(src_dir: str, dst_dir: str) -> None:
                 shutil.copytree(src, dst, dirs_exist_ok=True)
             else:
                 shutil.copy2(src, dst)
+
+
+def _clear_stale_phase1_checkpoints(
+    checkpoints_dir: str, latent_token_counts: list[int]
+) -> None:
+    stale_names = [
+        CANONICAL_DIRNAME,
+        BEST_DIRNAME,
+        LATENT_ONLY_BEST_DIRNAME,
+        COT_BEST_DIRNAME,
+        "cot",
+        *(f"ccot_L{int(n)}" for n in latent_token_counts),
+        "compat_export_meta.json",
+    ]
+    for name in stale_names:
+        path = os.path.join(checkpoints_dir, name)
+        if os.path.lexists(path):
+            print(f"Removing stale Phase 1 checkpoint artifact -> {path}")
+            _remove_checkpoint_path(path)
 
 
 def export_compat_checkpoints(
@@ -670,6 +700,9 @@ def _phase1_training_current(
         and metrics.get("best_stage") == MAX_LATENT_STAGE + 1
         and metrics.get("latent_only_best_stage") == MAX_LATENT_STAGE + 1
         and metrics.get("cot_best_epoch") is not None
+        and metrics.get("checkpoint_storage_version") == CHECKPOINT_STORAGE_VERSION
+        and metrics.get("canonical_checkpoint_policy") == "alias_to_selected_best"
+        and metrics.get("latent_only_checkpoint_policy") == "alias_to_selected_best"
     )
 
 
@@ -719,6 +752,7 @@ def train_coconut_phase1(
                 "Phase 1 checkpoints exist but were produced with stale stability/curriculum "
                 "settings; retraining."
             )
+        _clear_stale_phase1_checkpoints(checkpoints_dir, latent_token_counts)
         metrics = _run_coconut_training(base_model_id, D_train, D_val, canonical_dir, model_tag)
         os.makedirs(results_dir, exist_ok=True)
         with open(os.path.join(results_dir, "phase1_training_metrics.json"), "w", encoding="utf-8") as f:

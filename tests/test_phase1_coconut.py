@@ -19,6 +19,7 @@ from phase1.train import (
     _DEFAULT_HP,
     _build_stage_dataset,
     _get_stage_info,
+    _materialize_alias_dir,
     _should_run_validation,
     export_compat_checkpoints,
 )
@@ -123,6 +124,10 @@ class CompatibilityExportTests(unittest.TestCase):
                 ccot_meta = json.load(f)
             self.assertFalse(cot_meta["uses_coconut_wrapper"])
             self.assertTrue(ccot_meta["uses_coconut_wrapper"])
+            self.assertTrue(os.path.samefile(
+                os.path.join(root, BEST_DIRNAME, "config.json"),
+                os.path.join(root, "ccot_L3", "config.json"),
+            ))
 
     def test_export_rejects_mislabeled_coconut_checkpoint(self):
         with tempfile.TemporaryDirectory() as root:
@@ -130,6 +135,25 @@ class CompatibilityExportTests(unittest.TestCase):
             self.make_checkpoint(root, COT_BEST_DIRNAME, False)
             with self.assertRaises(RuntimeError):
                 export_compat_checkpoints(root, latent_token_counts=[3])
+
+    def test_alias_replaces_a_stale_physical_checkpoint_copy(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "source")
+            alias = os.path.join(root, "alias")
+            os.makedirs(source)
+            os.makedirs(alias)
+            with open(os.path.join(source, "model.safetensors"), "wb") as f:
+                f.write(b"selected-best")
+            with open(os.path.join(alias, "stale.safetensors"), "wb") as f:
+                f.write(b"stale-copy")
+
+            _materialize_alias_dir(source, alias)
+
+            self.assertFalse(os.path.exists(os.path.join(alias, "stale.safetensors")))
+            self.assertTrue(os.path.samefile(
+                os.path.join(source, "model.safetensors"),
+                os.path.join(alias, "model.safetensors"),
+            ))
 
 
 class FakeCausalLM(torch.nn.Module):

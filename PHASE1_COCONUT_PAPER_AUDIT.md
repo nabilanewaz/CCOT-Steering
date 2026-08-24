@@ -78,6 +78,9 @@ After training:
 - `_coconut_phase1_cot_best/` supplies the visible-CoT `cot/` alias.
 - `_coconut_phase1_best/` supplies all `ccot_L3/`, `ccot_L4/`, and
   `ccot_L6/` compatibility aliases.
+- `_coconut_phase1/` and `_coconut_phase1_best_latent_only/` are lightweight
+  aliases to the selected best latent checkpoint rather than duplicate
+  full-model copies.
 - Coconut metadata causes every CCoT alias to reload with recurrent latent
   execution.
 - Phase 1 evaluation chooses the best downstream latent budget on `D_val`.
