@@ -34,6 +34,8 @@ BEST_DIRNAME = "_coconut_phase1_best"
 LATENT_ONLY_BEST_DIRNAME = "_coconut_phase1_best_latent_only"
 COT_BEST_DIRNAME = "_coconut_phase1_cot_best"
 CURRICULUM_VERSION = "paper_gsm8k_c2_stage0_6_stage123_3_final_to_30_v1"
+VALIDATION_EPOCHS = (6, 10, 20, 30)
+VALIDATION_SCHEDULE_VERSION = "stage0_end_then_every_10_v1"
 BEST_CHECKPOINT_MIN_STAGE = 4
 LATENT_ONLY_CHECKPOINT_MIN_STAGE = 4
 TRAIN_USE_KV_CACHE = False
@@ -148,6 +150,10 @@ def _get_stage_info(epoch: int) -> tuple[int, bool, bool]:
     return 4, True, epoch == 15
 
 
+def _should_run_validation(epoch_number: int) -> bool:
+    return epoch_number in VALIDATION_EPOCHS
+
+
 def _build_stage_dataset(base_dataset, stage: int, drop_remaining: bool, start_id: int, latent_id: int, end_id: int):
     if stage < 0 or stage > MAX_LATENT_STAGE + 1:
         raise ValueError(f"Invalid Coconut curriculum stage: {stage}")
@@ -225,6 +231,7 @@ def _run_coconut_training(base_model_id: str, D_train: list, D_val: list, output
     losses_per_stage = {i: [] for i in range(5)}
     stage_transition_epochs = []
     val_acc_history = []
+    validation_epochs = []
     drift_by_token = {"<|start-latent|>": [], "<|latent|>": [], "<|end-latent|>": []}
     input_embeds_ref = coconut_model.base_causallm.get_input_embeddings().weight.detach().clone()
     checkpoint_root = os.path.dirname(output_dir)
@@ -362,9 +369,19 @@ def _run_coconut_training(base_model_id: str, D_train: list, D_val: list, output
                     dim=-1,
                 ).item()
                 drift_by_token[name].append(drift)
+        epoch_number = epoch + 1
+        if not _should_run_validation(epoch_number):
+            tqdm.write(
+                f"[phase1][{model_tag}] epoch={epoch_number}/{hp['epochs']} "
+                f"stage={stage} train_loss={epoch_avg_loss:.4f} validation=skipped "
+                f"skipped_nonfinite={epoch_skipped_losses + epoch_skipped_steps} "
+                f"(train_n={len(train_raw)} val_n={len(val_raw)})"
+            )
+            continue
+
         val_acc = _phase1_val_accuracy(stage, drop_remaining)
         val_acc_history.append(val_acc)
-        epoch_number = epoch + 1
+        validation_epochs.append(epoch_number)
         if stage == 0 and val_acc > cot_best_val_acc:
             cot_best_val_acc = val_acc
             cot_best_epoch = epoch_number
@@ -477,6 +494,9 @@ def _run_coconut_training(base_model_id: str, D_train: list, D_val: list, output
         "n_phase_examples": len(train_raw),
         "n_validation_examples": len(val_raw),
         "validation_source": "D_val",
+        "validation_epochs": validation_epochs,
+        "validation_schedule": list(VALIDATION_EPOCHS),
+        "validation_schedule_version": VALIDATION_SCHEDULE_VERSION,
         "epochs": hp["epochs"],
         "completed_epochs": len(loss_history),
         "fixed_epoch_schedule": True,
@@ -530,7 +550,10 @@ def _plot_curves(metrics: dict, phase1_plot_dir: str) -> None:
 
     # Validation accuracy
     plt.figure(figsize=(8, 4))
-    plt.plot(metrics["val_accuracy"])
+    validation_epochs = metrics.get("validation_epochs")
+    if validation_epochs is None:
+        validation_epochs = range(1, len(metrics["val_accuracy"]) + 1)
+    plt.plot(validation_epochs, metrics["val_accuracy"], marker="o")
     plt.xlabel("Epoch")
     plt.ylabel("Accuracy")
     plt.title("Phase1 Validation Accuracy")
@@ -628,6 +651,9 @@ def _phase1_training_current(
         and metrics.get("n_validation_examples") == n_validation_examples
         and metrics.get("n_val") == n_validation_examples
         and metrics.get("validation_source") == "D_val"
+        and metrics.get("validation_epochs") == list(VALIDATION_EPOCHS)
+        and metrics.get("validation_schedule") == list(VALIDATION_EPOCHS)
+        and metrics.get("validation_schedule_version") == VALIDATION_SCHEDULE_VERSION
         and metrics.get("curriculum_version") == CURRICULUM_VERSION
         and metrics.get("epochs") == 30
         and metrics.get("completed_epochs") == 30

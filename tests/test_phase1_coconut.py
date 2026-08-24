@@ -15,9 +15,11 @@ from phase1.train import (
     C_THOUGHT,
     MAX_LATENT_TOKENS,
     MODEL_HPARAMS,
+    VALIDATION_EPOCHS,
     _DEFAULT_HP,
     _build_stage_dataset,
     _get_stage_info,
+    _should_run_validation,
     export_compat_checkpoints,
 )
 
@@ -89,6 +91,13 @@ class CurriculumDatasetTests(unittest.TestCase):
         }
         for epoch, stage_info in expected.items():
             self.assertEqual(_get_stage_info(epoch), stage_info)
+
+    def test_validation_runs_at_stage_zero_end_and_every_ten_epochs(self):
+        scheduled = [
+            epoch for epoch in range(1, 31) if _should_run_validation(epoch)
+        ]
+        self.assertEqual(VALIDATION_EPOCHS, (6, 10, 20, 30))
+        self.assertEqual(scheduled, [6, 10, 20, 30])
 
 
 class CompatibilityExportTests(unittest.TestCase):
