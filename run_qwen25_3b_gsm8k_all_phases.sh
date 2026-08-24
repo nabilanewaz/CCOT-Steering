@@ -16,7 +16,7 @@ IFS=$'\n\t'
 #   PYTHON_BIN=python3.11       Bootstrap Python (must be >= 3.10)
 #   VENV_DIR=/path/to/venv      Virtual environment (default: .venv)
 #   DEVICE=cuda                 Pipeline device (default: cuda)
-#   TORCH_INDEX_URL=<url>       Official PyTorch wheel index for the machine's CUDA version
+#   TORCH_INDEX_URL=<url>       Override the auto-detected official PyTorch wheel index
 #   FORCE_PHASE4=1              Re-run Phase 4 even if final result files exist
 #   RUN_PHASE5=0                Skip the Phase 5 frozen-transfer evaluation
 #
@@ -148,9 +148,42 @@ PYTHON="$VENV_DIR/bin/python"
 run_step "Upgrading Python packaging tools" \
   "$PYTHON" -m pip install --upgrade pip setuptools wheel
 
+# PyPI's newest Linux torch wheel may target a CUDA runtime newer than the
+# host driver supports.  nvidia-smi reports the newest CUDA runtime supported
+# by the driver, so select the newest official PyTorch wheel channel that does
+# not exceed it.  An explicit TORCH_INDEX_URL always takes precedence.
+if [[ -z "$TORCH_INDEX_URL" && "$DEVICE" == cuda* ]] && command -v nvidia-smi >/dev/null 2>&1; then
+  NVIDIA_MAX_CUDA="$(nvidia-smi | sed -n 's/.*CUDA Version: \([0-9][0-9.]*\).*/\1/p')"
+  case "$NVIDIA_MAX_CUDA" in
+    13.*|12.9|12.8) TORCH_INDEX_URL="https://download.pytorch.org/whl/cu128" ;;
+    12.7|12.6)      TORCH_INDEX_URL="https://download.pytorch.org/whl/cu126" ;;
+    12.5|12.4)      TORCH_INDEX_URL="https://download.pytorch.org/whl/cu124" ;;
+    12.3|12.2|12.1) TORCH_INDEX_URL="https://download.pytorch.org/whl/cu121" ;;
+    11.9|11.8)      TORCH_INDEX_URL="https://download.pytorch.org/whl/cu118" ;;
+  esac
+  if [[ -n "$TORCH_INDEX_URL" ]]; then
+    printf '\nPyTorch: NVIDIA driver supports CUDA %s; selected %s\n' \
+      "$NVIDIA_MAX_CUDA" "$TORCH_INDEX_URL"
+  else
+    printf '\nWARNING: could not map NVIDIA CUDA version %q to a PyTorch wheel index.\n' \
+      "$NVIDIA_MAX_CUDA"
+    printf 'Set TORCH_INDEX_URL explicitly if the default PyPI wheel is incompatible.\n'
+  fi
+fi
+
 if [[ -n "$TORCH_INDEX_URL" ]]; then
-  run_step "Installing PyTorch from the requested CUDA wheel index" \
-    "$PYTHON" -m pip install --upgrade --index-url "$TORCH_INDEX_URL" 'torch>=2.2.0'
+  TORCH_BUILD="${TORCH_INDEX_URL%/}"
+  TORCH_BUILD="${TORCH_BUILD##*/}"
+  INSTALLED_TORCH_VERSION="$("$PYTHON" -c 'import torch; print(torch.__version__)' 2>/dev/null || true)"
+  if [[ "$INSTALLED_TORCH_VERSION" == *"+$TORCH_BUILD"* ]]; then
+    printf '\nPyTorch: reusing compatible torch %s\n' "$INSTALLED_TORCH_VERSION"
+  else
+    printf '\nPyTorch: replacing incompatible torch %s with the %s build\n' \
+      "${INSTALLED_TORCH_VERSION:-not-installed}" "$TORCH_BUILD"
+    run_step "Installing PyTorch from the compatible CUDA wheel index" \
+      "$PYTHON" -m pip install --upgrade --force-reinstall \
+        --index-url "$TORCH_INDEX_URL" 'torch>=2.2.0'
+  fi
 fi
 
 run_step "Installing repository requirements" \
