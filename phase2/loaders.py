@@ -68,6 +68,20 @@ def load_base_frozen(base_model_id: str, device: str):
     return model, tokenizer
 
 
+def forward_for_boundary_hooks(model, *args, **kwargs):
+    """Run a hooked forward whose boundary index is global to the input.
+
+    Coconut's KV-cache path invokes decoder layers on sequence chunks, so a
+    global boundary index cannot address those layer outputs directly. Its
+    non-cache path ends with a full-sequence decoder pass, which makes the
+    boundary index valid. Standard causal LMs must not receive Coconut's
+    private keyword.
+    """
+    if hasattr(model, "base_causallm"):
+        kwargs["use_kv_cache"] = False
+    return model(*args, **kwargs)
+
+
 # ── Boundary token finders ────────────────────────────────────────────────────
 
 def find_boundary_idx_ccot(input_ids: torch.Tensor, tokenizer) -> int:

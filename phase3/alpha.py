@@ -5,7 +5,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from phase2.loaders import get_transformer_layers, find_boundary_idx_ccot
+from phase2.loaders import (
+    find_boundary_idx_ccot,
+    forward_for_boundary_hooks,
+    get_transformer_layers,
+)
 from phase1.inference import latent_prompt
 from phase3.hook_utils import (
     boundary_state,
@@ -145,7 +149,11 @@ def tune_alpha(
         with ctx:
             handle = target_layer.register_forward_hook(steer_hook)
             try:
-                out = model(input_ids=full_ids, labels=labels)
+                # Keep decoder-layer positions global for Coconut; its cached
+                # path emits local chunks that cannot be indexed by b.
+                out = forward_for_boundary_hooks(
+                    model, input_ids=full_ids, labels=labels
+                )
             finally:
                 handle.remove()
             L_ans = out.loss

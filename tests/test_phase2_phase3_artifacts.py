@@ -5,8 +5,46 @@ from unittest.mock import patch
 
 import torch
 
+from phase2.loaders import forward_for_boundary_hooks
 from phase2.run import _hidden_state_cache_usable, run_phase2_source
 from phase3.evaluate import _require_phase2_inputs
+
+
+class BoundaryForwardTests(unittest.TestCase):
+    def test_coconut_forward_disables_chunked_kv_path(self):
+        class CoconutLike:
+            base_causallm = object()
+
+            def __init__(self):
+                self.call = None
+
+            def __call__(self, *args, **kwargs):
+                self.call = (args, kwargs)
+                return "output"
+
+        model = CoconutLike()
+        result = forward_for_boundary_hooks(model, "ids", labels="labels")
+
+        self.assertEqual(result, "output")
+        self.assertEqual(model.call[0], ("ids",))
+        self.assertEqual(
+            model.call[1],
+            {"labels": "labels", "use_kv_cache": False},
+        )
+
+    def test_standard_model_does_not_receive_coconut_keyword(self):
+        class StandardModel:
+            def __init__(self):
+                self.call = None
+
+            def __call__(self, *args, **kwargs):
+                self.call = (args, kwargs)
+                return "output"
+
+        model = StandardModel()
+        forward_for_boundary_hooks(model, "ids", labels="labels")
+
+        self.assertEqual(model.call[1], {"labels": "labels"})
 
 
 class HiddenStateCacheTests(unittest.TestCase):

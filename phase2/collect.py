@@ -5,7 +5,10 @@ import torch
 from tqdm.auto import tqdm
 
 from phase1.inference import extract_answer, normalize_answer
-from phase2.loaders import get_transformer_layers
+from phase2.loaders import (
+    forward_for_boundary_hooks,
+    get_transformer_layers,
+)
 from phase2.balance import (
     stratified_balance, check_balance,
     difficulty_bucket, IMBALANCE_THRESHOLD,
@@ -132,9 +135,12 @@ def collect_hidden_states(
                 continue
 
             # Set boundary, then re-run full forward pass to trigger hooks
+            # against the same global sequence coordinates returned by the
+            # boundary finder. Coconut otherwise exposes only local KV chunks
+            # to its decoder-layer hooks.
             captured['boundary_idx'] = bidx
             with torch.no_grad():
-                model(out_ids)
+                forward_for_boundary_hooks(model, out_ids)
 
             generated_text = tokenizer.decode(
                 out_ids[0][input_enc['input_ids'].shape[1]:],
