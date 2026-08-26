@@ -83,6 +83,23 @@ def _load_meta(vectors_dir: str) -> dict:
         return json.load(f)
 
 
+def _require_phase2_inputs(vectors_dir: str) -> None:
+    """Fail before model loading when mandatory Phase 2 outputs are absent."""
+    required = ('phase2_meta.json', *(f'{source}_dom.pt' for source in SOURCES))
+    missing = [
+        name for name in required
+        if not os.path.isfile(os.path.join(vectors_dir, name))
+        or os.path.getsize(os.path.join(vectors_dir, name)) == 0
+    ]
+    if missing:
+        raise RuntimeError(
+            "Phase 3 cannot start because Phase 2 is incomplete. Missing or empty "
+            f"artifacts in {vectors_dir}: {missing}. Rerun `python pipeline.py "
+            "--phase 2 --config <CONFIG> --model <MODEL>` and make sure Phase 2 "
+            "finishes successfully before retrying Phase 3."
+        )
+
+
 def _load_vector(vectors_dir: str, source: str, method: str,
                  r_final: Optional[int] = None) -> torch.Tensor:
     if method == 'dom':
@@ -533,6 +550,7 @@ def run_phase3_evaluation(
     Writes phase3_val.json, steered_val.json, alpha_diagnostic.json.
     """
     require_exact_count(D_val, "D_val")
+    _require_phase2_inputs(vectors_dir)
     os.makedirs(results_dir, exist_ok=True)
     meta    = _load_meta(vectors_dir)
     r_final = meta.get('ccot_r_final', 10)

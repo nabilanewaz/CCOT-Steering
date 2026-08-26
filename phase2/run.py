@@ -47,6 +47,35 @@ def _tensor_shape(value) -> list[int] | None:
     return list(value.shape) if value is not None and hasattr(value, "shape") else None
 
 
+def _hidden_state_cache_usable(cache: dict) -> bool:
+    """Return whether a cache contains at least one usable contrastive layer."""
+    h_pos = cache.get("H_pos") or {}
+    h_neg = cache.get("H_neg") or {}
+    common_layers = set(h_pos).intersection(h_neg)
+    return any(
+        getattr(h_pos[layer], "numel", lambda: 0)() > 0
+        and getattr(h_neg[layer], "numel", lambda: 0)() > 0
+        for layer in common_layers
+    )
+
+
+def _insufficient_hidden_states_error(
+    source_tag: str,
+    min_samples: int,
+    collection_diag: dict,
+    diagnostics_path: str,
+) -> RuntimeError:
+    per_layer = collection_diag.get("per_layer") or {}
+    max_pos = max((int(row.get("h_pos", 0)) for row in per_layer.values()), default=0)
+    max_neg = max((int(row.get("h_neg", 0)) for row in per_layer.values()), default=0)
+    return RuntimeError(
+        f"Phase 2 source={source_tag} could not create a steering vector: no layer "
+        f"had at least min_samples={min_samples} examples in both classes "
+        f"(largest observed H+={max_pos}, H-={max_neg}). The incomplete hidden-state "
+        f"cache will not be reused. Inspect {diagnostics_path}, then rerun Phase 2."
+    )
+
+
 def _layer_selection_diagnostics(
     layer_scores: dict[int, float],
     threshold_multiplier: float,
@@ -144,12 +173,16 @@ def run_phase2_source(
     if os.path.exists(hstates_cache):
         loaded = torch.load(hstates_cache, map_location="cpu")
         cache_meta = dict(loaded.get("cache_meta") or {})
-        if all(cache_meta.get(k) == v for k, v in cache_meta_expected.items()):
+        metadata_matches = all(
+            cache_meta.get(k) == v for k, v in cache_meta_expected.items()
+        )
+        if metadata_matches and _hidden_state_cache_usable(loaded):
             cache = loaded
             print(f"  Loading cached hidden states from {hstates_cache}")
         else:
+            reason = "incomplete" if metadata_matches else "stale"
             print(
-                f"  Ignoring stale hidden-state cache: {hstates_cache} "
+                f"  Ignoring {reason} hidden-state cache: {hstates_cache} "
                 f"meta={cache_meta or 'missing'}"
             )
     if cache is not None:
@@ -169,6 +202,22 @@ def run_phase2_source(
         collection_diag["cached"] = False
         collection_diag["cache_path"] = hstates_cache
         collection_diag["cache_meta"] = cache_meta_expected
+        if not H_pos or not H_neg:
+            diagnostics = {
+                "collection": collection_diag,
+                "freeze": {
+                    "trainable_params": trainable_params,
+                    "frozen_params": frozen_params,
+                    "model_training": bool(model.training),
+                },
+                "step_times_s": {**step_times, "total": time.time() - source_start},
+            }
+            diagnostics_path = _save_diagnostics(
+                vectors_dir, source_tag, diagnostics
+            )
+            raise _insufficient_hidden_states_error(
+                source_tag, min_samples, collection_diag, diagnostics_path
+            )
         torch.save(
             {
                 "H_pos": H_pos,
@@ -180,19 +229,6 @@ def run_phase2_source(
         )
         print(f"  Hidden states cached -> {hstates_cache}")
     _finish_step("1_collection", t)
-    if not H_pos:
-        print("No layers passed min_samples threshold — aborting this source.")
-        diagnostics = {
-            "collection": collection_diag,
-            "freeze": {
-                "trainable_params": trainable_params,
-                "frozen_params": frozen_params,
-                "model_training": bool(model.training),
-            },
-            "step_times_s": {**step_times, "total": time.time() - source_start},
-        }
-        _save_diagnostics(vectors_dir, source_tag, diagnostics)
-        return {"diagnostics": diagnostics}
 
     # ── Layer probe scores ────────────────────────────────────────────────────
     t = _step(2, "score layer probes")
