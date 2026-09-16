@@ -1,643 +1,254 @@
-"""Full Phase 2 runner: collect hidden states → probe → DoM → cPCA → compare."""
+"""Full Phase 2 extraction, provenance-aware caching, and optional ITI."""
 import json
 import os
 import time
 
 import torch
+from sklearn.model_selection import train_test_split
 
-from phase2.config import get_model_config
-from phase2.loaders import (
-    load_ccot_frozen,
-    find_boundary_idx_ccot,
-    find_boundary_idx_base,
-)
+from phase1.inference import cot_prompt, latent_prompt, load_finetuned
 from phase2.collect import collect_hidden_states
-from phase2.probe import PROBE_GATE, gate_status, score_all_layers
-from phase2.dom import (
-    compute_per_layer_dom,
-    compute_best_layer_dom,
-    compute_shuffled_dom,
-    report_cross_source_alignment,
-    save_dom_vector,
-    save_shuffled_vector,
-)
-from phase2.cpca import (
-    select_layers,
-    cpca_full,
-    cpca_shrunk,
-    cpca_randomized,
-    run_cpca_sweep,
-    weighted_subspace_merge,
-    save_subspace,
-    compute_shuffled_cpca,
-    save_shuffled_subspace,
-)
 from phase2.compare import compare_methods, select_best_source_method
-from phase1.inference import cot_prompt, latent_prompt
-from utils.experiment_config import require_exact_count
+from phase2.config import get_model_config
+from phase2.cpca import (
+    select_layers, cpca_full, cpca_shrunk, cpca_randomized, run_cpca_sweep,
+    weighted_subspace_merge, save_subspace, compute_shuffled_cpca, save_shuffled_subspace,
+)
+from phase2.dom import (
+    compute_per_layer_dom, compute_best_layer_dom, compute_shuffled_dom,
+    save_dom_vector, save_shuffled_vector, save_multilayer_dom_vectors,
+)
+from phase2.loaders import find_boundary_idx_ccot, find_boundary_idx_base
+from phase2.probe import gate_status, score_all_layers_both
+from utils.artifacts import (
+    EXPERIMENT_VERSION, atomic_json, checkpoint_identity, dataset_fingerprint, file_fingerprint,
+)
+from utils.experiment_config import load_protocol, protocol_seed, require_exact_count
 
-_CPCA_FN_MAP = {
-    'full':       cpca_full,
-    'shrunk':     cpca_shrunk,
-    'randomized': cpca_randomized,
-}
-
-
-def _tensor_shape(value) -> list[int] | None:
-    return list(value.shape) if value is not None and hasattr(value, "shape") else None
-
-
-def _hidden_state_cache_usable(cache: dict) -> bool:
-    """Return whether a cache contains at least one usable contrastive layer."""
-    h_pos = cache.get("H_pos") or {}
-    h_neg = cache.get("H_neg") or {}
-    common_layers = set(h_pos).intersection(h_neg)
-    return any(
-        getattr(h_pos[layer], "numel", lambda: 0)() > 0
-        and getattr(h_neg[layer], "numel", lambda: 0)() > 0
-        for layer in common_layers
-    )
+_CPCA_FN_MAP = {"full": cpca_full, "shrunk": cpca_shrunk, "randomized": cpca_randomized}
 
 
-def _insufficient_hidden_states_error(
-    source_tag: str,
-    min_samples: int,
-    collection_diag: dict,
-    diagnostics_path: str,
-) -> RuntimeError:
-    per_layer = collection_diag.get("per_layer") or {}
-    max_pos = max((int(row.get("h_pos", 0)) for row in per_layer.values()), default=0)
-    max_neg = max((int(row.get("h_neg", 0)) for row in per_layer.values()), default=0)
-    return RuntimeError(
-        f"Phase 2 source={source_tag} could not create a steering vector: no layer "
-        f"had at least min_samples={min_samples} examples in both classes "
-        f"(largest observed H+={max_pos}, H-={max_neg}). The incomplete hidden-state "
-        f"cache will not be reused. Inspect {diagnostics_path}, then rerun Phase 2."
-    )
+def _hidden_state_cache_usable(cache):
+    positive, negative = cache.get("H_pos") or {}, cache.get("H_neg") or {}
+    return any(positive[layer].numel() > 0 and negative[layer].numel() > 0
+               for layer in set(positive) & set(negative))
 
 
-def _layer_selection_diagnostics(
-    layer_scores: dict[int, float],
-    threshold_multiplier: float,
-    selected_layers: list[int],
-) -> dict:
-    if not layer_scores:
-        return {
-            "threshold": 0.0,
-            "mean": 0.0,
-            "std": 0.0,
-            "layers_passing": [],
-            "selected_layers": selected_layers,
-        }
-    vals = torch.tensor(list(layer_scores.values()), dtype=torch.float32)
-    mean = vals.mean().item()
-    std = vals.std(unbiased=False).item()
-    threshold = mean + threshold_multiplier * std
-    return {
-        "threshold": threshold,
-        "mean": mean,
-        "std": std,
-        "layers_passing": sorted(int(L) for L, s in layer_scores.items() if s >= threshold),
-        "selected_layers": sorted(int(L) for L in selected_layers),
-    }
-
-
-def _save_diagnostics(vectors_dir: str, source: str, diagnostics: dict) -> str:
-    os.makedirs(vectors_dir, exist_ok=True)
-    path = os.path.join(vectors_dir, f"{source}_diagnostics.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(diagnostics, f, indent=2)
-    print(f"Saved {source} diagnostics -> {path}")
-    return path
+def _split_extraction_holdout(H_pos, H_neg):
+    fit_pos, fit_neg, test_pos, test_neg = {}, {}, {}, {}
+    for layer in H_pos:
+        fit_pos[layer], test_pos[layer] = train_test_split(H_pos[layer], test_size=0.2, random_state=42)
+        fit_neg[layer], test_neg[layer] = train_test_split(H_neg[layer], test_size=0.2, random_state=42)
+    return fit_pos, fit_neg, test_pos, test_neg
 
 
 def run_phase2_source(
-    model,
-    tokenizer,
-    D_steer: list,
-    model_tag: str,
-    source_tag: str,
-    boundary_idx_fn,
-    device: str,
-    vectors_dir: str,
-    prompt_fn=None,
-    prompt_mode: str = 'unknown',
-    N: int = 20,
-    beta: float = 0.5,
-    r_per_layer: int = 3,
-    r_final: int = 10,
-    threshold_multiplier: float = 0.5,
-    min_samples: int = 200,
-    cpca_variant: str = 'full',
-) -> dict:
-    """
-    Phase 2 extraction for a single (model, source) pair.
-    Saves {source}_dom.pt and {source}_cpca_r{r_final}.pt to vectors_dir.
-    """
-    for param in model.parameters():
-        param.requires_grad = False
-    model.eval()
-    frozen_params = sum(p.numel() for p in model.parameters() if not p.requires_grad)
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-    header = f"Phase 2: {model_tag} | source={source_tag}"
-    print(f"\n{'='*len(header)}\n{header}\n{'='*len(header)}")
-    print(
-        f"Phase 2 freeze check [{source_tag}]: "
-        f"trainable_params={trainable_params} frozen_params={frozen_params}"
-    )
-    source_start = time.time()
-    step_times: dict[str, float] = {}
-
-    def _step(n: int, label: str) -> float:
-        elapsed = time.time() - source_start
-        print(f"\n{'-' * 72}")
-        print(f"STEP {n}/9 [{source_tag}] {label} | elapsed={elapsed:.1f}s")
-        print(f"{'-' * 72}")
-        return time.time()
-
-    def _finish_step(key: str, started: float) -> None:
-        step_times[key] = time.time() - started
-
-    t = _step(1, "collect hidden states")
+    model, tokenizer, D_steer, model_tag, source_tag, boundary_idx_fn, device,
+    vectors_dir, prompt_fn=None, prompt_mode="unknown", N=10, beta=0.5,
+    r_per_layer=3, r_final=10, threshold_multiplier=0.5, min_samples=200,
+    cpca_variant="full", extraction="mean_gen", gen_window=20, checkpoint=None,
+):
     os.makedirs(vectors_dir, exist_ok=True)
-    hstates_cache = os.path.join(vectors_dir, f"{source_tag}_hstates_cache.pt")
-    cache_meta_expected = {
-        "phase2_prompt_version": 2,
-        "prompt_mode": prompt_mode,
-        "answer_label_source": "generated_text_only",
-        "n_steer": len(D_steer),
-        "n_rollouts": N,
+    model.eval()
+    for parameter in model.parameters():
+        parameter.requires_grad = False
+    torch.manual_seed(protocol_seed())
+    started = time.time()
+    timings = {}
+    cache_meta = {
+        "experiment_version": EXPERIMENT_VERSION,
+        "data": dataset_fingerprint(D_steer), "n_steer": len(D_steer),
+        "model_tag": model_tag, "source": source_tag, "prompt_mode": prompt_mode,
+        "N": N, "min_samples": min_samples, "extraction": extraction,
+        "gen_window": gen_window, "checkpoint": checkpoint, "seed": protocol_seed(),
     }
+    cache_path = os.path.join(vectors_dir, f"{source_tag}_hstates_cache.pt")
     cache = None
-    if os.path.exists(hstates_cache):
-        loaded = torch.load(hstates_cache, map_location="cpu")
-        cache_meta = dict(loaded.get("cache_meta") or {})
-        metadata_matches = all(
-            cache_meta.get(k) == v for k, v in cache_meta_expected.items()
+    if os.path.exists(cache_path):
+        candidate = torch.load(cache_path, map_location="cpu", weights_only=False)
+        if candidate.get("cache_meta") == cache_meta and _hidden_state_cache_usable(candidate):
+            cache = candidate
+    if cache is None:
+        positive, negative, collection = collect_hidden_states(
+            model, tokenizer, D_steer, N, device, boundary_idx_fn, source_tag,
+            prompt_fn=prompt_fn, min_samples=min_samples, extraction=extraction, gen_window=gen_window,
         )
-        if metadata_matches and _hidden_state_cache_usable(loaded):
-            cache = loaded
-            print(f"  Loading cached hidden states from {hstates_cache}")
-        else:
-            reason = "incomplete" if metadata_matches else "stale"
-            print(
-                f"  Ignoring {reason} hidden-state cache: {hstates_cache} "
-                f"meta={cache_meta or 'missing'}"
+        if not positive or not negative:
+            rows = collection.get("per_layer", {}).values()
+            max_pos = max((row.get("h_pos", 0) for row in rows), default=0)
+            max_neg = max((row.get("h_neg", 0) for row in collection.get("per_layer", {}).values()), default=0)
+            atomic_json(os.path.join(vectors_dir, f"{source_tag}_diagnostics.json"), {"collection": collection})
+            raise RuntimeError(
+                f"Phase 2 has no contrastive layer: largest observed H+={max_pos}, H-={max_neg}; "
+                f"min_samples={min_samples}. No incomplete cache was saved."
             )
-    if cache is not None:
-        H_pos, H_neg = cache["H_pos"], cache["H_neg"]
-        collection_diag = dict(cache.get("collection_diag") or {})
-        collection_diag["cached"] = True
-        collection_diag["cache_path"] = hstates_cache
-        collection_diag["cache_meta"] = dict(cache.get("cache_meta") or {})
-    else:
-        H_pos, H_neg, collection_diag = collect_hidden_states(
-            model, tokenizer, D_steer, N, device,
-            boundary_idx_fn, source_tag,
-            prompt_fn=prompt_fn,
-            min_samples=min_samples,
+        cache = {"H_pos": positive, "H_neg": negative, "collection_diag": collection, "cache_meta": cache_meta}
+        temporary = cache_path + ".tmp"
+        torch.save(cache, temporary)
+        os.replace(temporary, cache_path)
+    positive, negative = cache["H_pos"], cache["H_neg"]
+    timings["collection"] = time.time() - started
+    fit_pos, fit_neg, test_pos, test_neg = _split_extraction_holdout(positive, negative)
+    probe_start = time.time()
+    try:
+        scores, probe_diagnostics = score_all_layers_both(fit_pos, fit_neg)
+    except RuntimeError as error:
+        atomic_json(os.path.join(vectors_dir, f"{source_tag}_diagnostics.json"), {
+            "collection": cache["collection_diag"], "probe_error": str(error),
+        })
+        raise
+    timings["probe"] = time.time() - probe_start
+    directions = compute_per_layer_dom(fit_pos, fit_neg)
+    truth, best_layer = compute_best_layer_dom(directions, scores)
+    save_dom_vector(truth, model_tag, source_tag, vectors_dir, best_layer=best_layer)
+    save_multilayer_dom_vectors(directions, scores, model_tag, source_tag, vectors_dir)
+    shuffled, shuffled_stats = compute_shuffled_dom(fit_pos, fit_neg, best_layer, truth)
+    save_shuffled_vector(shuffled, model_tag, source_tag, vectors_dir, best_layer=best_layer)
+    selected = select_layers(scores, multiplier=threshold_multiplier)
+    cpca_start = time.time()
+    cpca_function = _CPCA_FN_MAP[cpca_variant]
+    sweep = run_cpca_sweep(fit_pos, fit_neg, selected, cpca_function)
+    basis, weights, shuffled_basis = None, {}, None
+    if sweep:
+        subspaces = {layer: (row[0], row[1]) for layer, row in sweep.items()}
+        basis, weights = weighted_subspace_merge(subspaces, scores, directions, truth, r_final)
+        sweep_meta = {layer: {"k": row[2], "beta": row[3], "acc": row[4]} for layer, row in sweep.items()}
+        save_subspace(basis, selected, model_tag, source_tag, r_final, beta, vectors_dir,
+                      layer_scores=scores, sweep_meta=sweep_meta)
+        shuffled_basis = compute_shuffled_cpca(
+            fit_pos, fit_neg, selected, cpca_function, directions, scores, truth, r_final,
         )
-        collection_diag = dict(collection_diag or {})
-        collection_diag["cached"] = False
-        collection_diag["cache_path"] = hstates_cache
-        collection_diag["cache_meta"] = cache_meta_expected
-        if not H_pos or not H_neg:
-            diagnostics = {
-                "collection": collection_diag,
-                "freeze": {
-                    "trainable_params": trainable_params,
-                    "frozen_params": frozen_params,
-                    "model_training": bool(model.training),
-                },
-                "step_times_s": {**step_times, "total": time.time() - source_start},
-            }
-            diagnostics_path = _save_diagnostics(
-                vectors_dir, source_tag, diagnostics
-            )
-            raise _insufficient_hidden_states_error(
-                source_tag, min_samples, collection_diag, diagnostics_path
-            )
-        torch.save(
-            {
-                "H_pos": H_pos,
-                "H_neg": H_neg,
-                "collection_diag": collection_diag,
-                "cache_meta": cache_meta_expected,
-            },
-            hstates_cache,
-        )
-        print(f"  Hidden states cached -> {hstates_cache}")
-    _finish_step("1_collection", t)
-
-    # ── Layer probe scores ────────────────────────────────────────────────────
-    t = _step(2, "score layer probes")
-    layer_scores = score_all_layers(H_pos, H_neg)
-    probe_gate_info = gate_status(layer_scores, PROBE_GATE)
-    _finish_step("2_probe", t)
-
-    # ── Method A: best-layer DoM ──────────────────────────────────────────────
-    t = _step(3, "compute best-layer DoM")
-    dom_vectors         = compute_per_layer_dom(H_pos, H_neg)
-    v_truth, best_layer = compute_best_layer_dom(dom_vectors, layer_scores)
-    dom_cosines = {
-        str(L): float(torch.dot(v.float(), v_truth.float()).item())
-        for L, v in dom_vectors.items()
-    }
-    _finish_step("3_dom", t)
-
-    # ── Control: shuffled-label DoM ───────────────────────────────────────────
-    t = _step(4, "compute shuffled-label DoM control")
-    v_shuffled, shuffled_dom_stats = compute_shuffled_dom(H_pos, H_neg, best_layer, v_truth)
-    save_shuffled_vector(v_shuffled, model_tag, source_tag, vectors_dir,
-                         best_layer=best_layer)
-    _finish_step("4_shuffled_dom", t)
-
-    # ── Layer selection ───────────────────────────────────────────────────────
-    t = _step(5, "select cPCA layers")
-    selected_layers = select_layers(layer_scores, multiplier=threshold_multiplier)
-    layer_selection_diag = _layer_selection_diagnostics(
-        layer_scores, threshold_multiplier, selected_layers
+        if shuffled_basis is not None:
+            save_shuffled_subspace(shuffled_basis, model_tag, source_tag, r_final, vectors_dir)
+    timings["cpca"] = time.time() - cpca_start
+    winner, accuracies = compare_methods(
+        fit_pos, fit_neg, truth, basis, selected, heldout=(test_pos, test_neg), best_layer=best_layer,
     )
-    _finish_step("5_layer_selection", t)
-
-    # ── Method B: cPCA sweep (k ∈ {1,2,5,10}, β ∈ {0.3,0.5,0.7}) ────────────
-    t = _step(6, "run cPCA sweep")
-    cpca_fn = _CPCA_FN_MAP.get(cpca_variant, cpca_full)
-
-    cpca_results = run_cpca_sweep(H_pos, H_neg, selected_layers, cpca_fn)
-    subspaces  = {L: (U, lam) for L, (U, lam, _, _, _) in cpca_results.items()}
-    sweep_meta = {L: {'k': k, 'beta': b, 'acc': acc}
-                  for L, (_, _, k, b, acc) in cpca_results.items()}
-    cpca_sweep_diag = {
-        str(L): {
-            "best_k": int(k),
-            "best_beta": float(b),
-            "best_acc": float(acc),
-            "h_pos": int(H_pos[L].shape[0]),
-            "h_neg": int(H_neg[L].shape[0]),
-        }
-        for L, (_, _, k, b, acc) in cpca_results.items()
-    }
-    _finish_step("6_cpca_sweep", t)
-
-    if not subspaces:
-        print("No subspaces computed — saving DoM only, skipping Method B.")
-        save_dom_vector(v_truth, model_tag, source_tag, vectors_dir,
-                        best_layer=best_layer)
-        method_accs = {'dom': layer_scores.get(best_layer, 0.0), 'cpca': 0.0}
-        diagnostics = {
-            "collection": collection_diag,
-            "freeze": {
-                "trainable_params": trainable_params,
-                "frozen_params": frozen_params,
-                "model_training": bool(model.training),
-            },
-            "probe": {
-                "layer_scores": {str(L): float(s) for L, s in layer_scores.items()},
-                **probe_gate_info,
-            },
-            "dom": {
-                "best_layer": int(best_layer),
-                "v_truth_norm": float(v_truth.norm().item()),
-                "per_layer_cosines_to_best": dom_cosines,
-            },
-            "shuffled_dom": shuffled_dom_stats,
-            "layer_selection": layer_selection_diag,
-            "cpca_sweep": cpca_sweep_diag,
-            "subspace_merge": {"r_final": r_final, "U_shape": None, "layer_weights": {}},
-            "method_comparison": {
-                "dom_acc": float(method_accs["dom"]),
-                "cpca_acc": 0.0,
-                "gap": -float(method_accs["dom"]),
-                "winner": "dom",
-            },
-            "shuffled_cpca": {"U_shape": None},
-            "step_times_s": {**step_times, "total": time.time() - source_start},
-        }
-        _save_diagnostics(vectors_dir, source_tag, diagnostics)
-        return {
-            'v_truth':    v_truth,    'U_truth':       None,
-            'v_shuffled': v_shuffled, 'best_layer':    best_layer,
-            'layer_scores':    layer_scores,
-            'selected_layers': selected_layers, 'sweep_meta': {},
-            'winner':     'dom', 'dom_vectors': dom_vectors, 'subspaces': {},
-            'method_accs': method_accs,
-            'diagnostics': diagnostics,
-        }
-
-    t = _step(7, "merge weighted cPCA subspaces")
-    U_truth, layer_weights = weighted_subspace_merge(
-        subspaces, layer_scores, dom_vectors, v_truth, r_final
-    )
-    _finish_step("7_subspace_merge", t)
-
-    # ── Method comparison ─────────────────────────────────────────────────────
-    t = _step(8, "compare methods and save vectors")
-    winner, method_accs = compare_methods(
-        H_pos, H_neg, v_truth, U_truth, selected_layers
-    )
-
-    save_dom_vector(v_truth, model_tag, source_tag, vectors_dir,
-                    best_layer=best_layer)
-    save_subspace(U_truth, selected_layers, model_tag, source_tag,
-                  r_final, beta, vectors_dir,
-                  layer_scores=layer_scores, sweep_meta=sweep_meta)
-    _finish_step("8_method_compare_save", t)
-
-    # ── Control: Shuffled-Label cPCA ──────────────────────────────────────────
-    t = _step(9, "compute shuffled-label cPCA control")
-    U_shuffled_cpca = compute_shuffled_cpca(
-        H_pos, H_neg, selected_layers, cpca_fn,
-        dom_vectors, layer_scores, v_truth, r_final,
-    )
-    if U_shuffled_cpca is not None:
-        save_shuffled_subspace(U_shuffled_cpca, model_tag, source_tag,
-                               r_final, vectors_dir)
-    _finish_step("9_shuffled_cpca", t)
-
-    total_elapsed = time.time() - source_start
     diagnostics = {
-        "collection": collection_diag,
-        "freeze": {
-            "trainable_params": trainable_params,
-            "frozen_params": frozen_params,
-            "model_training": bool(model.training),
-        },
-        "probe": {
-            "layer_scores": {str(L): float(s) for L, s in layer_scores.items()},
-            **probe_gate_info,
-        },
-        "dom": {
-            "best_layer": int(best_layer),
-            "v_truth_norm": float(v_truth.norm().item()),
-            "per_layer_cosines_to_best": dom_cosines,
-        },
-        "shuffled_dom": shuffled_dom_stats,
-        "layer_selection": layer_selection_diag,
-        "cpca_sweep": cpca_sweep_diag,
-        "subspace_merge": {
-            "r_final": int(r_final),
-            "U_shape": _tensor_shape(U_truth),
-            "layer_weights": {str(L): float(w) for L, w in layer_weights.items()},
-        },
-        "method_comparison": {
-            "dom_acc": float(method_accs.get("dom", 0.0)),
-            "cpca_acc": float(method_accs.get("cpca", 0.0)),
-            "gap": float(method_accs.get("cpca", 0.0) - method_accs.get("dom", 0.0)),
-            "winner": winner,
-        },
-        "shuffled_cpca": {"U_shape": _tensor_shape(U_shuffled_cpca)},
-        "step_times_s": {**step_times, "total": total_elapsed},
+        "collection": cache["collection_diag"],
+        "probe": {**probe_diagnostics, **gate_status(scores), "layer_scores": scores},
+        "dom": {"best_layer": best_layer}, "shuffled_dom": shuffled_stats,
+        "layer_selection": {"selected_layers": selected},
+        "cpca_sweep": {layer: {"k": row[2], "beta": row[3], "accuracy": row[4]} for layer, row in sweep.items()},
+        "subspace_merge": {"requested_rank": r_final, "actual_rank": basis.shape[1] if basis is not None else 0,
+                           "layer_weights": weights},
+        "method_comparison": {"winner": winner, **accuracies, "holdout_fraction": 0.2},
+        "step_times_s": {**timings, "total": time.time() - started},
+        "freeze": {"trainable_params": 0, "model_training": False},
     }
-    _save_diagnostics(vectors_dir, source_tag, diagnostics)
-
-    print(f"\n{'=' * 72}")
-    print(f"Phase 2 source complete: {model_tag} | source={source_tag}")
-    print(f"  best_layer={best_layer}  probe_acc={layer_scores.get(best_layer, 0.0):.3f}")
-    print(f"  winner={winner}  method_accs={method_accs}")
-    print(f"  v_truth_shape={_tensor_shape(v_truth)}  U_truth_shape={_tensor_shape(U_truth)}")
-    print(f"  shuffled_dom_shape={_tensor_shape(v_shuffled)}  shuffled_cpca_shape={_tensor_shape(U_shuffled_cpca)}")
-    print(f"  total_time={total_elapsed:.1f}s")
-    for key, seconds in step_times.items():
-        print(f"    {key}: {seconds:.1f}s")
-    print(f"{'=' * 72}")
-
+    atomic_json(os.path.join(vectors_dir, f"{source_tag}_diagnostics.json"), diagnostics)
     return {
-        'v_truth':         v_truth,
-        'U_truth':         U_truth,
-        'v_shuffled':      v_shuffled,
-        'U_shuffled_cpca': U_shuffled_cpca,
-        'best_layer':      best_layer,
-        'layer_scores':    layer_scores,
-        'selected_layers': selected_layers,
-        'sweep_meta':      sweep_meta,
-        'winner':          winner,
-        'method_accs':     method_accs,
-        'dom_vectors':     dom_vectors,
-        'subspaces':       subspaces,
-        'diagnostics':     diagnostics,
+        "v_truth": truth, "U_truth": basis, "best_layer": best_layer, "layer_scores": scores,
+        "selected_layers": selected, "method_accs": accuracies, "winner": winner,
+        "diagnostics": diagnostics, "has_cpca": basis is not None,
+        "has_shuffled_cpca": shuffled_basis is not None,
     }
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+def pick_best_ccot_latent_tokens(results_dir, model_tag):
+    best_path = os.path.join(results_dir, "phase1_best_latent.json")
+    if not os.path.exists(best_path):
+        raise FileNotFoundError(f"Phase 1 selection required; no fallback latent budget: {best_path}")
+    with open(best_path) as stream:
+        payload = json.load(stream)
+    budget = int(payload["latent_tokens"])
+    if budget not in (3, 4, 6):
+        raise ValueError(f"Unsupported Phase 1 latent budget: {budget}")
+    return budget
 
-def pick_best_ccot_latent_tokens(results_dir: str, model_tag: str) -> int:
-    """
-    Read Phase 1 latent-token results and return the CCoT latent count that
-    maximizes validation accuracy. Defaults to 4 if no Phase 1 result exists.
-    """
-    best_path = os.path.join(results_dir, 'phase1_best_latent.json')
-    if os.path.exists(best_path):
-        with open(best_path) as f:
-            best = json.load(f)
-        n_latents = int(best.get('latent_tokens') or 4)
-        print(
-            f"Best CCoT latent budget for {model_tag}: L={n_latents} "
-            f"(val acc = {best.get('accuracy', 0.0):.3f})"
-        )
-        return n_latents
 
-    sweep_path = os.path.join(results_dir, 'phase1_latent_sweep.json')
-    if not os.path.exists(sweep_path):
-        print(f"Phase 1 latent results missing in {results_dir} — defaulting to L=4")
-        return 4
+def run_iti_phase2(model_tag, checkpoints_dir, D_steer, device, vectors_dir, results_dir, sources=None):
+    from phase2.collect_heads import collect_head_activations
+    from phase2.probe_heads import probe_all_heads
 
-    with open(sweep_path) as f:
-        records = json.load(f)
-
-    candidates = [
-        r for r in records
-        if str(r.get('condition', '')).startswith('ccot_L') and r.get('latent_tokens')
-    ]
-    if not candidates:
-        print(f"No latent-token CCoT records found in {sweep_path} — defaulting to L=4")
-        return 4
-
-    best = max(candidates, key=lambda r: (r.get('accuracy', 0.0), int(r['latent_tokens'])))
-    n_latents = int(best['latent_tokens'])
-    print(
-        f"Best CCoT latent budget for {model_tag}: L={n_latents} "
-        f"(val acc = {best.get('accuracy', 0.0):.3f})"
-    )
-    return n_latents
+    with open(os.path.join(vectors_dir, "phase2_meta.json")) as stream:
+        meta = json.load(stream)
+    budget = meta["best_ccot_latent_tokens"]
+    for source in sources or meta["sources"]:
+        checkpoint = os.path.join(checkpoints_dir, f"ccot_L{budget}" if source == "ccot" else "cot")
+        identity = {"version": EXPERIMENT_VERSION, "dataset": dataset_fingerprint(D_steer),
+                    "checkpoint": checkpoint_identity(checkpoint), "source": source,
+                    "N": 10, "temperature": 0.8, "min_samples": 30, "max_new_tokens": 128}
+        cache_path = os.path.join(vectors_dir, f"{source}_head_hstates_cache.pt")
+        cache = torch.load(cache_path, map_location="cpu", weights_only=False) if os.path.exists(cache_path) else {}
+        if cache.get("identity") != identity:
+            model, tokenizer = load_finetuned(checkpoint, device)
+            prompt = (lambda item: latent_prompt(item["question"], budget)) if source == "ccot" else (lambda item: cot_prompt(item["question"]))
+            boundary = find_boundary_idx_ccot if source == "ccot" else find_boundary_idx_base
+            try:
+                positive, negative = collect_head_activations(model, tokenizer, D_steer, device, prompt, boundary)
+                num_heads = int(model.config.num_attention_heads)
+            finally:
+                del model
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            cache = {"identity": identity, "H_pos": positive, "H_neg": negative, "num_heads": num_heads}
+            torch.save(cache, cache_path)
+        payload = probe_all_heads(cache["H_pos"], cache["H_neg"], top_k=load_protocol().get("iti_top_k", 48))
+        payload.update(model_tag=model_tag, source_tag=source, identity=identity, num_heads=cache["num_heads"])
+        torch.save(payload, os.path.join(vectors_dir, f"{source}_iti_heads.pt"))
 
 
 def run_phase2_all_sources(
-    model_tag: str,
-    base_model_id: str,
-    checkpoints_dir: str,
-    D_steer: list,
-    device: str,
-    vectors_dir: str,
-    results_dir: str,
-) -> dict:
-    """
-    Load Source A (best CCoT checkpoint) and Source B (CoT checkpoint),
-    run Phase 2 extraction for both, save vectors, and write phase2_meta.json.
-    """
+    model_tag, base_model_id, checkpoints_dir, D_steer, device, vectors_dir, results_dir,
+    run_source_b=None, run_iti=None,
+):
     require_exact_count(D_steer, "D_steer")
-    phase_start = time.time()
-    cfg = get_model_config(model_tag)
-    best_latent_tokens = pick_best_ccot_latent_tokens(results_dir, model_tag)
-    ccot_ckpt = os.path.join(checkpoints_dir, f'ccot_L{best_latent_tokens}')
-
-    results: dict = {}
-
-    # ── Source A: CCoT fine-tuned model ──────────────────────────────────────
-    print(f"\n{'#' * 72}")
-    print(f"SOURCE A/2: CCoT latent checkpoint | model={model_tag} | L={best_latent_tokens}")
-    print(f"{'#' * 72}")
-    print(f"\nLoading Source A  CCoT L={best_latent_tokens}: {ccot_ckpt}")
-    ccot_model, tok_a = load_ccot_frozen(base_model_id, ccot_ckpt, device)
-
-    ccot_prompt_fn = (
-        lambda item, n=best_latent_tokens: latent_prompt(item['question'], n)
-    )
-    results['ccot'] = run_phase2_source(
-        ccot_model, tok_a, D_steer, model_tag,
-        source_tag='ccot',
-        boundary_idx_fn=find_boundary_idx_ccot,
-        device=device,
-        vectors_dir=vectors_dir,
-        prompt_fn=ccot_prompt_fn,
-        prompt_mode='latent_prompt',
-        **cfg,
-    )
-    del ccot_model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    # ── Source B: CoT fine-tuned model (Phase 1, Stage 1 checkpoint) ─────────
-    # Using load_finetuned from phase1 (loads LoRA adapter), then freeze
-    print(f"\n{'#' * 72}")
-    print(f"SOURCE B/2: CoT checkpoint | model={model_tag}")
-    print(f"{'#' * 72}")
-    from phase1.inference import load_finetuned
-    cot_ckpt = os.path.join(checkpoints_dir, 'cot')
-    print(f"\nLoading Source B  CoT checkpoint: {cot_ckpt}")
-    cot_model, tok_b = load_finetuned(cot_ckpt, device)
-    for param in cot_model.parameters():
-        param.requires_grad = False
-    cot_model.eval()
-
-    cot_prompt_fn = lambda item: cot_prompt(item['question'])
-    results['base'] = run_phase2_source(
-        cot_model, tok_b, D_steer, model_tag,
-        source_tag='base',
-        boundary_idx_fn=find_boundary_idx_base,
-        device=device,
-        vectors_dir=vectors_dir,
-        prompt_fn=cot_prompt_fn,
-        prompt_mode='cot_prompt',
-        **cfg,
-    )
-    del cot_model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    # ── Cross-source DoM alignment ────────────────────────────────────────────
-    ccot_res = results.get('ccot', {})
-    base_res = results.get('base', {})
-    v_ccot   = ccot_res.get('v_truth')
-    v_base   = base_res.get('v_truth')
-    cross_cos = None
-    if v_ccot is not None and v_base is not None:
-        cross_cos = report_cross_source_alignment(
-            v_ccot, v_base,
-            best_L_a=ccot_res.get('best_layer', -1),
-            best_L_b=base_res.get('best_layer', -1),
-        )
-
-    # ── Select best source × method ───────────────────────────────────────────
-    print("\n--- Source × Method Selection ---")
-    best_source, best_method, best_acc = select_best_source_method(
-        ccot_res, base_res
-    )
-
-    # ── Save metadata ─────────────────────────────────────────────────────────
-    def _pick_layer_star(result: dict) -> int:
-        ls  = result.get('layer_scores', {})
-        sel = result.get('selected_layers', [])
-        candidates = [L for L in sel if L in ls]
-        pool = candidates if candidates else list(ls.keys())
-        return max(pool, key=ls.get) if pool else 0
-
-    ccot_ls = ccot_res.get('layer_scores', {})
-    base_ls = base_res.get('layer_scores', {})
-
-    meta = {
-        'model_tag':              model_tag,
-        'n_steer':                len(D_steer),
-        'phase2_prompt_version':  2,
-        'ccot_prompt_mode':       'latent_prompt',
-        'base_prompt_mode':       'cot_prompt',
-        'best_ccot_latent_tokens': best_latent_tokens,
-        'best_ccot_condition':    f'ccot_L{best_latent_tokens}',
-        # Per-source winner (dom vs cpca)
-        'ccot_winner_method':     ccot_res.get('winner'),
-        'base_winner_method':     base_res.get('winner'),
-        'ccot_method_accs':       ccot_res.get('method_accs', {}),
-        'base_method_accs':       base_res.get('method_accs', {}),
-        # Overall winner across sources and methods
-        'best_source':            best_source,
-        'best_method':            best_method,
-        'best_probe_acc':         best_acc,
-        # Layer info
-        'ccot_best_layer':        ccot_res.get('best_layer', _pick_layer_star(ccot_res)),
-        'base_best_layer':        base_res.get('best_layer', _pick_layer_star(base_res)),
-        'ccot_selected_layers':   ccot_res.get('selected_layers', []),
-        'base_selected_layers':   base_res.get('selected_layers', []),
-        'ccot_layer_scores':      {str(L): s for L, s in ccot_ls.items()},
-        'base_layer_scores':      {str(L): s for L, s in base_ls.items()},
-        'ccot_max_probe_score':   max(ccot_ls.values()) if ccot_ls else 0.0,
-        'base_max_probe_score':   max(base_ls.values()) if base_ls else 0.0,
-        'ccot_probe_gate':        ccot_res.get('diagnostics', {}).get('probe', {}),
-        'base_probe_gate':        base_res.get('diagnostics', {}).get('probe', {}),
-        'cross_source_cos':       cross_cos,
-        'ccot_r_final':           cfg.get('r_final', 10),
-        'phase2_models_frozen':   True,
-        'ccot_trainable_params':  int(ccot_res.get('diagnostics', {}).get('freeze', {}).get('trainable_params', 0)),
-        'base_trainable_params':  int(base_res.get('diagnostics', {}).get('freeze', {}).get('trainable_params', 0)),
-    }
+    protocol = load_protocol()
+    run_source_b = protocol.get("run_source_b", False) if run_source_b is None else run_source_b
+    run_iti = protocol.get("run_iti", False) if run_iti is None else run_iti
+    sources = ["ccot", "base"] if run_source_b else ["ccot"]
+    budget = pick_best_ccot_latent_tokens(results_dir, model_tag)
+    config = get_model_config(model_tag)
+    config.update(extraction=protocol["extraction"], gen_window=protocol["gen_window"])
+    results, checkpoints = {}, {}
     os.makedirs(vectors_dir, exist_ok=True)
-    os.makedirs(results_dir, exist_ok=True)
-    meta_path = os.path.join(vectors_dir, 'phase2_meta.json')
-    with open(meta_path, 'w') as f:
-        json.dump(meta, f, indent=2)
-    results_meta_path = os.path.join(results_dir, 'phase2_meta.json')
-    with open(results_meta_path, 'w') as f:
-        json.dump(meta, f, indent=2)
-    for source, res in (("ccot", ccot_res), ("base", base_res)):
-        diag = res.get('diagnostics')
-        if diag:
-            diag_path = os.path.join(results_dir, f'phase2_{source}_diagnostics.json')
-            with open(diag_path, 'w') as f:
-                json.dump(diag, f, indent=2)
-            print(f"Phase 2 {source} diagnostics -> {diag_path}")
-    print(f"\nPhase 2 metadata -> {meta_path}")
-    print(f"Phase 2 metadata mirror -> {results_meta_path}")
-
-    total_elapsed = time.time() - phase_start
-    print(f"\n{'=' * 72}")
-    print(f"PHASE 2 COMPLETE | model={model_tag}")
-    print(f"  total_time={total_elapsed:.1f}s")
-    for source, res in (("ccot", ccot_res), ("base", base_res)):
-        diag = res.get("diagnostics", {})
-        method = res.get("winner")
-        best_layer = res.get("best_layer")
-        layer_scores = res.get("layer_scores", {})
-        probe_acc = layer_scores.get(best_layer, 0.0) if best_layer is not None else 0.0
-        print(f"  source={source}: best_layer={best_layer} probe_acc={probe_acc:.3f} winner={method}")
-        print(f"    v_truth_shape={_tensor_shape(res.get('v_truth'))} U_truth_shape={_tensor_shape(res.get('U_truth'))}")
-        step_times = diag.get("step_times_s", {})
-        if step_times:
-            timing = ", ".join(
-                f"{k}={v:.1f}s" for k, v in step_times.items()
-                if isinstance(v, (int, float))
+    for source in sources:
+        path = os.path.join(checkpoints_dir, f"ccot_L{budget}" if source == "ccot" else "cot")
+        checkpoints[source] = checkpoint_identity(path)
+        model, tokenizer = load_finetuned(path, device)
+        prompt = (lambda item: latent_prompt(item["question"], budget)) if source == "ccot" else (lambda item: cot_prompt(item["question"]))
+        boundary = find_boundary_idx_ccot if source == "ccot" else find_boundary_idx_base
+        try:
+            results[source] = run_phase2_source(
+                model, tokenizer, D_steer, model_tag, source, boundary, device, vectors_dir,
+                prompt_fn=prompt, prompt_mode="latent_prompt" if source == "ccot" else "cot_prompt",
+                checkpoint=checkpoints[source], **config,
             )
-            print(f"    step_times: {timing}")
-    print(f"  overall winner: source={best_source} method={best_method} probe_acc={best_acc:.3f}")
-    print(f"{'=' * 72}")
-
+        finally:
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    best_source, best_method, accuracy = select_best_source_method(results["ccot"], results.get("base", {}))
+    meta = {
+        "experiment_version": EXPERIMENT_VERSION, "phase2_prompt_version": 3,
+        "model_tag": model_tag, "n_steer": len(D_steer), "sources": sources,
+        "dataset_fingerprint": dataset_fingerprint(D_steer), "checkpoints": checkpoints,
+        "config": config, "best_ccot_latent_tokens": budget, "best_source": best_source,
+        "best_method": best_method, "best_probe_acc": accuracy,
+        "ccot_r_final": config["r_final"], "extraction": config["extraction"],
+    }
+    for source, result in results.items():
+        meta.update({
+            f"{source}_best_layer": result["best_layer"],
+            f"{source}_selected_layers": result["selected_layers"],
+            f"{source}_max_probe_score": max(result["layer_scores"].values()),
+            f"{source}_probe_gate": result["diagnostics"]["probe"],
+            f"{source}_method_accs": result["method_accs"],
+            f"{source}_has_cpca": result["has_cpca"],
+            f"{source}_has_shuffled_cpca": result["has_shuffled_cpca"],
+        })
+        atomic_json(os.path.join(results_dir, f"phase2_{source}_diagnostics.json"), result["diagnostics"])
+    artifact_names = []
+    for source, result in results.items():
+        artifact_names.extend(f"{source}_{suffix}.pt" for suffix in ("dom", "multilayer_dom", "shuffled_dom"))
+        if result["has_cpca"]:
+            artifact_names.append(f"{source}_cpca_r{config['r_final']}.pt")
+        if result["has_shuffled_cpca"]:
+            artifact_names.append(f"{source}_shuffled_cpca_r{config['r_final']}.pt")
+    meta["artifacts"] = {name: file_fingerprint(os.path.join(vectors_dir, name)) for name in artifact_names}
+    atomic_json(os.path.join(vectors_dir, "phase2_meta.json"), meta)
+    atomic_json(os.path.join(results_dir, "phase2_meta.json"), meta)
+    if run_iti:
+        run_iti_phase2(model_tag, checkpoints_dir, D_steer, device, vectors_dir, results_dir, sources)
     return results

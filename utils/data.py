@@ -1,22 +1,13 @@
 import inspect
 import json
-import random
 
-from utils.experiment_config import protocol_seed, require_exact_count, samples_per_phase
+from utils.experiment_config import require_exact_count
 
 _PERMITTED_CALLER = "evaluate_final.py"
 
 
 def select_test_examples(examples: list, source: str = "D_test") -> list:
-    expected = samples_per_phase()
-    if len(examples) < expected:
-        raise ValueError(
-            f"D_test source {source!r} contains {len(examples)} examples; "
-            f"at least {expected} are required"
-        )
     selected = list(examples)
-    random.Random(protocol_seed()).shuffle(selected)
-    selected = selected[:expected]
     require_exact_count(selected, "D_test")
     return selected
 
@@ -39,7 +30,6 @@ def load_test_set(path: str | None = None) -> list:
         path = get_test_path()
     with open(path) as f:
         examples = [json.loads(l) for l in f]
-    # Seeded sampling avoids treating the official file's first rows as a special slice.
     return select_test_examples(examples, source=path)
 
 

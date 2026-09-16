@@ -1,61 +1,26 @@
-"""Model-specific Phase 2 hyperparameters (spec §2.8)."""
-
-MODEL_PHASE2_CONFIG = {
-    'llama32_3b': {
-        'N': 20,
-        'cpca_variant':         'randomized',
-        'r_per_layer':          3,
-        'r_final':              10,
-        'beta':                 0.5,
-        'threshold_multiplier': 0.5,
-        'min_samples':          200,
-    },
-    'phi2': {
-        'N': 20,
-        'cpca_variant':         'full',
-        'r_per_layer':          3,
-        'r_final':              10,
-        'beta':                 0.5,
-        'threshold_multiplier': 0.3,
-        'min_samples':          200,
-    },
-    'qwen25_0.5b': {
-        'N': 20,
-        'cpca_variant':         'full',
-        'r_per_layer':          2,
-        'r_final':              6,
-        'beta':                 0.5,
-        'threshold_multiplier': 0.5,
-        'min_samples':          200,
-    },
-    'qwen25_3b': {
-        'N': 20,
-        'cpca_variant':         'full',
-        'r_per_layer':          3,
-        'r_final':              10,
-        'beta':                 0.5,
-        'threshold_multiplier': 0.5,
-        'min_samples':          200,
-    },
-    'qwen25_math1.5b': {
-        'N': 20,
-        'cpca_variant':         'shrunk',
-        'r_per_layer':          2,
-        'r_final':              6,
-        'beta':                 0.5,
-        'threshold_multiplier': 0.6,
-        'min_samples':          300,
-    },
-}
+"""Phase 2 settings from PHASE2.md, adapted to Coconut checkpoints."""
 
 _DEFAULT_CONFIG = {
-    'N': 20,
-    'cpca_variant':         'full',
-    'r_per_layer':          3,
-    'r_final':              10,
-    'beta':                 0.5,
-    'threshold_multiplier': 0.5,
-    'min_samples':          200,
+    "N": 10,
+    "cpca_variant": "full",
+    "r_per_layer": 3,
+    "r_final": 10,
+    "beta": 0.5,
+    "threshold_multiplier": 0.5,
+    "min_samples": 200,
+    "extraction": "mean_gen",
+    "gen_window": 20,
+}
+
+MODEL_PHASE2_CONFIG = {
+    "qwen25_3b": dict(_DEFAULT_CONFIG),
+    "qwen25_0.5b": dict(_DEFAULT_CONFIG),
+    "qwen25_math1.5b": {
+        **_DEFAULT_CONFIG, "cpca_variant": "shrunk",
+        "r_final": 8, "threshold_multiplier": 0.4,
+    },
+    "llama32_3b": {**_DEFAULT_CONFIG, "cpca_variant": "randomized"},
+    "phi2": dict(_DEFAULT_CONFIG),
 }
 
 

@@ -4,8 +4,22 @@ seed: 42
 train_pool: null   # resolved at runtime via utils/dataset_paths (CCOT_DATASET / configs/active_dataset.txt)
 test_path:  null   # resolved at runtime; never opened outside evaluate_final.py
 
-split: S2
-samples_per_phase: 300  # exact count for D_train, D_steer, D_val, and D_test
+split: S3
+split_ratios: [0.60, 0.10, 0.30]
+dataset_sizes:
+  gsm8k: {train: 7473, test: 1319}
+  svamp: {train: 700, test: 300}
+  prontoqa: {train: 500, test: 500}
+experiment_version: full_60_10_30_v1
+extraction: mean_gen
+gen_window: 20
+run_source_b: false
+run_iti: false
+injection: gen_only
+alpha_tune_examples: 50
+lambda_sweep_examples: 200
+diagnostic_examples: 50
+iti_top_k: 48
 
 # ── Models ────────────────────────────────────────────────────────────────
 model_tags:
@@ -27,7 +41,7 @@ learning_rate: 2.0e-4
 max_seq_len:   512
 
 # ── Phase 2 ───────────────────────────────────────────────────────────────
-n_rollouts:          20        # per question in D_steer
+n_rollouts:          10
 temperature:         1.0
 min_samples:         200       # minimum H+/H- per layer before cPCA
 beta_cpca:           0.5       # contrastive weight
@@ -43,7 +57,7 @@ alpha_lr:    5.0e-2
 lambda_a:    0.1
 lambda_m:    0.01              # use 0.005 for phi2
 max_epochs:  5
-es_patience: 3
+es_patience: 5
 es_fraction: 0.1               # fraction of D_val held out for early stopping
 
 diagnostic_alphas: [0.0, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0]

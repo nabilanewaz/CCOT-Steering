@@ -1,4 +1,5 @@
 import os
+import json
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -8,6 +9,7 @@ import torch
 from phase2.loaders import forward_for_boundary_hooks
 from phase2.run import _hidden_state_cache_usable, run_phase2_source
 from phase3.evaluate import _require_phase2_inputs
+from utils.artifacts import EXPERIMENT_VERSION, file_fingerprint
 
 
 class BoundaryForwardTests(unittest.TestCase):
@@ -117,9 +119,15 @@ class Phase3PreflightTests(unittest.TestCase):
 
     def test_accepts_nonempty_required_artifacts(self):
         with tempfile.TemporaryDirectory() as vectors_dir:
-            for name in ("phase2_meta.json", "ccot_dom.pt", "base_dom.pt"):
+            names = ("ccot_dom.pt", "ccot_multilayer_dom.pt", "ccot_shuffled_dom.pt")
+            for name in names:
                 with open(os.path.join(vectors_dir, name), "wb") as fp:
                     fp.write(b"present")
+            with open(os.path.join(vectors_dir, "phase2_meta.json"), "w") as stream:
+                json.dump({
+                    "experiment_version": EXPERIMENT_VERSION,
+                    "artifacts": {name: file_fingerprint(os.path.join(vectors_dir, name)) for name in names},
+                }, stream)
 
             _require_phase2_inputs(vectors_dir)
 

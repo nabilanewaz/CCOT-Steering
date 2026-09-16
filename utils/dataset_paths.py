@@ -107,15 +107,10 @@ def init_project_dataset(
 ) -> str:
     """Resolve and set the active dataset for this process.
 
-    * ``cli_dataset`` — explicit id from argparse (highest priority after env).
+    * ``cli_dataset`` — explicit id from argparse (highest priority).
     * ``interactive`` — if ``None``, prompt only when a TTY is attached and no explicit source.
     """
     global _ACTIVE
-
-    env = os.environ.get("CCOT_DATASET", "").strip().lower()
-    if env in DATASET_IDS:
-        _ACTIVE = env
-        return env
 
     if cli_dataset:
         cid = cli_dataset.strip().lower()
@@ -123,6 +118,11 @@ def init_project_dataset(
             raise ValueError(f"--dataset must be one of {list(DATASET_IDS)}, got {cli_dataset!r}")
         set_active_dataset(cid, persist=persist)
         return cid
+
+    env = os.environ.get("CCOT_DATASET", "").strip().lower()
+    if env in DATASET_IDS:
+        _ACTIVE = env
+        return env
 
     if _ACTIVE in DATASET_IDS:
         return _ACTIVE
@@ -149,3 +149,19 @@ def phase4_subprocess_env() -> dict:
     env = os.environ.copy()
     env["CCOT_DATASET"] = get_active_dataset_id()
     return env
+
+
+def artifact_root(kind: str, dataset_id: str | None = None) -> str:
+    """Keep existing GSM8K paths and isolate other datasets' experiment artifacts."""
+    dataset_id = dataset_id or get_active_dataset_id()
+    if dataset_id not in DATASET_IDS:
+        raise ValueError(f"Unknown dataset: {dataset_id}")
+    return kind if dataset_id == "gsm8k" else os.path.join(kind, dataset_id)
+
+
+def selected_config_path(dataset_id: str | None = None) -> str:
+    return os.path.join(artifact_root("configs", dataset_id), "selected.yaml")
+
+
+def split_output_dir(dataset_id: str | None = None) -> str:
+    return os.path.join(artifact_root("configs", dataset_id), "splits")

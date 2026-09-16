@@ -9,8 +9,8 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.extmath import randomized_svd as rsvd
 
-K_SWEEP    = [1, 2, 5, 10]     # per-layer rank candidates
-BETA_SWEEP = [0.3, 0.5, 0.7]   # contrastive weight candidates
+K_SWEEP = [3, 5, 8, 10]
+BETA_SWEEP = [0.1, 0.5, 1.0, 2.0]
 
 
 # ── Layer selection ───────────────────────────────────────────────────────────
@@ -186,12 +186,12 @@ def sweep_cpca_layer(
     """
     results = {}
     for beta in beta_vals:
-        for k in k_vals:
-            try:
-                U, lam = cpca_fn(H_pos_L, H_neg_L, r=k, beta=beta)
-                results[(k, beta)] = (U, lam)
-            except Exception as exc:
-                print(f"      k={k}  β={beta:.1f}: failed ({exc})")
+        try:
+            basis, eigenvalues = cpca_fn(H_pos_L, H_neg_L, r=max(k_vals), beta=beta)
+            for rank in k_vals:
+                results[(rank, beta)] = (basis[:, :rank], eigenvalues[:rank])
+        except ValueError as exc:
+            print(f"      β={beta:.1f}: no usable subspace ({exc})")
     return results
 
 
@@ -205,11 +205,12 @@ def select_best_cpca(
     Evaluate each (k, β) by stratified 80/20 held-out probe accuracy on the
     projected space. Returns (U_best [d,k], lam_best [k], best_k, best_beta, best_acc).
     """
-    X = torch.cat([H_pos_L.float(), H_neg_L.float()]).numpy().astype(np.float32)
-    y = np.array([1] * len(H_pos_L) + [0] * len(H_neg_L))
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=0.2, random_state=seed, stratify=y
-    )
+    pos_train, pos_test = train_test_split(H_pos_L, test_size=0.2, random_state=seed)
+    neg_train, neg_test = train_test_split(H_neg_L, test_size=0.2, random_state=seed)
+    X_tr = torch.cat([pos_train, neg_train]).float().numpy()
+    X_te = torch.cat([pos_test, neg_test]).float().numpy()
+    y_tr = np.array([1] * len(pos_train) + [0] * len(neg_train))
+    y_te = np.array([1] * len(pos_test) + [0] * len(neg_test))
 
     scores = {}
     for (k, beta), (U, _) in sweep_results.items():
@@ -259,13 +260,16 @@ def run_cpca_sweep(
         n_pos = H_pos[L].shape[0]
         n_neg = H_neg[L].shape[0] if L in H_neg else 0
         print(f"\n  cPCA sweep at layer {L}  (H+={n_pos}  H-={n_neg})")
-        sweep = sweep_cpca_layer(H_pos[L], H_neg[L], cpca_fn, k_vals, beta_vals)
+        pos_fit, _ = train_test_split(H_pos[L], test_size=0.2, random_state=42)
+        neg_fit, _ = train_test_split(H_neg[L], test_size=0.2, random_state=42)
+        sweep = sweep_cpca_layer(pos_fit, neg_fit, cpca_fn, k_vals, beta_vals)
         if not sweep:
             print(f"    All (k, β) combinations failed — skipping layer {L}.")
             continue
         U_best, lam_best, best_k, best_beta, best_acc = select_best_cpca(
             sweep, H_pos[L], H_neg[L],
         )
+        U_best, lam_best = cpca_fn(H_pos[L], H_neg[L], r=best_k, beta=best_beta)
         analyze_eigenspectrum(lam_best, L)
         layer_results[L] = (U_best, lam_best, best_k, best_beta, best_acc)
     return layer_results
@@ -291,7 +295,11 @@ def weighted_subspace_merge(
     for L, (U_L, lam_L) in sorted(subspaces.items()):
         probe_w = layer_scores.get(L, 0.5)
         eig_w   = lam_L.mean().item()
-        dir_w   = max(0.0, torch.dot(dom_vectors[L], v_global).item())
+        agreement = torch.dot(U_L[:, 0].float(), v_global.float()).item()
+        if agreement < 0:
+            U_L = U_L.clone()
+            U_L[:, 0] = -U_L[:, 0]
+        dir_w = abs(agreement)
         weight  = probe_w * eig_w * dir_w
         layer_weights[int(L)] = float(weight)
         weighted_cols.append(U_L * weight)
@@ -303,7 +311,10 @@ def weighted_subspace_merge(
 
     W = torch.cat(weighted_cols, dim=1).float()            # [d, r_per_layer * k]
     U_final, S, _ = torch.linalg.svd(W, full_matrices=False)
-    U_truth_final = U_final[:, :r_final]           # [d, r_final]
+    rank = int((S > torch.finfo(S.dtype).eps * max(W.shape) * S.max()).sum())
+    if rank == 0:
+        raise ValueError("Weighted cPCA merge has zero numerical rank")
+    U_truth_final = U_final[:, :min(r_final, rank)]
 
     total_S = S.sum().item()
     cumulative = 0.0

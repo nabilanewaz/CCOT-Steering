@@ -1,1026 +1,398 @@
-"""Phase 3 evaluation: full condition grid, alpha tuning, flip-rate computation.
-
-Conditions evaluated per backbone (spec §3.2):
-  Fixed (×1):      no_cot, full_cot
-  Per latent budget:  ccot_L*, trimmed_L*, noise_{src}, dom_{src}, cpca_{src}, trimmed_dom
-  → ~52 evaluations per backbone on D_val.
-"""
-import glob as _glob
+"""Full-validation condition grid with provenance-checked, per-condition resume."""
 import json
 import os
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Optional
 
 import torch
+from tqdm.auto import tqdm
 
 from phase1.inference import (
-    compute_per_example_budgets,
-    cot_prompt,
-    extract_answer,
-    extract_reasoning_span,
-    latent_prompt,
-    load_finetuned,
-    normalize_answer,
-    run_cot,
-    run_no_cot,
-    run_trimmed_cot,
+    cot_prompt, extract_answer, extract_reasoning_span, latent_prompt,
+    load_base_frozen, load_finetuned, normalize_answer, run_trimmed_cot,
 )
-from phase2.loaders import find_boundary_idx_base, find_boundary_idx_ccot
 from phase3.alpha import tune_alpha
-from phase3.hooks import (
-    get_injection_layer,
-    make_cpca_hook,
-    make_dom_hook,
-    make_noise_hook,
-    run_with_hook,
+from phase3.hooks import condition_hooks, generation_scope
+from utils.artifacts import (
+    EXPERIMENT_VERSION, atomic_json, checkpoint_identity, dataset_fingerprint,
+    file_fingerprint, fingerprint,
 )
+from utils.experiment_config import load_protocol, protocol_seed, require_exact_count
 
-from utils.experiment_config import require_exact_count, samples_per_phase
+STEERED_METHODS = ("dom", "cpca", "multilayer_dom", "multilayer_dom_mlp", "iti")
+SKIP_CONDITIONS = frozenset()
 
-LATENT_TOKEN_COUNTS = [3, 4, 6]
-SOURCES  = ('ccot', 'base')
-
-def _checkpoint_ready(path: str) -> bool:
-    return os.path.exists(os.path.join(path, 'adapter_config.json')) or os.path.exists(os.path.join(path, 'config.json'))
-
-
-# ── Data types ─────────────────────────────────────────────────────────────────
 
 @dataclass
 class ConditionResult:
-    condition:         str
-    model_tag:         str
-    ratio:             Optional[float]
-    vector_source:     Optional[str]    # 'ccot' | 'base' | None
-    vector_method:     Optional[str]    # 'dom' | 'cpca' | 'noise' | None
-    alpha:             Optional[float]
-    accuracy:          float
-    flip_rate:         float            # wrong→right vs CCoT baseline at same R
-    reasoning_tokens:  float
-    actual_ratio:      float            # mean_reasoning_tokens / full_cot_mean_tokens
-    latency_sec:       float
+    condition: str
+    model_tag: str
+    ratio: Optional[float]
+    vector_source: Optional[str]
+    vector_method: Optional[str]
+    alpha: Optional[float]
+    accuracy: float
+    flip_rate: float
+    reasoning_tokens: float
+    actual_ratio: float
+    latency_sec: float
     answer_found_rate: float
-    n_examples:        int = 0
+    n_examples: int = 0
 
 
-# ── Small helpers ──────────────────────────────────────────────────────────────
-
-def _score(text: str, gold: str) -> bool:
-    pred = extract_answer(text)
-    return normalize_answer(pred) == normalize_answer(gold) if pred else False
+def _load_meta(vectors_dir):
+    with open(os.path.join(vectors_dir, "phase2_meta.json")) as stream:
+        return json.load(stream)
 
 
-def _boundary_from_prompt(tokenizer, prompt: str) -> int:
-    return max(0, len(tokenizer.encode(prompt, add_special_tokens=False)) - 1)
-
-
-def _load_meta(vectors_dir: str) -> dict:
-    path = os.path.join(vectors_dir, 'phase2_meta.json')
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"phase2_meta.json not found: {path}")
-    with open(path) as f:
-        return json.load(f)
-
-
-def _require_phase2_inputs(vectors_dir: str) -> None:
-    """Fail before model loading when mandatory Phase 2 outputs are absent."""
-    required = ('phase2_meta.json', *(f'{source}_dom.pt' for source in SOURCES))
-    missing = [
-        name for name in required
-        if not os.path.isfile(os.path.join(vectors_dir, name))
-        or os.path.getsize(os.path.join(vectors_dir, name)) == 0
-    ]
+def _require_phase2_inputs(vectors_dir):
+    required = ("phase2_meta.json", "ccot_dom.pt", "ccot_multilayer_dom.pt", "ccot_shuffled_dom.pt")
+    missing = [name for name in required if not os.path.isfile(os.path.join(vectors_dir, name))
+               or os.path.getsize(os.path.join(vectors_dir, name)) == 0]
     if missing:
-        raise RuntimeError(
-            "Phase 3 cannot start because Phase 2 is incomplete. Missing or empty "
-            f"artifacts in {vectors_dir}: {missing}. Rerun `python pipeline.py "
-            "--phase 2 --config <CONFIG> --model <MODEL>` and make sure Phase 2 "
-            "finishes successfully before retrying Phase 3."
-        )
+        raise RuntimeError(f"Phase 3 cannot start: Phase 2 artifacts missing or empty: {missing}")
+    meta = _load_meta(vectors_dir)
+    if meta.get("experiment_version") != EXPERIMENT_VERSION:
+        raise RuntimeError("Phase 2 artifacts predate the full experiment; rerun Phase 2")
+    for name, expected in meta["artifacts"].items():
+        path = os.path.join(vectors_dir, name)
+        if not os.path.exists(path) or file_fingerprint(path) != expected:
+            raise RuntimeError(f"Phase 2 artifact missing or changed: {path}")
 
 
-def _load_vector(vectors_dir: str, source: str, method: str,
-                 r_final: Optional[int] = None) -> torch.Tensor:
-    if method == 'dom':
-        return torch.load(
-            os.path.join(vectors_dir, f'{source}_dom.pt'), map_location='cpu'
-        )['v_truth']
-    files = (
-        [os.path.join(vectors_dir, f'{source}_cpca_r{r_final}.pt')]
-        if r_final else
-        sorted(_glob.glob(os.path.join(vectors_dir, f'{source}_cpca_r*.pt')))
-    )
-    if not files or not os.path.exists(files[-1]):
-        raise FileNotFoundError(f"No cPCA vector for source={source} in {vectors_dir}")
-    return torch.load(files[-1], map_location='cpu')['U_truth']
+def load_source_artifacts(vectors_dir, source, meta):
+    def read(suffix):
+        path = os.path.join(vectors_dir, f"{source}_{suffix}.pt")
+        return torch.load(path, map_location="cpu", weights_only=False)
+
+    artifacts = {key: read(key) for key in ("dom", "multilayer_dom", "shuffled_dom")}
+    rank = meta["ccot_r_final"]
+    if meta.get(f"{source}_has_cpca"):
+        artifacts["cpca"] = read(f"cpca_r{rank}")
+    if meta.get(f"{source}_has_shuffled_cpca"):
+        artifacts["shuffled_cpca"] = read(f"shuffled_cpca_r{rank}")
+    iti_path = os.path.join(vectors_dir, f"{source}_iti_heads.pt")
+    if os.path.exists(iti_path):
+        iti = read("iti_heads")
+        identity = iti.get("identity", {})
+        if (identity.get("dataset") != meta["dataset_fingerprint"]
+                or identity.get("checkpoint") != meta["checkpoints"][source]):
+            raise RuntimeError(f"Stale ITI artifact: {iti_path}; rerun Phase 2.5")
+        artifacts["iti"] = iti
+    return artifacts
 
 
-def _load_shuffled_vector(
-    vectors_dir: str,
-    source: str,
-    method: str,
-    r_final: Optional[int] = None,
-) -> torch.Tensor:
-    """Load shuffled-label control vector (v_shuffled or U_shuffled)."""
-    if method == 'dom':
-        path = os.path.join(vectors_dir, f'{source}_shuffled_dom.pt')
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Shuffled DoM missing: {path}")
-        return torch.load(path, map_location='cpu')['v_shuffled']
-    # cPCA
-    if r_final:
-        candidates = [os.path.join(vectors_dir, f'{source}_shuffled_cpca_r{r_final}.pt')]
-    else:
-        candidates = sorted(
-            _glob.glob(os.path.join(vectors_dir, f'{source}_shuffled_cpca_r*.pt'))
-        )
-    if not candidates or not os.path.exists(candidates[-1]):
-        raise FileNotFoundError(
-            f"Shuffled cPCA missing for source={source} in {vectors_dir}"
-        )
-    return torch.load(candidates[-1], map_location='cpu')['U_shuffled']
+def available_methods(artifacts):
+    methods = ["noise", "dom", "multilayer_dom", "multilayer_dom_mlp", "shuf_dom", "neg_dom"]
+    if "cpca" in artifacts:
+        methods.extend(["cpca", "neg_cpca"])
+    if "shuffled_cpca" in artifacts:
+        methods.append("shuf_cpca")
+    if "iti" in artifacts:
+        methods.append("iti")
+    return methods
 
 
-def _alpha_path(vectors_dir: str, source: str) -> str:
-    return os.path.join(vectors_dir, f'{source}_alpha_star.pt')
-
-
-def _load_alpha(vectors_dir: str, source: str) -> float:
-    return torch.load(_alpha_path(vectors_dir, source)).item()
-
-
-# ── Per-example evaluation helpers ────────────────────────────────────────────
-
-def _eval_one(
-    model, tokenizer, item: dict, prompt: str,
-    layer_star: Optional[int], hook_factory,
-    device: str, max_new_tokens: int,
-    boundary_fn=None,   # find_boundary_idx_ccot | find_boundary_idx_base | None
-) -> tuple[bool, bool, int, float]:
-    """
-    Run one example (optionally with a hook).
-    When hook_factory is given and boundary_fn is provided, probe-generates first
-    to find the reasoning/answer boundary (spec §3.8), then steers the real pass.
-    Returns (correct, answer_found, n_tok, latency_sec).
-    """
-    gold = item['answer'].split('####')[1].strip()
-    t0   = time.time()
-
-    if hook_factory is not None:
-        if boundary_fn is not None:
-            # Spec §3.8: probe-generate (no_grad) to locate the semantic boundary
-            enc = tokenizer(prompt, return_tensors='pt').to(device)
-            with torch.no_grad():
-                probe_ids = model.generate(
-                    **enc, do_sample=False, max_new_tokens=128,
-                    pad_token_id=tokenizer.eos_token_id,
-                )
-            try:
-                b_idx = boundary_fn(probe_ids, tokenizer)
-            except (ValueError, Exception):
-                b_idx = max(0, enc['input_ids'].shape[1] - 1)
-        else:
-            b_idx = _boundary_from_prompt(tokenizer, prompt)
-
-        hook_fn = hook_factory(b_idx)
-        text    = run_with_hook(model, tokenizer, prompt, layer_star,
-                                hook_fn, device, max_new_tokens)
-    else:
-        enc = tokenizer(prompt, return_tensors='pt').to(device)
+def generate_condition(model, tokenizer, prompt, device, method=None, artifacts=None, alpha=0.0, max_new_tokens=256):
+    encoded = tokenizer(prompt, return_tensors="pt").to(device)
+    length = encoded["input_ids"].shape[1]
+    context = condition_hooks(model, method, artifacts or {}, alpha, device) if method else nullcontext()
+    with generation_scope(model, length), context:
         with torch.no_grad():
-            out = model.generate(
-                **enc, max_new_tokens=max_new_tokens, do_sample=False,
-                pad_token_id=tokenizer.eos_token_id,
-            )
-        text = tokenizer.decode(out[0][enc['input_ids'].shape[1]:],
-                                skip_special_tokens=True)
+            output = model.generate(**encoded, max_new_tokens=max_new_tokens,
+                                    do_sample=False, pad_token_id=tokenizer.pad_token_id)
+    return tokenizer.decode(output[0, length:], skip_special_tokens=True)
 
-    lat   = time.time() - t0
-    found = extract_answer(text) is not None
-    ok    = _score(text, gold)
+
+def example_record(text, item, tokenizer, elapsed):
+    prediction = extract_answer(text)
+    gold = item["answer"].split("####", 1)[1].strip()
     reasoning = extract_reasoning_span(text)
-    n_tok = len(tokenizer.encode(reasoning, add_special_tokens=False))
-    return ok, found, n_tok, lat
+    return {
+        "id": item.get("id"), "question_hash": fingerprint(item["question"]),
+        "prediction": prediction, "generated_text": text,
+        "correct": prediction is not None and normalize_answer(prediction) == normalize_answer(gold),
+        "answer_found": prediction is not None,
+        "reasoning_tokens": len(tokenizer.encode(reasoning, add_special_tokens=False)),
+        "latency_sec": elapsed,
+    }
 
 
-def _alpha_validation_sweep(
-    model, tokenizer, D_val: list, v_dom: torch.Tensor, L_star: int,
-    device: str, model_tag: str, source: str, latent_tokens: int,
-    learned_alpha: float, min_gain: float = 0.0025, n_sub: int | None = None,
-    prompt_fn=None, boundary_fn=None, prompt_mode: str = 'ccot',
-) -> tuple[float, list[dict]]:
-    """Pick alpha by generated-answer validation, not teacher-forced loss only."""
-    if prompt_fn is None:
-        prompt_fn = lambda item: latent_prompt(item['question'], latent_tokens)
-    if boundary_fn is None:
-        boundary_fn = find_boundary_idx_ccot
-    candidates = [0.0, float(learned_alpha), 0.1, 0.5, 1.0, 2.0, 5.0, 10.0]
-    seen = set()
-    candidates = [a for a in candidates if not (round(a, 8) in seen or seen.add(round(a, 8)))]
-    n_sub = samples_per_phase() if n_sub is None else n_sub
-    D_sub = D_val[-min(n_sub, len(D_val)):]
-    rows = []
-    print(
-        f"  [α-validate] source={source} examples={len(D_sub)} "
-        f"min_gain={min_gain:.4f}",
-        flush=True,
-    )
-    for alpha in candidates:
-        correct, found, tokens, lats = [], [], [], []
-        hook_factory = None
-        if alpha != 0.0:
-            hook_factory = lambda b, a=alpha: make_dom_hook(b, v_dom, a, device)
-        for item in D_sub:
-            ok, fd, nt, lt = _eval_one(
-                model, tokenizer, item, prompt_fn(item),
-                L_star if hook_factory is not None else None, hook_factory,
-                device, 128, boundary_fn=boundary_fn,
-            )
-            correct.append(ok); found.append(fd); tokens.append(nt); lats.append(lt)
-        acc = sum(correct) / max(len(correct), 1)
-        row = {
-            'model_tag': model_tag,
-            'source': source,
-            'prompt_mode': prompt_mode,
-            'alpha': float(alpha),
-            'accuracy': float(acc),
-            'answer_found_rate': sum(found) / max(len(found), 1),
-            'reasoning_tokens': sum(tokens) / max(len(tokens), 1),
-            'latency_sec': sum(lats) / max(len(lats), 1),
-            'n_examples': len(correct),
-        }
-        rows.append(row)
-        print(f"    [α-validate] α={alpha:.4f} acc={acc:.4f}", flush=True)
-
-    baseline = next((r for r in rows if r['alpha'] == 0.0), rows[0])
-    best = max(rows, key=lambda r: (r['accuracy'], -abs(r['alpha'] - float(learned_alpha))))
-    if best['accuracy'] >= baseline['accuracy'] + min_gain:
-        selected = best['alpha']
-        reason = 'generated_validation_gain'
-    else:
-        selected = 0.0
-        reason = 'no_alpha_improvement'
-    for r in rows:
-        r['selected'] = bool(r['alpha'] == selected)
-        r['selection_reason'] = reason if r['selected'] else ''
-        r['baseline_accuracy'] = baseline['accuracy']
-        r['min_gain'] = min_gain
-    print(
-        f"  [α-validate] selected α={selected:.4f} "
-        f"reason={reason} baseline={baseline['accuracy']:.4f} "
-        f"best={best['accuracy']:.4f}",
-        flush=True,
-    )
-    return float(selected), rows
-
-
-def _build_result(
-    condition, model_tag, ratio, vector_source, vector_method, alpha,
-    correct_list, found_list, tokens_list, latencies,
-    ccot_correct, full_cot_mean_tokens,
-) -> ConditionResult:
-    n   = len(correct_list)
-    acc = sum(correct_list) / n if n else 0.0
-
-    wrong_idx = [i for i, c in enumerate(ccot_correct) if not c] if ccot_correct else []
-    flip_rate = (
-        sum(correct_list[i] for i in wrong_idx) / len(wrong_idx)
-        if wrong_idx else 0.0
-    )
-
-    mean_tok = sum(tokens_list) / len(tokens_list) if tokens_list else 0.0
-    act_r    = mean_tok / full_cot_mean_tokens if full_cot_mean_tokens else 0.0
-
+def _result(condition, model_tag, source, method, alpha, rows, baseline, full_mean):
+    count = len(rows)
+    wrong = [index for index, row in enumerate(baseline or []) if not row["correct"]]
+    mean_tokens = sum(row["reasoning_tokens"] for row in rows) / count
     return ConditionResult(
-        condition=condition, model_tag=model_tag,
-        ratio=ratio, vector_source=vector_source,
-        vector_method=vector_method, alpha=alpha,
-        accuracy=acc, flip_rate=flip_rate,
-        reasoning_tokens=mean_tok,
-        actual_ratio=act_r,
-        latency_sec=sum(latencies) / len(latencies) if latencies else 0.0,
-        answer_found_rate=sum(found_list) / n if n else 0.0,
-        n_examples=n,
+        condition, model_tag, None, source, method, alpha,
+        sum(row["correct"] for row in rows) / count,
+        sum(rows[index]["correct"] for index in wrong) / len(wrong) if wrong else 0.0,
+        mean_tokens, mean_tokens / full_mean if full_mean else 0.0,
+        sum(row["latency_sec"] for row in rows) / count,
+        sum(row["answer_found"] for row in rows) / count, count,
     )
 
 
-# ── Alpha tuning (pre-run, per source) ────────────────────────────────────────
-
-def _tune_and_save_alpha(
-    model_tag: str,
-    checkpoints_dir: str,
-    D_val: list,
-    vectors_dir: str,
-    device: str,
-    meta: dict,
-    results_dir: str = None,
-) -> None:
-    """
-    For each source:
-      1. Run the λ sweep on all 300 D_val examples to select (λ_a, λ_m).
-      2. Run full gradient-based α* tuning with the selected lambdas.
-      3. Save alpha_star, training history JSON, and loss-curve PNG.
-    Results are cached per source — rerun is skipped if alpha_star file exists.
-    """
-    best_latent_tokens = int(meta.get('best_ccot_latent_tokens') or 4)
-
-    source_ckpt = {
-        'ccot': os.path.join(checkpoints_dir, f'ccot_L{best_latent_tokens}'),
-        'base': os.path.join(checkpoints_dir, 'cot'),
-    }
-    source_L_star = {
-        'ccot': meta.get('ccot_best_layer'),
-        'base': meta.get('base_best_layer'),
-    }
-    source_prompt_fn = {
-        'ccot': lambda item, n=best_latent_tokens: latent_prompt(item['question'], n),
-        'base': lambda item: cot_prompt(item['question']),
-    }
-    source_boundary_fn = {
-        'ccot': find_boundary_idx_ccot,
-        'base': find_boundary_idx_base,
+def phase3_identity(model_tag, checkpoints_dir, D_val, vectors_dir, max_new_tokens=256):
+    meta = _load_meta(vectors_dir)
+    budget = meta["best_ccot_latent_tokens"]
+    checkpoint_paths = {"cot": os.path.join(checkpoints_dir, "cot"),
+                        "ccot": os.path.join(checkpoints_dir, f"ccot_L{budget}")}
+    current_checkpoints = {key: checkpoint_identity(path) for key, path in checkpoint_paths.items()}
+    for source in meta["sources"]:
+        key = "ccot" if source == "ccot" else "cot"
+        if meta["checkpoints"][source] != current_checkpoints[key]:
+            raise RuntimeError(f"Checkpoint changed since Phase 2: {source}; rerun extraction")
+    vector_files = dict(meta["artifacts"])
+    for source in meta["sources"]:
+        path = os.path.join(vectors_dir, f"{source}_iti_heads.pt")
+        if os.path.exists(path):
+            vector_files[f"{source}_iti_heads.pt"] = file_fingerprint(path)
+    return {
+        "experiment_version": EXPERIMENT_VERSION, "model_tag": model_tag,
+        "validation": dataset_fingerprint(D_val), "n_val": len(D_val),
+        "phase2": file_fingerprint(os.path.join(vectors_dir, "phase2_meta.json")),
+        "artifacts": vector_files, "protocol": load_protocol(),
+        "checkpoints": current_checkpoints,
+        "injection": "generated_positions_only", "max_new_tokens": max_new_tokens,
     }
 
-    def _alpha_validation_cache_valid(path: str, source_name: str) -> bool:
-        if not os.path.exists(path):
-            return False
+
+def _load_alpha(vectors_dir, source):
+    return float(torch.load(os.path.join(vectors_dir, f"{source}_alpha_star.pt"), map_location="cpu", weights_only=False))
+
+
+def _tune_and_save_alpha(model_tag, checkpoints_dir, D_val, vectors_dir, device, meta, results_dir, signature):
+    from phase3.lambda_sweep import sweep_lambda_grid
+
+    protocol = load_protocol()
+    budget = meta["best_ccot_latent_tokens"]
+    for source in meta["sources"]:
+        alpha_path = os.path.join(vectors_dir, f"{source}_alpha_star.pt")
+        metadata_path = os.path.join(results_dir, f"{source}_alpha_meta.json")
+        if os.path.exists(alpha_path) and os.path.exists(metadata_path):
+            with open(metadata_path) as stream:
+                saved = json.load(stream)
+            if saved.get("signature") == signature and saved.get("alpha_sha256") == file_fingerprint(alpha_path):
+                continue
+        checkpoint = os.path.join(checkpoints_dir, f"ccot_L{budget}" if source == "ccot" else "cot")
+        model, tokenizer = load_finetuned(checkpoint, device)
+        artifacts = load_source_artifacts(vectors_dir, source, meta)
+        vector = artifacts["dom"]["v_truth"]
+        layer = artifacts["dom"]["best_layer"]
+        prompt_fn = (lambda item: latent_prompt(item["question"], budget)) if source == "ccot" else (lambda item: cot_prompt(item["question"]))
+        sweep_path = os.path.join(results_dir, f"{source}_lambda_sweep.json")
         try:
-            with open(path) as fp:
-                payload = json.load(fp)
-            return (
-                payload.get('prompt_mode') == source_name
-                and payload.get('n_val') == len(D_val)
-            )
-        except Exception:
-            return False
-
-    def _read_valid_sweep(path: str, source_name: str):
-        if not path or not os.path.exists(path):
-            return None
-        try:
-            with open(path) as fp:
-                payload = json.load(fp)
-            if (
-                payload.get('prompt_mode') != source_name
-                or payload.get('n_val') != len(D_val)
-            ):
-                return None
-            return payload
-        except Exception:
-            return None
-
-    for source in SOURCES:
-        out_path = _alpha_path(vectors_dir, source)
-        validation_path = os.path.join(vectors_dir, f'{source}_alpha_validation_sweep.json')
-        results_validation_path = (
-            os.path.join(results_dir, f'{source}_alpha_validation_sweep.json')
-            if results_dir else None
-        )
-        validation_cache_valid = _alpha_validation_cache_valid(validation_path, source)
-        if os.path.exists(out_path) and validation_cache_valid:
-            print(f"[PH3] alpha_star for source={source} cached: {out_path}")
-            if results_dir:
-                alpha_cached = torch.load(out_path, map_location='cpu')
-                with open(os.path.join(results_dir, f'{source}_alpha_star.json'), 'w') as fp:
-                    json.dump({
-                        'model_tag': model_tag,
-                        'source': source,
-                        'alpha_star': float(alpha_cached.item()),
-                        'prompt_mode': source,
-                        'cached_from': out_path,
-                    }, fp, indent=2)
-                if os.path.exists(validation_path):
-                    with open(validation_path) as src_fp, open(results_validation_path, 'w') as dst_fp:
-                        json.dump(json.load(src_fp), dst_fp, indent=2)
-            continue
-        if os.path.exists(out_path):
-            print(
-                f"[PH3] alpha_star cache lacks source-matched validation sweep for source={source}; "
-                "recomputing alpha.",
-                flush=True,
-            )
-
-        v_dom  = _load_vector(vectors_dir, source, 'dom')
-        L_star = source_L_star[source]
-        if L_star is None:
-            try:
-                L_star = get_injection_layer(vectors_dir, source)
-            except FileNotFoundError:
-                L_star = meta.get('ccot_best_layer', 14)
-
-        print(f"\n[PH3] Tuning alpha  source={source}  L*={L_star}")
-        model, tok = load_finetuned(source_ckpt[source], device)
-        for p in model.parameters():
-            p.requires_grad = False
-        model.eval()
-
-        # Step 1: lambda sweep on the full 300-example D_val.
-        sweep_path = os.path.join(vectors_dir, f'{source}_lambda_sweep.json')
-        results_sweep_path = (
-            os.path.join(results_dir, f'{source}_lambda_sweep.json')
-            if results_dir else None
-        )
-        active_sweep_path = sweep_path
-        sweep_payload = _read_valid_sweep(sweep_path, source)
-        if sweep_payload is None and results_sweep_path:
-            sweep_payload = _read_valid_sweep(results_sweep_path, source)
-            if sweep_payload is not None:
-                active_sweep_path = results_sweep_path
-        if sweep_payload is not None:
-            sweep_sel = sweep_payload['selected']
-            lambda_a = sweep_sel['lambda_a']
-            lambda_m = sweep_sel['lambda_m']
-            print(f"[PH3] λ sweep cached: λ_a={lambda_a}  λ_m={lambda_m}")
-        else:
-            if os.path.exists(sweep_path) or (results_sweep_path and os.path.exists(results_sweep_path)):
-                print(f"[PH3] λ sweep cache stale for source={source}; recomputing.")
-            from phase3.lambda_sweep import sweep_lambda_grid
-            D_sub = D_val
-            sweep_sel = sweep_lambda_grid(
-                model, tok, D_sub, v_dom, L_star, device, model_tag,
-                latent_tokens=best_latent_tokens,
-                out_path=sweep_path,
-                max_epochs=2,
-                prompt_fn=source_prompt_fn[source],
-                boundary_fn=source_boundary_fn[source],
-                prompt_mode=source,
-            )
-            lambda_a = sweep_sel['lambda_a']
-            lambda_m = sweep_sel['lambda_m']
-            # Plot heatmap if results_dir provided
-            active_sweep_path = sweep_path
-
-        if results_dir and active_sweep_path and os.path.exists(active_sweep_path):
-            try:
-                with open(active_sweep_path) as fp:
-                    sweep_data = json.load(fp)
-                with open(results_sweep_path, 'w') as fp:
-                    json.dump(sweep_data, fp, indent=2)
-                from phase3.plots import plot_lambda_sweep_heatmap
-                plot_lambda_sweep_heatmap(
-                    sweep_data,
-                    os.path.join(results_dir, f'{source}_lambda_heatmap.png'),
+            sweep = None
+            if os.path.exists(sweep_path):
+                with open(sweep_path) as stream:
+                    cached = json.load(stream)
+                if cached.get("signature") == signature:
+                    sweep = cached["selected"]
+            if sweep is None:
+                sweep = sweep_lambda_grid(
+                    model, tokenizer, D_val[:protocol["lambda_sweep_examples"]], vector, layer,
+                    device, model_tag, latent_tokens=budget, out_path=sweep_path, max_epochs=2,
+                    prompt_fn=prompt_fn, prompt_mode=source,
                 )
-            except Exception as e:
-                print(f"  [plot/log] {e}")
+                with open(sweep_path) as stream:
+                    cached = json.load(stream)
+                cached["signature"] = signature
+                atomic_json(sweep_path, cached)
+            alpha, history = tune_alpha(
+                model, tokenizer, D_val[:protocol["alpha_tune_examples"]], vector, layer, device,
+                model_tag=model_tag, latent_tokens=budget, lambda_a=sweep["lambda_a"],
+                lambda_m=sweep["lambda_m"], prompt_fn=prompt_fn, es_patience=protocol["es_patience"],
+                max_epochs=protocol["max_epochs"], lr=protocol["alpha_lr"],
+            )
+            torch.save(alpha.cpu(), alpha_path)
+            atomic_json(metadata_path, {
+                "signature": signature, "alpha": float(alpha),
+                "alpha_sha256": file_fingerprint(alpha_path),
+                "n_tune": min(len(D_val), protocol["alpha_tune_examples"]),
+                "n_lambda": min(len(D_val), protocol["lambda_sweep_examples"]),
+                "dataset_role": "D_val", "injection": "generated_positions_only",
+            })
+            atomic_json(os.path.join(results_dir, f"{source}_alpha_history.json"), {
+                "source": source, "model_tag": model_tag, "history": history, **sweep,
+            })
+            from phase3.plots import plot_loss_curves, plot_lambda_sweep_heatmap
+            plot_loss_curves(history, os.path.join(results_dir, f"{source}_loss_curves.png"))
+            plot_lambda_sweep_heatmap(cached, os.path.join(results_dir, f"{source}_lambda_heatmap.png"))
+        finally:
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-        # ── Step 2: Full α* tuning with selected lambdas ──────────────────────
-        alpha_star_raw, history = tune_alpha(
-            model, tok, D_val, v_dom, L_star, device,
-            model_tag=model_tag, latent_tokens=best_latent_tokens,
-            lambda_a=lambda_a, lambda_m=lambda_m,
-            prompt_fn=source_prompt_fn[source],
-            boundary_fn=source_boundary_fn[source],
-        )
-        selected_alpha, validation_rows = _alpha_validation_sweep(
-            model, tok, D_val, v_dom, L_star, device, model_tag, source,
-            best_latent_tokens, float(alpha_star_raw.item()),
-            prompt_fn=source_prompt_fn[source],
-            boundary_fn=source_boundary_fn[source],
-            prompt_mode=source,
-        )
-        alpha_star = torch.tensor(selected_alpha, dtype=alpha_star_raw.dtype)
-        torch.save(alpha_star, out_path)
-        validation_payload = {
-            'model_tag': model_tag,
-            'source': source,
-            'prompt_mode': source,
-            'learned_alpha': float(alpha_star_raw.item()),
-            'selected_alpha': float(selected_alpha),
-            'n_val': len(D_val),
-            'rows': validation_rows,
-        }
-        with open(validation_path, 'w') as fp:
-            json.dump(validation_payload, fp, indent=2)
-        print(f"  alpha_star={alpha_star.item():.4f}  -> {out_path}")
 
-        # ── Step 3: Persist history and plots ─────────────────────────────────
-        if results_dir:
-            with open(os.path.join(results_dir, f'{source}_alpha_star.json'), 'w') as fp:
-                json.dump({
-                    'model_tag': model_tag,
-                    'source': source,
-                    'alpha_star': float(alpha_star.item()),
-                    'learned_alpha': float(alpha_star_raw.item()),
-                    'prompt_mode': source,
-                    'path': out_path,
-                    'validation_path': validation_path,
-                }, fp, indent=2)
-            if results_validation_path:
-                with open(results_validation_path, 'w') as fp:
-                    json.dump(validation_payload, fp, indent=2)
-            hist_path = os.path.join(results_dir, f'{source}_alpha_history.json')
-            with open(hist_path, 'w') as fp:
-                json.dump({
-                    'model_tag': model_tag,
-                    'source':    source,
-                    'lambda_a':  lambda_a,
-                    'lambda_m':  lambda_m,
-                    'history':   history,
-                }, fp, indent=2)
-            try:
-                from phase3.plots import plot_loss_curves
-                plot_loss_curves(
-                    history,
-                    os.path.join(results_dir, f'{source}_loss_curves.png'),
-                )
-            except Exception as e:
-                print(f"  [plot] {e}")
+def alpha_diagnostic(model, tokenizer, data, prompt_fn, artifacts, method, device, candidates):
+    rows = []
+    for alpha in candidates:
+        correct = 0
+        for item in data:
+            text = generate_condition(model, tokenizer, prompt_fn(item), device,
+                                      method, artifacts, alpha)
+            prediction = extract_answer(text)
+            gold = item["answer"].split("####", 1)[1].strip()
+            correct += prediction is not None and normalize_answer(prediction) == normalize_answer(gold)
+        rows.append({"alpha": alpha, "accuracy": correct / len(data),
+                     "n_examples": len(data), "n_correct": correct})
+    return rows
 
+
+def run_phase3_evaluation(
+    model_tag, base_model_id, checkpoints_dir, D_val, vectors_dir, results_dir, device,
+    max_new_tokens=256,
+):
+    require_exact_count(D_val, "D_val")
+    _require_phase2_inputs(vectors_dir)
+    meta = _load_meta(vectors_dir)
+    identity = phase3_identity(model_tag, checkpoints_dir, D_val, vectors_dir, max_new_tokens)
+    signature = fingerprint(identity)
+    os.makedirs(results_dir, exist_ok=True)
+    interim_path = os.path.join(results_dir, "phase3_val_interim.json")
+    example_path = os.path.join(results_dir, "phase3_examples.json")
+    run_path = os.path.join(results_dir, "phase3_run_meta.json")
+    results, saved_examples = [], {}
+    if os.path.exists(run_path):
+        with open(run_path) as stream:
+            previous = json.load(stream)
+        if previous.get("signature") == signature and os.path.exists(interim_path) and os.path.exists(example_path):
+            with open(interim_path) as stream:
+                results = [ConditionResult(**row) for row in json.load(stream)]
+            with open(example_path) as stream:
+                saved_examples = json.load(stream)
+            results = [row for row in results if row.n_examples == len(D_val)
+                       and len(saved_examples.get(row.condition, [])) == len(D_val)]
+    atomic_json(run_path, {**identity, "signature": signature, "complete": False, "phase3_eval_version": 3})
+    _tune_and_save_alpha(model_tag, checkpoints_dir, D_val, vectors_dir, device, meta, results_dir, signature)
+    alphas = {source: _load_alpha(vectors_dir, source) for source in meta["sources"]}
+    full_mean = next((row.reasoning_tokens for row in results if row.condition == "full_cot"), 0.0)
+
+    def evaluate(name, model, tokenizer, prompt_fn, source=None, method=None, alpha=None,
+                 artifacts=None, baseline=None, budgets=None, token_limit=max_new_tokens):
+        nonlocal results
+        if any(row.condition == name for row in results):
+            print(f"[RESUME] {name}: {len(D_val)} examples")
+            return saved_examples[name]
+        torch.manual_seed(int(fingerprint([protocol_seed(), name])[:8], 16))
+        rows = []
+        for index, item in enumerate(tqdm(D_val, desc=name, unit="example")):
+            started = time.time()
+            if budgets is not None:
+                with generation_scope(model, len(tokenizer.encode(cot_prompt(item["question"])))):
+                    if method:
+                        with condition_hooks(model, method, artifacts, alpha, device):
+                            prediction, reasoning = run_trimmed_cot(model, tokenizer, item, budgets[index], device)
+                    else:
+                        prediction, reasoning = run_trimmed_cot(model, tokenizer, item, budgets[index], device)
+                text = reasoning + ("\n#### " + prediction if prediction is not None else "")
+            else:
+                text = generate_condition(model, tokenizer, prompt_fn(item), device,
+                                          method, artifacts, alpha or 0.0, token_limit)
+            rows.append(example_record(text, item, tokenizer, time.time() - started))
+        if name == "no_cot":
+            for row in rows:
+                row["reasoning_tokens"] = 0
+        result = _result(name, model_tag, source, method, alpha, rows, baseline, full_mean)
+        results.append(result)
+        saved_examples[name] = rows
+        atomic_json(example_path, saved_examples)
+        atomic_json(interim_path, [asdict(row) for row in results])
+        print(f"{name}: accuracy={result.accuracy:.4f}, n={result.n_examples}")
+        return rows
+
+    if not any(row.condition == "no_cot" for row in results):
+        model, tokenizer = load_base_frozen(base_model_id, device)
+        evaluate("no_cot", model, tokenizer, lambda item: f"Question: {item['question']}\n\nAnswer:", token_limit=32)
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
-
-# ── Main evaluation runner ────────────────────────────────────────────────────
-
-def run_phase3_evaluation(
-    model_tag: str,
-    base_model_id: str,
-    checkpoints_dir: str,
-    D_val: list,
-    vectors_dir: str,
-    results_dir: str,
-    device: str,
-    max_new_tokens: int = 256,
-) -> list[ConditionResult]:
-    """
-    Evaluate all Phase 3 conditions on D_val.
-    Writes phase3_val.json, steered_val.json, alpha_diagnostic.json.
-    """
-    require_exact_count(D_val, "D_val")
-    _require_phase2_inputs(vectors_dir)
-    os.makedirs(results_dir, exist_ok=True)
-    meta    = _load_meta(vectors_dir)
-    r_final = meta.get('ccot_r_final', 10)
-
-    # ── Pre-compute alpha per source ──────────────────────────────────────────
-    _tune_and_save_alpha(model_tag, checkpoints_dir, D_val,
-                         vectors_dir, device, meta, results_dir=results_dir)
-    alphas = {s: _load_alpha(vectors_dir, s) for s in SOURCES}
-    print(f"\n[PH3] Alpha stars: {alphas}")
-
-    results: list[ConditionResult] = []
-
-    # ── No CoT baseline (base model, no LoRA) ─────────────────────────────────
-    print("\n[PH3] Evaluating: No CoT")
-    from phase1.inference import load_base_frozen
-    base_model, tok_base = load_base_frozen(base_model_id, device)
-    c_list, f_list, tok_list, lat_list = [], [], [], []
-    for item in D_val:
-        prompt = f"Question: {item['question']}\n\nAnswer:"
-        ok, fd, nt, lt = _eval_one(base_model, tok_base, item, prompt,
-                                   None, None, device, 32)
-        c_list.append(ok); f_list.append(fd)
-        tok_list.append(0); lat_list.append(lt)
-    results.append(_build_result(
-        'no_cot', model_tag, None, None, None, None,
-        c_list, f_list, tok_list, lat_list, None, 1.0,
-    ))
-    print(f"  no_cot: acc={results[-1].accuracy:.3f}")
-    del base_model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    # ── CoT model: load once, use for Full CoT + Trimmed CoT conditions ───────
-    cot_ckpt  = os.path.join(checkpoints_dir, 'cot')
-    cot_model, tok_cot = load_finetuned(cot_ckpt, device)
-    for p in cot_model.parameters():
-        p.requires_grad = False
-    cot_model.eval()
-
-    # Full CoT
-    print("\n[PH3] Evaluating: Full CoT")
-    c_list, f_list, tok_list, lat_list = [], [], [], []
-    for item in D_val:
-        t0 = time.time()
-        pred, reasoning = run_cot(cot_model, tok_cot, item, device)
-        lt = time.time() - t0
-        gold = item['answer'].split('####')[1].strip()
-        ok   = normalize_answer(pred) == normalize_answer(gold) if pred else False
-        fd   = pred is not None
-        nt   = len(tok_cot.encode(reasoning, add_special_tokens=False)) if reasoning else 0
-        c_list.append(ok); f_list.append(fd)
-        tok_list.append(nt); lat_list.append(lt)
-    full_cot_mean_tokens = sum(tok_list) / max(len(tok_list), 1)
-    results.append(_build_result(
-        'full_cot', model_tag, None, None, None, None,
-        c_list, f_list, tok_list, lat_list, None, full_cot_mean_tokens,
-    ))
-    print(f"  full_cot: acc={results[-1].accuracy:.3f}  "
-          f"mean_tok={full_cot_mean_tokens:.1f}")
-
-    best_latent_tokens = int(meta.get('best_ccot_latent_tokens') or 4)
-    latent_token_counts = [best_latent_tokens]
-
-    # Pre-compute per-example budgets for the selected latent budget.
-    budgets_by_latents: dict[int, list[int]] = {}
-    for latent_tokens in latent_token_counts:
-        budget_ratio = latent_tokens / 6.0
-        print(f"  [budget] computing per-example budgets for L={latent_tokens}…")
-        budgets_by_latents[latent_tokens] = compute_per_example_budgets(
-            cot_model, tok_cot, D_val, device, budget_ratio
-        )
-
-    # ── Per-latent-budget loop ────────────────────────────────────────────────
-    for latent_tokens in latent_token_counts:
-        ratio = latent_tokens / 6.0
-        rtag = f"L{latent_tokens}"
-        budgets = budgets_by_latents[latent_tokens]
-        print(f"\n{'='*55}\n[PH3] Latent tokens = {latent_tokens}  ({rtag})\n{'='*55}")
-
-        # Trimmed CoT (CoT model, same approximate token budget as latent budget)
-        print(f"  Evaluating: Trimmed CoT (L={latent_tokens})")
-        c_list, f_list, tok_list, lat_list = [], [], [], []
-        for i, item in enumerate(D_val):
-            t0   = time.time()
-            pred, reasoning = run_trimmed_cot(cot_model, tok_cot, item,
-                                              budgets[i], device)
-            lt   = time.time() - t0
-            gold = item['answer'].split('####')[1].strip()
-            ok   = normalize_answer(pred) == normalize_answer(gold) if pred else False
-            nt   = len(tok_cot.encode(reasoning or '', add_special_tokens=False))
-            c_list.append(ok); f_list.append(pred is not None)
-            tok_list.append(nt); lat_list.append(lt)
-        results.append(_build_result(
-            f'trimmed_{rtag}', model_tag, ratio, None, None, None,
-            c_list, f_list, tok_list, lat_list, None, full_cot_mean_tokens,
-        ))
-        print(f"    trimmed_{rtag}: acc={results[-1].accuracy:.3f}")
-
-        # Load CCoT model for this latent budget
-        ccot_ckpt  = os.path.join(checkpoints_dir, f'ccot_{rtag}')
-        if not _checkpoint_ready(ccot_ckpt):
-            print(f"  [SKIP] CCoT checkpoint missing: {ccot_ckpt}")
-            continue
-        ccot_model, tok_ccot = load_finetuned(ccot_ckpt, device)
-        for p in ccot_model.parameters():
-            p.requires_grad = False
-        ccot_model.eval()
-        ccot_prompt_fn = lambda item, n=latent_tokens: latent_prompt(item['question'], n)
-
-        # CCoT baseline (no steering) — collect per-example correct flags
-        print(f"  Evaluating: CCoT (L={latent_tokens})")
-        c_list, f_list, tok_list, lat_list = [], [], [], []
-        for item in D_val:
-            ok, fd, nt, lt = _eval_one(
-                ccot_model, tok_ccot, item, ccot_prompt_fn(item),
-                None, None, device, max_new_tokens,
-            )
-            c_list.append(ok); f_list.append(fd)
-            tok_list.append(nt); lat_list.append(lt)
-        ccot_correct = list(c_list)    # used for flip rate below
-        results.append(_build_result(
-            f'ccot_{rtag}', model_tag, ratio, None, None, None,
-            c_list, f_list, tok_list, lat_list, None, full_cot_mean_tokens,
-        ))
-        print(f"    ccot_{rtag}: acc={results[-1].accuracy:.3f}")
-
-        # Steered conditions (both sources)
-        for source in SOURCES:
-            alpha = alphas[source]
-            try:
-                L_star = get_injection_layer(vectors_dir, source)
-            except FileNotFoundError:
-                L_star = meta.get(f'{source}_best_layer',
-                                  meta.get('ccot_best_layer', 14))
-
-            try:
-                v_dom = _load_vector(vectors_dir, source, 'dom')
-            except FileNotFoundError:
-                print(f"  [SKIP] DoM vector missing for source={source}")
-                continue
-
-            try:
-                U_cpca = _load_vector(vectors_dir, source, 'cpca', r_final)
-                has_cpca = True
-            except FileNotFoundError:
-                U_cpca  = None
-                has_cpca = False
-
-            # Condition 5: Random Noise
-            print(f"  Evaluating: Random Noise (L={latent_tokens}, src={source})")
-            c_list, f_list, tok_list, lat_list = [], [], [], []
-            noise_fac = lambda b, a=alpha: make_noise_hook(b, a, device)
-            for item in D_val:
-                ok, fd, nt, lt = _eval_one(
-                    ccot_model, tok_ccot, item, ccot_prompt_fn(item),
-                    L_star, noise_fac, device, max_new_tokens,
-                    boundary_fn=find_boundary_idx_ccot,
-                )
-                c_list.append(ok); f_list.append(fd)
-                tok_list.append(nt); lat_list.append(lt)
-            results.append(_build_result(
-                f'noise_{rtag}_{source}', model_tag, ratio, source, 'noise', alpha,
-                c_list, f_list, tok_list, lat_list, ccot_correct, full_cot_mean_tokens,
-            ))
-            print(f"    noise_{rtag}_{source}: acc={results[-1].accuracy:.3f}  "
-                  f"flip={results[-1].flip_rate:.3f}")
-
-            # Condition 6: CCoT + DoM
-            print(f"  Evaluating: CCoT + DoM (L={latent_tokens}, src={source})")
-            c_list, f_list, tok_list, lat_list = [], [], [], []
-            dom_fac = lambda b, v=v_dom, a=alpha: make_dom_hook(b, v, a, device)
-            for item in D_val:
-                ok, fd, nt, lt = _eval_one(
-                    ccot_model, tok_ccot, item, ccot_prompt_fn(item),
-                    L_star, dom_fac, device, max_new_tokens,
-                    boundary_fn=find_boundary_idx_ccot,
-                )
-                c_list.append(ok); f_list.append(fd)
-                tok_list.append(nt); lat_list.append(lt)
-            results.append(_build_result(
-                f'dom_{rtag}_{source}', model_tag, ratio, source, 'dom', alpha,
-                c_list, f_list, tok_list, lat_list, ccot_correct, full_cot_mean_tokens,
-            ))
-            print(f"    dom_{rtag}_{source}: acc={results[-1].accuracy:.3f}  "
-                  f"flip={results[-1].flip_rate:.3f}")
-
-            # Condition 7: CCoT + cPCA
-            if has_cpca:
-                print(f"  Evaluating: CCoT + cPCA (L={latent_tokens}, src={source})")
-                c_list, f_list, tok_list, lat_list = [], [], [], []
-                cpca_fac = lambda b, U=U_cpca, a=alpha: make_cpca_hook(b, U, a, device)
-                for item in D_val:
-                    ok, fd, nt, lt = _eval_one(
-                        ccot_model, tok_ccot, item, ccot_prompt_fn(item),
-                        L_star, cpca_fac, device, max_new_tokens,
-                        boundary_fn=find_boundary_idx_ccot,
-                    )
-                    c_list.append(ok); f_list.append(fd)
-                    tok_list.append(nt); lat_list.append(lt)
-                results.append(_build_result(
-                    f'cpca_{rtag}_{source}', model_tag, ratio, source, 'cpca', alpha,
-                    c_list, f_list, tok_list, lat_list, ccot_correct, full_cot_mean_tokens,
-                ))
-                print(f"    cpca_{rtag}_{source}: acc={results[-1].accuracy:.3f}  "
-                      f"flip={results[-1].flip_rate:.3f}")
-
-            # ── Controls ──────────────────────────────────────────────────────
-
-            # Control A: Shuffled-label DoM vector at α*
-            # Rules out: "the extraction procedure itself creates a useful artifact"
-            try:
-                v_shuf = _load_shuffled_vector(vectors_dir, source, 'dom')
-                print(f"  Evaluating: Shuffled-label DoM (L={latent_tokens}, src={source})")
-                c_list, f_list, tok_list, lat_list = [], [], [], []
-                shuf_dom_fac = lambda b, v=v_shuf, a=alpha: make_dom_hook(b, v, a, device)
-                for item in D_val:
-                    ok, fd, nt, lt = _eval_one(
-                        ccot_model, tok_ccot, item, ccot_prompt_fn(item),
-                        L_star, shuf_dom_fac, device, max_new_tokens,
-                        boundary_fn=find_boundary_idx_ccot,
-                    )
-                    c_list.append(ok); f_list.append(fd)
-                    tok_list.append(nt); lat_list.append(lt)
-                results.append(_build_result(
-                    f'shuf_dom_{rtag}_{source}', model_tag, ratio,
-                    source, 'shuf_dom', alpha,
-                    c_list, f_list, tok_list, lat_list, ccot_correct, full_cot_mean_tokens,
-                ))
-                print(f"    shuf_dom_{rtag}_{source}: acc={results[-1].accuracy:.3f}")
-            except FileNotFoundError:
-                print(f"  [SKIP] Shuffled DoM vector missing for source={source}")
-
-            # Control B: Negative DoM direction at α*
-            # Injects −v_truth; should degrade accuracy if the direction is meaningful
-            print(f"  Evaluating: Negative DoM (L={latent_tokens}, src={source})")
-            c_list, f_list, tok_list, lat_list = [], [], [], []
-            neg_dom_fac = lambda b, v=v_dom, a=alpha: make_dom_hook(b, v, -a, device)
-            for item in D_val:
-                ok, fd, nt, lt = _eval_one(
-                    ccot_model, tok_ccot, item, ccot_prompt_fn(item),
-                    L_star, neg_dom_fac, device, max_new_tokens,
-                    boundary_fn=find_boundary_idx_ccot,
-                )
-                c_list.append(ok); f_list.append(fd)
-                tok_list.append(nt); lat_list.append(lt)
-            results.append(_build_result(
-                f'neg_dom_{rtag}_{source}', model_tag, ratio,
-                source, 'neg_dom', alpha,
-                c_list, f_list, tok_list, lat_list, ccot_correct, full_cot_mean_tokens,
-            ))
-            print(f"    neg_dom_{rtag}_{source}: acc={results[-1].accuracy:.3f}  "
-                  f"flip={results[-1].flip_rate:.3f}")
-
-            if has_cpca:
-                # Control C: Negative cPCA — subtract subspace projection at α*
-                # h' = h − α·σ·U·Uᵀ·ĥ; should degrade if subspace is meaningful
-                print(f"  Evaluating: Negative cPCA (L={latent_tokens}, src={source})")
-                c_list, f_list, tok_list, lat_list = [], [], [], []
-                neg_cpca_fac = lambda b, U=U_cpca, a=alpha: make_cpca_hook(b, U, -a, device)
-                for item in D_val:
-                    ok, fd, nt, lt = _eval_one(
-                        ccot_model, tok_ccot, item, ccot_prompt_fn(item),
-                        L_star, neg_cpca_fac, device, max_new_tokens,
-                        boundary_fn=find_boundary_idx_ccot,
-                    )
-                    c_list.append(ok); f_list.append(fd)
-                    tok_list.append(nt); lat_list.append(lt)
-                results.append(_build_result(
-                    f'neg_cpca_{rtag}_{source}', model_tag, ratio,
-                    source, 'neg_cpca', alpha,
-                    c_list, f_list, tok_list, lat_list, ccot_correct, full_cot_mean_tokens,
-                ))
-                print(f"    neg_cpca_{rtag}_{source}: acc={results[-1].accuracy:.3f}  "
-                      f"flip={results[-1].flip_rate:.3f}")
-
-                # Control D: Shuffled cPCA subspace at α*
-                # Subspace-level analogue of shuffled-label DoM
-                try:
-                    U_shuf_cpca = _load_shuffled_vector(vectors_dir, source, 'cpca', r_final)
-                    print(f"  Evaluating: Shuffled cPCA (L={latent_tokens}, src={source})")
-                    c_list, f_list, tok_list, lat_list = [], [], [], []
-                    shuf_cpca_fac = lambda b, U=U_shuf_cpca, a=alpha: (
-                        make_cpca_hook(b, U, a, device)
-                    )
-                    for item in D_val:
-                        ok, fd, nt, lt = _eval_one(
-                            ccot_model, tok_ccot, item, ccot_prompt_fn(item),
-                            L_star, shuf_cpca_fac, device, max_new_tokens,
-                            boundary_fn=find_boundary_idx_ccot,
-                        )
-                        c_list.append(ok); f_list.append(fd)
-                        tok_list.append(nt); lat_list.append(lt)
-                    results.append(_build_result(
-                        f'shuf_cpca_{rtag}_{source}', model_tag, ratio,
-                        source, 'shuf_cpca', alpha,
-                        c_list, f_list, tok_list, lat_list, ccot_correct, full_cot_mean_tokens,
-                    ))
-                    print(f"    shuf_cpca_{rtag}_{source}: acc={results[-1].accuracy:.3f}")
-                except FileNotFoundError:
-                    print(f"  [SKIP] Shuffled cPCA missing for source={source}")
-
-        # Condition 8: Trimmed + DoM (best source = 'base' by convention)
-        try:
-            v_base_dom = _load_vector(vectors_dir, 'base', 'dom')
-            alpha_base = alphas.get('base', alphas.get('ccot'))
-            try:
-                L_star_base = get_injection_layer(vectors_dir, 'base')
-            except FileNotFoundError:
-                L_star_base = meta.get('base_best_layer',
-                                       meta.get('ccot_best_layer', 14))
-
-            print(f"  Evaluating: Trimmed + DoM (L={latent_tokens})")
-            c_list, f_list, tok_list, lat_list = [], [], [], []
-            trim_dom_fac = lambda b, v=v_base_dom, a=alpha_base: (
-                make_dom_hook(b, v, a, device)
-            )
-            cot_prompt_fn = lambda item: (
-                f"Question: {item['question']}\n\nReasoning:"
-            )
-            for i, item in enumerate(D_val):
-                # Use budget as max_new_tokens (trimmed decoding)
-                ok, fd, nt, lt = _eval_one(
-                    cot_model, tok_cot, item, cot_prompt_fn(item),
-                    L_star_base, trim_dom_fac, device, budgets[i],
-                    boundary_fn=find_boundary_idx_base,
-                )
-                c_list.append(ok); f_list.append(fd)
-                tok_list.append(nt); lat_list.append(lt)
-            results.append(_build_result(
-                f'trimmed_dom_{rtag}', model_tag, ratio, 'base', 'dom', alpha_base,
-                c_list, f_list, tok_list, lat_list, ccot_correct, full_cot_mean_tokens,
-            ))
-            print(f"    trimmed_dom_{rtag}: acc={results[-1].accuracy:.3f}  "
-                  f"flip={results[-1].flip_rate:.3f}")
-        except FileNotFoundError:
-            print(f"  [SKIP] Base DoM vector missing — skipping Trimmed+DoM at L={latent_tokens}")
-
-        del ccot_model
+    if not any(row.condition == "full_cot" for row in results):
+        model, tokenizer = load_finetuned(os.path.join(checkpoints_dir, "cot"), device)
+        evaluate("full_cot", model, tokenizer, lambda item: cot_prompt(item["question"]), token_limit=512)
+        del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
-    del cot_model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    # ── Diagnostic alpha sweep (DoM, first source, subset) ────────────────────
-    print(f"\n[PH3] Diagnostic alpha sweep…")
-    _run_diagnostic_sweep(
-        model_tag, checkpoints_dir, D_val, vectors_dir, meta, results_dir, device
-    )
-
-    # ── Save full results ──────────────────────────────────────────────────────
-    ph3_path = os.path.join(results_dir, 'phase3_val.json')
-    with open(ph3_path, 'w') as f:
-        json.dump([asdict(r) for r in results], f, indent=2)
-    run_meta_path = os.path.join(results_dir, 'phase3_run_meta.json')
-    with open(run_meta_path, 'w') as f:
-        json.dump({
-            'model_tag': model_tag,
-            'phase3_eval_version': 2,
-            'n_val': len(D_val),
-            'phase2_prompt_version': meta.get('phase2_prompt_version'),
-            'alpha_prompt_modes': {source: source for source in SOURCES},
-        }, f, indent=2)
-    print(f"\nPhase 3 results -> {ph3_path}")
-    print(f"Phase 3 run metadata -> {run_meta_path}")
-
-    # steered_val.json for scripts/selection.py
-    steered = [r for r in results if r.vector_method in ('dom', 'cpca')]
-    max_probe = meta.get('ccot_max_probe_score', 0.0)
-    best_s    = max(steered, key=lambda r: (r.accuracy, r.flip_rate)) if steered else None
-    sv = {
-        'model_tag':        model_tag,
-        'best_condition':   best_s.condition if best_s else 'ccot',
-        'steered_accuracy': best_s.accuracy  if best_s else 0.0,
-        'flip_rate':        best_s.flip_rate if best_s else 0.0,
-        'probe_accuracy':   max_probe,
-        'n_examples':       len(D_val),
-    }
-    with open(os.path.join(results_dir, 'steered_val.json'), 'w') as f:
-        json.dump(sv, f, indent=2)
-
-    _print_phase3_table(results)
-    return results
-
-
-# ── Diagnostic alpha sweep ─────────────────────────────────────────────────────
-
-def _run_diagnostic_sweep(
-    model_tag, checkpoints_dir, D_val, vectors_dir, meta, results_dir, device,
-    n_sub: int | None = None,
-) -> None:
-    """Sweep alpha ∈ {0,.1,.5,1,2,5,10,20,50} on all 300 D_val examples and save JSON."""
-    alphas  = [0.0, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0]
-    n_sub = samples_per_phase() if n_sub is None else n_sub
-    D_sub = D_val[:min(n_sub, len(D_val))]
-    source  = 'ccot'
-    latent_tokens = int(meta.get('best_ccot_latent_tokens') or 4)
-
+    full_mean = sum(row["reasoning_tokens"] for row in saved_examples["full_cot"]) / len(D_val)
+    for result in results:
+        result.actual_ratio = result.reasoning_tokens / full_mean if full_mean else 0.0
+    budget = meta["best_ccot_latent_tokens"]
+    tag = f"L{budget}"
+    model, tokenizer = load_finetuned(os.path.join(checkpoints_dir, f"ccot_{tag}"), device)
+    prompt_fn = lambda item: latent_prompt(item["question"], budget)
+    baseline = evaluate(f"ccot_{tag}", model, tokenizer, prompt_fn)
+    diagnostics = {}
     try:
-        v_dom  = _load_vector(vectors_dir, source, 'dom')
-        L_star = get_injection_layer(vectors_dir, source)
-    except FileNotFoundError:
-        print("  [sweep skip] Missing vector or cPCA file.")
-        return
-
-    ckpt   = os.path.join(checkpoints_dir, f'ccot_L{latent_tokens}')
-    if not _checkpoint_ready(ckpt):
-        print("  [sweep skip] CCoT checkpoint missing.")
-        return
-
-    model, tok = load_finetuned(ckpt, device)
-    for p in model.parameters():
-        p.requires_grad = False
-    model.eval()
-
-    prompt_fn  = lambda item, n=latent_tokens: latent_prompt(item['question'], n)
-    alpha_star = _load_alpha(vectors_dir, source)
-
-    sweep = []
-    for a in alphas:
-        c_list = []
-        if a == 0.0:
-            fac = None
-        else:
-            fac = lambda b, av=a: make_dom_hook(b, v_dom, av, device)
-        for item in D_sub:
-            ok, _, _, _ = _eval_one(
-                model, tok, item, prompt_fn(item),
-                L_star if fac else None, fac, device, 256,
-                boundary_fn=find_boundary_idx_ccot if fac else None,
-            )
-            c_list.append(ok)
-        acc    = sum(c_list) / len(c_list)
-        marker = " ← α*" if abs(a - alpha_star) < 0.5 else ""
-        sweep.append({'alpha': a, 'accuracy': acc})
-        print(f"  [α-sweep] α={a:>5.1f}  acc={acc:.3f}{marker}")
-
-    del model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    payload = {'model_tag': model_tag, 'source': source,
-               'alpha_star': alpha_star, 'sweep': sweep}
-    out = os.path.join(results_dir, 'alpha_diagnostic.json')
-    with open(out, 'w') as f:
-        json.dump(payload, f, indent=2)
-    print(f"  Sweep -> {out}")
-
-    try:
+        for source in meta["sources"]:
+            artifacts = load_source_artifacts(vectors_dir, source, meta)
+            iti_alpha = None
+            if "iti" in artifacts:
+                path = os.path.join(results_dir, f"iti_alpha_diagnostic_{source}.json")
+                cached = {}
+                if os.path.exists(path):
+                    with open(path) as stream:
+                        cached = json.load(stream)
+                if cached.get("signature") != signature:
+                    subset = D_val[:load_protocol()["diagnostic_examples"]]
+                    sweep = alpha_diagnostic(model, tokenizer, subset, prompt_fn, artifacts, "iti", device,
+                                             [0.5, 1, 2, 5, 10, 15, 20])
+                    best = max(sweep, key=lambda row: (row["accuracy"], -row["alpha"]))
+                    cached = {"signature": signature, "best_alpha": best["alpha"], "sweep": sweep,
+                              "n_examples": len(subset), "dataset_role": "D_val"}
+                    atomic_json(path, cached)
+                iti_alpha = cached["best_alpha"]
+            for method in available_methods(artifacts):
+                alpha = iti_alpha if method == "iti" else alphas[source]
+                evaluate(f"{method}_{tag}_{source}", model, tokenizer, prompt_fn,
+                         source, method, alpha, artifacts, baseline)
+            diagnostics[source] = {"methods": available_methods(artifacts), "alpha": alphas[source],
+                                   "iti_alpha": iti_alpha}
+        diagnostic_path = os.path.join(results_dir, "alpha_diagnostic.json")
+        cached = {}
+        if os.path.exists(diagnostic_path):
+            with open(diagnostic_path) as stream:
+                cached = json.load(stream)
+        if cached.get("signature") != signature:
+            subset = D_val[:load_protocol()["diagnostic_examples"]]
+            sweep = alpha_diagnostic(model, tokenizer, subset, prompt_fn,
+                                     load_source_artifacts(vectors_dir, "ccot", meta), "dom", device,
+                                     load_protocol()["diagnostic_alphas"])
+            cached = {"signature": signature, "model_tag": model_tag, "source": "ccot",
+                      "alpha_star": alphas["ccot"], "sweep": sweep, "n_examples": len(subset),
+                      "dataset_role": "D_val"}
+            atomic_json(diagnostic_path, cached)
         from phase3.plots import plot_alpha_diagnostic
-        plot_alpha_diagnostic(
-            payload,
-            os.path.join(results_dir, 'alpha_diagnostic.png'),
-        )
-    except Exception as e:
-        print(f"  [plot] {e}")
-
-
-# ── Printing ───────────────────────────────────────────────────────────────────
-
-def _print_phase3_table(results: list[ConditionResult]):
-    print("\n" + "=" * 72)
-    print(f"{'Condition':<32} {'Acc':>6} {'Flip':>6} "
-          f"{'Tok':>6} {'ActR':>6} {'Lat':>6}")
-    print("-" * 72)
-    for r in results:
-        print(
-            f"{r.condition:<32} {r.accuracy:>6.3f} {r.flip_rate:>6.3f} "
-            f"{r.reasoning_tokens:>6.1f} {r.actual_ratio:>6.3f} "
-            f"{r.latency_sec:>6.2f}s"
-        )
-    print("=" * 72)
+        plot_alpha_diagnostic(cached, os.path.join(results_dir, "alpha_diagnostic.png"))
+    finally:
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    budgets = [max(1, budget + row["reasoning_tokens"]) for row in baseline]
+    atomic_json(os.path.join(results_dir, f"phase3_budgets_{tag}.json"), {"signature": signature, "budgets": budgets})
+    atomic_json(os.path.join(results_dir, f"phase3_ccot_correct_{tag}.json"),
+                {"signature": signature, "correct": [row["correct"] for row in baseline]})
+    model, tokenizer = load_finetuned(os.path.join(checkpoints_dir, "cot"), device)
+    try:
+        evaluate(f"trimmed_{tag}", model, tokenizer, lambda item: cot_prompt(item["question"]),
+                 baseline=baseline, budgets=budgets)
+        if "base" in meta["sources"]:
+            artifacts = load_source_artifacts(vectors_dir, "base", meta)
+            evaluate(f"trimmed_dom_{tag}", model, tokenizer, lambda item: cot_prompt(item["question"]),
+                     "base", "dom", alphas["base"], artifacts, baseline, budgets)
+    finally:
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    atomic_json(os.path.join(results_dir, "phase3_val.json"), [asdict(row) for row in results])
+    atomic_json(os.path.join(results_dir, "phase3_diagnostics.json"), diagnostics)
+    atomic_json(run_path, {**identity, "signature": signature, "complete": True, "phase3_eval_version": 3})
+    from phase3.select import select_best_steered_config
+    selection = select_best_steered_config(results_dir, model_tag)
+    atomic_json(os.path.join(results_dir, "steered_val.json"), {
+        **selection, "n_examples": len(D_val),
+        "probe_accuracy": meta.get(f"{selection.get('vector_source', 'ccot')}_max_probe_score", 0.0),
+    })
+    return results

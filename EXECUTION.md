@@ -1,11 +1,15 @@
 # Execution Commands — CCoT Steering Pipeline
 
+SVAMP full training/evaluation is available with `bash run_svamp_all_phases.sh` (420 train / 70 steer / 210 validation / 300 test). It uses separate `svamp/` artifact directories. See [the SVAMP workflow](FULL_EXPERIMENT.md#independent-svamp-experiment) for commands and the separate GSM8K-to-SVAMP transfer mode.
+
 All commands are run from the **project root** (`d:\Thesis\CCOT-Steering`).
 Dataset used throughout: **GSM8K** (replace `gsm8k` with `svamp` or `prontoqa` for other datasets).
-Runtime protocol: **300 examples per phase data role** (D_train, D_steer, D_val, D_test).
+Runtime protocol: **S3, full 60/10/30 split**: D_train=4,484, D_steer=747, D_val=2,242. D_test contains all 1,319 GSM8K test examples.
 GPU is assumed (`cuda`). Append `--device cpu` to any `pipeline.py` command if needed.
 
 ---
+
+See [FULL_EXPERIMENT.md](FULL_EXPERIMENT.md) for the current implementation contract, optional ITI/source-B flags, and artifact compatibility.
 
 ## 0. Environment
 
@@ -33,7 +37,7 @@ python download_dataset.py --dataset prontoqa
 
 ## 2. Verify Data Isolation (pre-flight check)
 
-Confirms D\_train / D\_steer / D\_val have zero overlap with D\_test by item ID.
+Confirms D\_train / D\_steer / D\_val have zero overlap with D\_test by normalized question text.
 Run once after downloading, and again before Phase 4.
 
 ```bash
@@ -44,7 +48,7 @@ python verify_isolation.py
 
 ## 3. Build Phase 1 Compatibility Cache
 
-Creates `cache/S2/compressed_R5.jsonl` … `cache/S2/compressed_R9.jsonl` for
+Creates `cache/S3/compressed_R5.jsonl` … `cache/S3/compressed_R9.jsonl` for
 pipeline compatibility. Coconut phase1 no longer depends on LLMLingua.
 Run once. Safe to re-run — already-built files are skipped.
 
@@ -64,7 +68,7 @@ python preprocess_compress.py --dataset gsm8k
 
 Runs Coconut latent curriculum training and exports compatible checkpoints to
 `cot/` and `ccot_L{3,4,6}/` paths per backbone.
-Evaluates all on D\_val and writes `results/S2/<model>/phase1_val.json`.
+Evaluates all on D\_val and writes `results/S3/<model>/phase1_val.json`.
 
 This phase is now a **single 30-epoch Coconut run per model** with full stage
 progression (`0-5`, `6-8`, `9-11`, `12-14`, `15-29`) and monitoring outputs.
@@ -84,17 +88,17 @@ python pipeline.py --phase 1 --model qwen25_3b
 python pipeline.py --phase 1 --model qwen25_math1.5b
 ```
 
-Checkpoint output: `checkpoints/S2/<model>/cot/` and `checkpoints/S2/<model>/ccot_L{3,4,6}/` (full-model format)
+Checkpoint output: `checkpoints/S3/<model>/cot/` and `checkpoints/S3/<model>/ccot_L{3,4,6}/` (full-model format)
 
 Only the selected CoT and best latent checkpoints occupy full-model disk
 space. Canonical, latent-only, and latent-budget compatibility paths use
 filesystem aliases to those selected weights.
 
 Monitoring output:
-- `results/S2/<model>/phase1_training_metrics.json`
-- `plots/S2/<model>/phase1/stage_loss_curve.png`
-- `plots/S2/<model>/phase1/embedding_drift.png`
-- `plots/S2/<model>/phase1/val_accuracy.png`
+- `results/S3/<model>/phase1_training_metrics.json`
+- `plots/S3/<model>/phase1/stage_loss_curve.png`
+- `plots/S3/<model>/phase1/embedding_drift.png`
+- `plots/S3/<model>/phase1/val_accuracy.png`
 
 ---
 
@@ -102,7 +106,7 @@ Monitoring output:
 
 Collects hidden states from D\_steer, runs probing, computes DoM and cPCA vectors,
 and also produces the shuffled-label control vectors.
-Writes to `vectors/S2/<model>/`.
+Writes to `vectors/S3/<model>/`.
 
 **All four backbones:**
 
@@ -117,10 +121,10 @@ python pipeline.py --phase 2 --model llama32_3b
 ```
 
 Key output files per model:
-- `vectors/S2/<model>/ccot_dom.pt` — CCoT DoM vector
-- `vectors/S2/<model>/base_dom.pt` — CoT DoM vector
-- `vectors/S2/<model>/ccot_cpca_r10.pt` — CCoT cPCA subspace
-- `vectors/S2/<model>/phase2_meta.json` — best probe layer, probe accuracy
+- `vectors/S3/<model>/ccot_dom.pt` — CCoT DoM vector
+- `vectors/S3/<model>/base_dom.pt` — CoT DoM vector
+- `vectors/S3/<model>/ccot_cpca_r10.pt` — CCoT cPCA subspace
+- `vectors/S3/<model>/phase2_meta.json` — best probe layer, probe accuracy
 
 ---
 
@@ -143,15 +147,15 @@ python pipeline.py --phase 3 --model llama32_3b
 ```
 
 Key output files per model:
-- `results/S2/<model>/phase3_val.json` — per-condition D\_val accuracy
-- `results/S2/<model>/phase3_best_config.yaml` — selected condition for this backbone
-- `vectors/S2/<model>/ccot_alpha_star.pt` — learned α\*
-- `vectors/S2/<model>/ccot_alpha_history.json` — training loss curves per epoch
-- `vectors/S2/<model>/ccot_lambda_sweep.json` — λ grid search results
-- `plots/S2/<model>/loss_curves_*.png` — L\_ans / L\_align / L\_mag curves
-- `plots/S2/<model>/lambda_heatmap_*.png` — λ sweep heatmap
+- `results/S3/<model>/phase3_val.json` — per-condition D\_val accuracy
+- `results/S3/<model>/phase3_best_config.yaml` — selected condition for this backbone
+- `vectors/S3/<model>/ccot_alpha_star.pt` — learned α\*
+- `vectors/S3/<model>/ccot_alpha_history.json` — training loss curves per epoch
+- `vectors/S3/<model>/ccot_lambda_sweep.json` — λ grid search results
+- `plots/S3/<model>/loss_curves_*.png` — L\_ans / L\_align / L\_mag curves
+- `plots/S3/<model>/lambda_heatmap_*.png` — λ sweep heatmap
 
-After Phase 3 completes, `configs/selected.yaml` is written automatically with `winning_config: S2`.
+After Phase 3 completes, `configs/selected.yaml` is written automatically with `winning_config: S3`.
 
 ---
 

@@ -4,6 +4,7 @@ import os
 import re
 from math import sqrt
 from pathlib import Path
+from utils.artifacts import file_fingerprint
 
 
 def _wilson_lower(accuracy: float, n: int, z: float = 1.96) -> float:
@@ -70,7 +71,9 @@ def select_best_steered_config(
     # Steered conditions: vector_method in ('dom', 'cpca'), but only from
     # sources whose Phase 2 probe gate passed. Failed-gate vectors can remain in
     # phase3_val.json for analysis; they are not eligible for locked selection.
-    steered_all = [r for r in records if r.get('vector_method') in ('dom', 'cpca')]
+    steered_all = [r for r in records
+                   if r.get('vector_method') in ('dom', 'cpca', 'multilayer_dom', 'multilayer_dom_mlp', 'iti')
+                   and not r['condition'].startswith('trimmed_')]
     steered = [
         r for r in steered_all
         if _source_gate_passed(meta, str(r.get('vector_source') or ''))
@@ -115,7 +118,9 @@ def select_best_steered_config(
         print(f"  -> {out_path}")
         return selection
 
-    best = max(steered, key=lambda r: (r['accuracy'], r['flip_rate']))
+    best = max(steered, key=lambda r: (
+        _wilson_lower(r['accuracy'], r['n_examples']), r['accuracy'], r['flip_rate'],
+    ))
 
     n = best.get('n_examples', 1) or 1
     wl = _wilson_lower(best['accuracy'], n)
@@ -141,7 +146,7 @@ def select_best_steered_config(
         'reasoning_tokens': best.get('reasoning_tokens'),
         'actual_ratio':     best.get('actual_ratio'),
         'wilson_lower_95':  wl,
-        'selection_metric': 'accuracy_then_flip_rate',
+        'selection_metric': 'wilson_lower_then_accuracy_then_flip_rate',
     }
 
     print(f"\n[PH3-select] {model_tag}: {best['condition']}")
@@ -152,6 +157,14 @@ def select_best_steered_config(
               f"gain={best['accuracy'] - ccot_acc:+.4f}")
 
     selection['selection_reason'] = 'best_probe_passing_steered_config'
+    selection['phase3_val_sha256'] = file_fingerprint(ph3_path)
+    run_meta_path = os.path.join(results_dir, 'phase3_run_meta.json')
+    if os.path.exists(run_meta_path):
+        with open(run_meta_path) as stream:
+            run_meta = json.load(stream)
+        selection['phase3_signature'] = run_meta.get('signature')
+        selection['experiment_version'] = run_meta.get('experiment_version')
+        selection['injection'] = run_meta.get('injection')
     selection['excluded_vector_sources'] = sorted({
         str(r.get('vector_source'))
         for r in steered_all

@@ -4,7 +4,7 @@ set -euo pipefail
 # Runs the full CCOT-Steering pipeline for one fixed experiment:
 #   dataset: gsm8k
 #   model:   qwen25_math1.5b
-#   config:  S2
+#   config:  S3
 #
 # Usage:
 #   ./run_qwen25_math_gsm8k_all_phases.sh
@@ -18,7 +18,7 @@ cd "$ROOT_DIR"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 DATASET="gsm8k"
-CONFIG="S2"
+CONFIG="S3"
 MODEL="qwen25_math1.5b"
 
 PIPELINE_ARGS=(--config "$CONFIG" --model "$MODEL" --dataset "$DATASET")

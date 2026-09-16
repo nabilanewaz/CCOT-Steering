@@ -162,3 +162,17 @@ def save_dom_vector(
     torch.save(payload, path)
     print(f"Saved DoM vector -> {path}  shape={tuple(v_truth.shape)}")
     return path
+
+
+def save_multilayer_dom_vectors(dom_vectors, layer_scores, model_tag, source, vectors_dir, top_k=3):
+    layers = sorted(dom_vectors, key=lambda layer: layer_scores[layer], reverse=True)[:top_k]
+    payload = {
+        "top_layers": layers,
+        "layer_vectors": {layer: dom_vectors[layer] for layer in layers},
+        "layer_scores": {layer: layer_scores[layer] for layer in layers},
+        "top_k": len(layers), "method": "multilayer_dom",
+        "model_tag": model_tag, "source": source,
+    }
+    path = os.path.join(vectors_dir, f"{source}_multilayer_dom.pt")
+    torch.save(payload, path)
+    return path

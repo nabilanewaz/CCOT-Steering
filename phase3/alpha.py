@@ -10,7 +10,7 @@ from phase2.loaders import (
     forward_for_boundary_hooks,
     get_transformer_layers,
 )
-from phase1.inference import latent_prompt
+from phase1.inference import latent_prompt, extract_reasoning_span
 from phase3.hook_utils import (
     boundary_state,
     first_hidden,
@@ -91,7 +91,9 @@ def tune_alpha(
     alpha_module = LearnableAlpha(alpha_max=50.0, alpha_init=1.0).to(device)
     optimizer    = torch.optim.AdamW(alpha_module.parameters(), lr=lr)
 
-    n_tune = int(len(D_val_tune) * 0.9)
+    if len(D_val_tune) < 2:
+        raise ValueError("Alpha tuning requires at least two validation examples")
+    n_tune = max(1, int(len(D_val_tune) * 0.9))
     D_tune = D_val_tune[:n_tune]
     D_es   = D_val_tune[n_tune:]
 
@@ -103,10 +105,10 @@ def tune_alpha(
 
     def steer_hook(module, input, output):
         h = first_hidden(output)
-        b = cache.get('boundary_idx', 0)
-        h_t = boundary_state(h, b)
-        if h_t is None:
+        start = cache['prompt_length']
+        if h.shape[-2] <= start:
             return output
+        h_t = h[..., start:, :]
         h_float = h_t.float()
         sigma = h_float.detach().norm(dim=-1, keepdim=True) / (h_float.shape[-1] ** 0.5)
         alpha = alpha_module()
@@ -114,9 +116,12 @@ def tune_alpha(
         cache['h_steered'] = h_float + delta  # grad through delta -> alpha
         cache['h_orig']    = h_float.detach() # reference norm (no grad needed)
         cache['delta']     = delta        # keep grad so L_mag regularises alpha
-        h_out = write_boundary_state(h, b, cache['h_steered'])
+        h_out = h.clone()
+        h_out[..., start:, :] = cache['h_steered'].to(h.dtype)
         return replace_first_hidden(output, h_out)
 
+
+    prepared = {}
 
     def _compute_losses(item, grad: bool):
         """Returns (loss, L_ans, L_align, L_mag, boundary_fallback)."""
@@ -125,19 +130,19 @@ def tune_alpha(
         ans_text = item['answer'].split('####')[1].strip()
 
         q_enc = tokenizer(q_prompt, return_tensors='pt').to(device)
-        # Boundary probing must be unsteered; otherwise the alpha being tuned can
-        # change the sequence used to choose its own injection point.
-        with torch.no_grad():
-            gen_ids = model.generate(
-                **q_enc, do_sample=False, max_new_tokens=128,
-                pad_token_id=tokenizer.eos_token_id,
-            )
+        cache['prompt_length'] = q_enc['input_ids'].shape[1]
+        if q_prompt not in prepared:
+            with torch.no_grad():
+                gen_ids = model.generate(
+                    **q_enc, do_sample=False, max_new_tokens=128,
+                    pad_token_id=tokenizer.eos_token_id,
+                )
+            generated = tokenizer.decode(gen_ids[0, cache['prompt_length']:], skip_special_tokens=True)
+            reasoning = extract_reasoning_span(generated)
+            suffix = tokenizer.encode(reasoning + "\n#### ", add_special_tokens=False, return_tensors="pt").to(device)
+            prepared[q_prompt] = torch.cat([q_enc['input_ids'], suffix], dim=1)
+        gen_ids = prepared[q_prompt]
         boundary_fallback = False
-        try:
-            cache['boundary_idx'] = boundary_fn(gen_ids, tokenizer)
-        except Exception:
-            cache['boundary_idx'] = max(0, q_enc['input_ids'].shape[1] - 1)
-            boundary_fallback = True
 
         a_ids    = tokenizer(ans_text, return_tensors='pt',
                              add_special_tokens=False).input_ids.to(device)
@@ -176,8 +181,10 @@ def tune_alpha(
             )
 
             loss = L_ans + lambda_a * L_align + lambda_m * L_mag
-            if not loss.requires_grad:
-                loss = loss + 0.0 * alpha_module()
+            if grad and not loss.requires_grad:
+                raise RuntimeError("Alpha has no gradient path through generated-token intervention")
+            if not torch.isfinite(loss):
+                raise RuntimeError("Non-finite alpha tuning loss")
 
         return loss, L_ans.item(), L_align.item(), L_mag.item(), boundary_fallback
 

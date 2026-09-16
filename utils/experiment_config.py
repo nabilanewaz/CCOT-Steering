@@ -18,13 +18,19 @@ def load_protocol() -> dict:
     return protocol
 
 
-def samples_per_phase() -> int:
-    value = load_protocol().get("samples_per_phase")
-    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-        raise ValueError(
-            f"{PROTOCOL_PATH}: samples_per_phase must be a positive integer, got {value!r}"
-        )
-    return value
+def split_counts(pool_size: int) -> dict[str, int]:
+    if pool_size < 10:
+        raise ValueError("A 60/10/30 split requires at least ten examples")
+    train = round(pool_size * 0.60)
+    steer = round(pool_size * 0.10)
+    return {"D_train": train, "D_steer": steer, "D_val": pool_size - train - steer}
+
+
+def expected_count(role: str) -> int:
+    from utils.dataset_paths import get_active_dataset_id
+
+    sizes = load_protocol()["dataset_sizes"][get_active_dataset_id()]
+    return sizes["test"] if role == "D_test" else split_counts(sizes["train"])[role]
 
 
 def protocol_seed() -> int:
@@ -37,7 +43,7 @@ def protocol_seed() -> int:
 def require_exact_count(examples: list, role: str) -> None:
     if role not in DATA_ROLES:
         raise ValueError(f"Unknown data role {role!r}; expected one of {DATA_ROLES}")
-    expected = samples_per_phase()
+    expected = expected_count(role)
     actual = len(examples)
     if actual != expected:
         raise ValueError(f"{role} must contain exactly {expected} examples; got {actual}")

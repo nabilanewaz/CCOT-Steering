@@ -6,15 +6,12 @@ import torch
 
 from phase3.evaluate import run_phase3_evaluation
 from phase3.select import select_best_steered_config
-from utils.experiment_config import require_exact_count, samples_per_phase
+from utils.experiment_config import require_exact_count
 
 
 def _load_jsonl(path: str) -> list:
     with open(path, encoding='utf-8') as f:
         examples = [json.loads(line) for line in f]
-    if len(examples) < samples_per_phase():
-        raise ValueError(f"{path} has fewer than {samples_per_phase()} examples")
-    examples = examples[:samples_per_phase()]
     require_exact_count(examples, "D_val")
     return examples
 

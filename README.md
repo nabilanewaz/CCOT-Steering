@@ -1,5 +1,9 @@
 # CCOT-Steering: Steering Continuous Reasoning via Latent Intervention
 
+SVAMP full training/evaluation is available with `bash run_svamp_all_phases.sh` (420 train / 70 steer / 210 validation / 300 test). It uses separate `svamp/` artifact directories. See [the SVAMP workflow](FULL_EXPERIMENT.md#independent-svamp-experiment) for commands and the separate GSM8K-to-SVAMP transfer mode.
+
+Current full-experiment commands and validation limits: [FULL_EXPERIMENT.md](FULL_EXPERIMENT.md).
+
 An end-to-end framework for extracting and steering latent reasoning in language models using inference-time intervention. Four phases: training baselines, extracting truth vectors, tuning steering intensity, and final evaluation.
 
 ---
@@ -15,8 +19,8 @@ pip install -r requirements.txt
 # Download GSM8K (7,473 train + 1,319 test)
 python download_gsm8k.py
 
-# Runtime selection is fixed at 300 examples for each data role.
-# D_train=300, D_steer=300, D_val=300, D_test=300.
+# Full 60/10/30 split of the 7,473-example training pool.
+# D_train=4484, D_steer=747, D_val=2242; all 1319 test examples.
 
 # Verify data isolation (no train/val/test overlap)
 python verify_isolation.py
@@ -46,14 +50,14 @@ python pipeline.py --phase 4                    # final D_test eval (≈1h total
 ### 3. Selective Runs (one split + one model)
 
 ```bash
-python pipeline.py --phase 1 --config S2 --model llama32_3b
-python pipeline.py --phase 2 --config S2 --model llama32_3b
-python pipeline.py --phase 3 --config S2 --model llama32_3b
+python pipeline.py --phase 1 --config S3 --model llama32_3b
+python pipeline.py --phase 2 --config S3 --model llama32_3b
+python pipeline.py --phase 3 --config S3 --model llama32_3b
 ```
 
 ### 4. View Results
 
-- Per-config metrics: `results/{S1,S2,S3,S4}/{model}/phase{1,2,3}_val.json`
+- Per-config metrics: `results/{S1,S3,S3,S4}/{model}/phase{1,2,3}_val.json`
 - Winning config: `configs/selected.yaml`
 - Final D_test results: `results/final/{model}_test.json` + `summary_test.json`
 
@@ -71,10 +75,10 @@ project/
 │   └── test.jsonl              # 1,319 examples (locked until Phase 4)
 ├── cache/compressed/           # pre-computed TokenSkip traces
 │   ├── R5.jsonl  ├── R6.jsonl  ├── R7.jsonl  ├── R8.jsonl  └── R9.jsonl
-├── checkpoints/{S1,S2,S3,S4}/{model}/
+├── checkpoints/{S1,S3,S3,S4}/{model}/
 │   ├── cot/                    # Coconut compatibility export (shared weights)
 │   ├── ccot_L3/ ├── ccot_L4/ └── ccot_L6/
-├── vectors/{S1,S2,S3,S4}/{model}/
+├── vectors/{S1,S3,S3,S4}/{model}/
 │   ├── ccot_dom.pt             # Source A: DoM vector
 │   ├── ccot_cpca_r10.pt        # Source A: cPCA subspace [d, r_final]
 │   ├── base_dom.pt             # Source B: DoM vector
@@ -82,7 +86,7 @@ project/
 │   ├── {source}_alpha_star.pt  # tuned steering intensity α*
 │   └── phase2_meta.json        # probe scores + layer metadata
 ├── results/
-│   ├── {S1,S2,S3,S4}/{model}/
+│   ├── {S1,S3,S3,S4}/{model}/
 │   │   ├── phase1_val.json     # 12 conditions on D_val
 │   │   ├── phase2_probe_scores.json
 │   │   └── phase3_val.json     # steered 52-condition grid on D_val
@@ -114,13 +118,13 @@ project/
 ### Phase 1: Coconut Training Baselines
 
 Phase 1 uses Coconut full-model curriculum training for 30 epochs. It trains
-on all 300 `D_train` rows and monitors the active curriculum stage on all 300
+on all 4,484 `D_train` rows and monitors the active curriculum stage on all 2,242
 disjoint `D_val` rows. See
 [`PHASE1_COCONUT_PAPER_AUDIT.md`](PHASE1_COCONUT_PAPER_AUDIT.md) for the
 paper comparison and intentional deviations.
 
 ```bash
-python pipeline.py --phase 1 --config S2 --model llama32_3b
+python pipeline.py --phase 1 --config S3 --model llama32_3b
 ```
 
 The single curriculum run exports distinct compatibility checkpoints:
@@ -209,7 +213,7 @@ Time: ~3h per model (A100)
 ### Split Selection
 
 After Phase 3 for all configs × all models, compute mean Wilson CI lower bound
-on steered accuracy across models. Pick split S1/S2/S3/S4 with highest mean.
+on steered accuracy across models. Pick split S1/S3/S3/S4 with highest mean.
 
 ```bash
 # Called by pipeline.py; manual:
@@ -277,8 +281,8 @@ If interrupted, restart the same command — it resumes from the last completed 
 To force re-run, delete the checkpoint:
 
 ```bash
-rm -rf checkpoints/S2/llama32_3b/ccot_L4/
-python pipeline.py --phase 1 --config S2 --model llama32_3b
+rm -rf checkpoints/S3/llama32_3b/ccot_L4/
+python pipeline.py --phase 1 --config S3 --model llama32_3b
 ```
 
 ---

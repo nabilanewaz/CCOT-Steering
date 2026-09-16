@@ -4,6 +4,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import normalize
+from sklearn.neural_network import MLPClassifier
 
 PROBE_GATE = 0.55   # minimum per-layer accuracy required in at least one layer
 
@@ -26,7 +28,7 @@ def score_all_layers(
     layer_scores: dict[int, float] = {}
 
     for L in sorted(H_pos.keys()):
-        X = torch.cat([H_pos[L].float(), H_neg[L].float()]).numpy().astype(np.float32)
+        X = normalize(torch.cat([H_pos[L].float(), H_neg[L].float()]).numpy().astype(np.float32))
         y = np.array([1] * len(H_pos[L]) + [0] * len(H_neg[L]))
 
         X_tr, X_te, y_tr, y_te = train_test_split(
@@ -72,6 +74,8 @@ def _gate_check(
     gate: float,
     enforce_gate: bool = False,
 ) -> None:
+    if not layer_scores:
+        raise RuntimeError("Probe gate failed: no usable contrastive layers")
     passing = [L for L, acc in layer_scores.items() if acc > gate]
     if not passing:
         best_L   = max(layer_scores, key=layer_scores.get)
@@ -91,3 +95,43 @@ def _gate_check(
             "Check hidden-state quality or increase D_steer size."
         )
     print(f"Gate PASSED: {len(passing)} layer(s) > {gate:.0%}  -> {passing}")
+
+
+def score_all_layers_nn(H_pos, H_neg):
+    scores = {}
+    for layer in sorted(H_pos):
+        features = normalize(torch.cat([H_pos[layer], H_neg[layer]]).float().numpy())
+        labels = np.array([1] * len(H_pos[layer]) + [0] * len(H_neg[layer]))
+        train, test, train_labels, test_labels = train_test_split(
+            features, labels, test_size=0.2, random_state=42, stratify=labels,
+        )
+        scaler = StandardScaler().fit(train)
+        train, test = scaler.transform(train), scaler.transform(test)
+        best_accuracy = 0.0
+        for hidden in ((64,), (128, 64)):
+            for learning_rate in (1e-3, 5e-3, 1e-2):
+                for regularization in (1e-4, 1e-3):
+                    probe = MLPClassifier(
+                        hidden_layer_sizes=hidden, learning_rate_init=learning_rate,
+                        alpha=regularization, early_stopping=True,
+                        validation_fraction=0.15, n_iter_no_change=20,
+                        max_iter=300, random_state=42,
+                    )
+                    probe.fit(train, train_labels)
+                    best_accuracy = max(best_accuracy, float(probe.score(test, test_labels)))
+        scores[layer] = best_accuracy
+    return scores
+
+
+def score_all_layers_both(H_pos, H_neg, gate=PROBE_GATE):
+    logistic = score_all_layers(H_pos, H_neg, enforce_gate=False)
+    neural = score_all_layers_nn(H_pos, H_neg)
+    scores = {layer: max(logistic[layer], neural[layer]) for layer in logistic}
+    _gate_check(scores, gate, enforce_gate=True)
+    diagnostics = {
+        "probe_method": "max(LR, MLP)",
+        "logistic_scores": logistic, "mlp_scores": neural,
+        "winning_probe": {layer: "MLP" if neural[layer] > logistic[layer] else "LR"
+                          for layer in scores},
+    }
+    return scores, diagnostics

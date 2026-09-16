@@ -1,64 +1,66 @@
+"""Build the full S3 allocation: 60% train, 10% steer, 30% validation."""
 import json
 import random
-import os
-from typing import Dict
+import sys
+from pathlib import Path
 
-from utils.experiment_config import samples_per_phase
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from utils.artifacts import EXPERIMENT_VERSION, atomic_json, dataset_fingerprint
+from utils.experiment_config import split_counts
 
 
-def build_all_splits(pool_path: str, seed: int = 42, out_dir: str = None) -> Dict:
-    with open(pool_path) as f:
-        pool = [json.loads(l) for l in f]
-
-    random.seed(seed)
-    random.shuffle(pool)
-    n_each = samples_per_phase()
-    required = n_each * 3
-    if len(pool) < required:
-        raise ValueError(
-            f"Train pool {pool_path!r} needs at least {required} examples to build "
-            f"three disjoint {n_each}-example splits; found {len(pool)}"
-        )
-
-    # One seeded shuffle, then three disjoint, fixed-size phase datasets.
-    splits = {
-        'S2': {
-            'D_train': pool[:n_each],
-            'D_steer': pool[n_each : 2 * n_each],
-            'D_val':   pool[2 * n_each : 3 * n_each],
-        }
+def build_all_splits(pool_path: str, seed: int = 42, out_dir: str = None) -> dict:
+    with open(pool_path, encoding="utf-8") as stream:
+        pool = [json.loads(line) for line in stream if line.strip()]
+    random.Random(seed).shuffle(pool)
+    counts = split_counts(len(pool))
+    train_end = counts["D_train"]
+    steer_end = train_end + counts["D_steer"]
+    parts = {
+        "D_train": pool[:train_end],
+        "D_steer": pool[train_end:steer_end],
+        "D_val": pool[steer_end:],
     }
-    print(f"S2: train={n_each}  steer={n_each}  val={n_each}")
-
+    question_sets = {
+        role: {" ".join(item["question"].split()).casefold() for item in examples}
+        for role, examples in parts.items()
+    }
+    roles = list(parts)
+    for index, role in enumerate(roles):
+        for other in roles[index + 1:]:
+            overlap = question_sets[role] & question_sets[other]
+            if overlap:
+                raise ValueError(f"Question leakage between {role} and {other}: {len(overlap)}")
+    print(f"S3: train={counts['D_train']} steer={counts['D_steer']} val={counts['D_val']}")
     if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-        meta = {}
-        for cfg_id, parts in splits.items():
-            meta[cfg_id] = {k: len(v) for k, v in parts.items()}
-            for part_name, examples in parts.items():
-                path = os.path.join(out_dir, f"{cfg_id}_{part_name}.jsonl")
-                with open(path, 'w', encoding='utf-8') as f:
-                    for ex in examples:
-                        f.write(json.dumps(ex) + "\n")
-        with open(os.path.join(out_dir, 'splits_meta.json'), 'w') as mf:
-            json.dump(meta, mf, indent=2)
+        root = Path(out_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        for role, examples in parts.items():
+            with (root / f"S3_{role}.jsonl").open("w", encoding="utf-8") as stream:
+                for example in examples:
+                    stream.write(json.dumps(example, ensure_ascii=False) + "\n")
+        atomic_json(root / "splits_meta.json", {"S3": counts})
+        atomic_json(root / "split_manifest.json", {
+            "experiment_version": EXPERIMENT_VERSION,
+            "config": "S3", "seed": seed, "ratios": [0.6, 0.1, 0.3],
+            "pool_path": str(Path(pool_path).resolve()), "pool_size": len(pool),
+            "counts": counts,
+            "fingerprints": {role: dataset_fingerprint(rows) for role, rows in parts.items()},
+        })
+    return {"S3": parts}
 
-    return splits
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     import argparse
-    import sys
+    from utils.dataset_paths import get_train_pool_path, init_project_dataset, split_output_dir
 
-    from utils.dataset_paths import get_train_pool_path, init_project_dataset
-
-    p = argparse.ArgumentParser()
-    p.add_argument('--pool', default=None, help='Train pool JSONL (default: active dataset train.jsonl)')
-    p.add_argument('--dataset', default=None, choices=('gsm8k', 'svamp', 'prontoqa'),
-                   help='Active dataset id (used when --pool is omitted)')
-    p.add_argument('--seed', type=int, default=42)
-    p.add_argument('--out', default='configs/splits')
-    args = p.parse_args()
-    init_project_dataset(args.dataset, interactive=sys.stdin.isatty())
-    pool = args.pool or get_train_pool_path()
-    build_all_splits(pool, seed=args.seed, out_dir=args.out)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--pool")
+    parser.add_argument("--dataset", default="gsm8k", choices=("gsm8k", "svamp", "prontoqa"))
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--out", default=None)
+    args = parser.parse_args()
+    init_project_dataset(args.dataset, interactive=False)
+    build_all_splits(args.pool or get_train_pool_path(), args.seed, args.out or split_output_dir())

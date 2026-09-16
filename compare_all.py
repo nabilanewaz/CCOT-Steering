@@ -16,7 +16,7 @@ MODEL_TAGS = ['llama32_3b', 'phi2', 'qwen25_0.5b', 'qwen25_3b', 'qwen25_math1.5b
 
 def main():
     parser = argparse.ArgumentParser(description='Select winning split config.')
-    parser.add_argument('--results', default='results',
+    parser.add_argument('--results', default=None,
                         help='Base results directory (default: results)')
     parser.add_argument('--models', default=None,
                         help='Comma-separated model tags (default: all four)')
@@ -26,22 +26,16 @@ def main():
                         help='Active dataset id when --pool is omitted')
     args = parser.parse_args()
 
-    from utils.dataset_paths import get_train_pool_path, init_project_dataset
+    from utils.dataset_paths import get_train_pool_path, init_project_dataset, artifact_root
 
     init_project_dataset(args.dataset, interactive=sys.stdin.isatty())
     pool = args.pool or get_train_pool_path()
 
     model_tags = args.models.split(',') if args.models else MODEL_TAGS
 
-    try:
-        splits = build_all_splits(pool, seed=42)
-    except FileNotFoundError:
-        print(f"[warn] Train pool not found at {pool} — using placeholder split counts.")
-        splits = {
-            'S2': {'D_train': [None] * 300, 'D_steer': [None] * 300, 'D_val': [None] * 300},
-        }
+    splits = build_all_splits(pool, seed=42)
 
-    winner, scores = select_best_config(splits, args.results, model_tags)
+    winner, scores = select_best_config(splits, args.results or artifact_root('results'), model_tags)
     return winner, scores
 
 

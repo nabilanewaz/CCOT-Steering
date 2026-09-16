@@ -3,7 +3,7 @@
 D_test is loaded exactly once. This file is run exactly once.
 No hyperparameter is changed after Phase 3. No result inspires a rerun.
 
-Phase 5 (SVAMP transfer): use ``--dataset svamp`` and ``--results-dir`` (e.g.
+Phase 5 (SVAMP transfer): use ``--dataset svamp --training-dataset gsm8k`` and ``--results-dir`` (e.g.
 ``results/final_svamp_transfer``) so GSM8K final JSON is not overwritten; vectors
 and checkpoints still come from ``vectors/{winner}/<model>/`` (GSM8K pipeline).
 """
@@ -21,8 +21,13 @@ import torch
 import torch.nn.functional as F
 
 from utils.data import load_test_set
-from utils.dataset_paths import get_active_dataset_id, init_project_dataset
-from utils.experiment_config import require_exact_count, samples_per_phase
+from utils.dataset_paths import get_active_dataset_id, init_project_dataset, artifact_root, selected_config_path
+from utils.experiment_config import require_exact_count
+from utils.artifacts import EXPERIMENT_VERSION, dataset_fingerprint, file_fingerprint, checkpoint_identity, fingerprint
+from phase3.evaluate import load_source_artifacts, available_methods, _require_phase2_inputs
+from phase3.hooks import condition_hooks, generation_scope, intervention_positions
+from phase3.hook_utils import first_hidden
+from contextlib import nullcontext
 from phase1.inference import (
     extract_answer,
     extract_reasoning_span,
@@ -54,7 +59,7 @@ N_BOOTSTRAP  = 1000    # resamples for all bootstrap CIs
 CI_SEED      = 0       # fixed seed → reproducible CIs across re-runs
 CI_LEVEL     = 0.95    # 95% confidence interval
 
-MODEL_TAGS = ['llama32_3b', 'phi2', 'qwen25_0.5b', 'qwen25_3b', 'qwen25_math1.5b']
+MODEL_TAGS = ['qwen25_0.5b', 'qwen25_3b', 'qwen25_math1.5b']
 MODEL_ID_MAP = {
     'llama32_3b':      'meta-llama/Llama-3.2-3B',
     'phi2':            'microsoft/phi-2',
@@ -133,6 +138,8 @@ class ExampleResult:
     latency_sec: float
     traj_coherence: float = 0.0
     truth_align: float = 0.0
+    generated_text: str = ""
+    question_hash: str = ""
 
 
 @dataclass
@@ -364,7 +371,7 @@ def _load_phase3_best_configs(
         return phase3_best
 
     best_by_model = {}
-    for model_tag in MODEL_TAGS:
+    for model_tag in MODEL_ID_MAP:
         results_dir = os.path.join(results_base, winning_config, model_tag)
         best_path = os.path.join(results_dir, 'phase3_best_config.yaml')
         if not os.path.exists(best_path):
@@ -610,69 +617,47 @@ def precompute_full_cot_tokens(
 
 
 def run_steered_with_metrics(
-    model,
-    tokenizer,
-    prompt: str,
-    item: dict,
-    hook_fn,              # pre-created hook (None for unsteered baseline)
-    L_star: int,
-    v_truth: torch.Tensor,  # unit-normalised truth vector on correct device
-    device: str,
-    max_new_tokens: int = 256,
-) -> ExampleResult:
-    """
-    Greedy decode with optional steering hook.
-    Captures hidden states at L_star for trajectory_coherence and truth_alignment.
-    hook_fn is expected to already embed the boundary_idx in its closure.
-    """
-    gold     = item['answer'].split('####')[1].strip()
-    captured: list[torch.Tensor] = []
-    v_hat    = (v_truth / (v_truth.norm() + 1e-8)) if v_truth is not None else None
-
+    model, tokenizer, prompt, item, hook_fn, L_star, v_truth, device,
+    max_new_tokens=256, method=None, artifacts=None, alpha=0.0,
+):
+    gold = item["answer"].split("####", 1)[1].strip()
+    captured = []
+    direction = v_truth.to(device).float() if v_truth is not None else None
     layers = get_transformer_layers(model)
 
-    def _capture(module, input, output):
-        h_last = _last_hidden_state(output)
-        if h_last is not None:
-            captured.append(h_last.detach().float().clone())
+    def capture(module, inputs, output):
+        hidden = first_hidden(output)
+        positions = intervention_positions(hidden)
+        if positions:
+            captured.append(hidden[..., positions[-1], :].detach().float().cpu().clone())
         return output
 
-    handles = []
-    if hook_fn is not None:
-        handles.append(layers[L_star].register_forward_hook(hook_fn))
-    handles.append(layers[L_star].register_forward_hook(_capture))
-
-    t0 = time.time()
-    try:
-        enc = tokenizer(prompt, return_tensors='pt').to(device)
-        with torch.no_grad():
-            out = model.generate(
-                **enc, max_new_tokens=max_new_tokens, do_sample=False,
-                pad_token_id=tokenizer.eos_token_id,
-            )
-        generated = out[0][enc['input_ids'].shape[1]:]
-        text = tokenizer.decode(generated, skip_special_tokens=True)
-    finally:
-        for h in handles:
-            h.remove()
-
-    latency    = time.time() - t0
-    found      = extract_answer(text) is not None
-    ok         = _score_text(text, gold)
-    reasoning_text = extract_reasoning_span(text)
-    n_reasoning = len(tokenizer.encode(reasoning_text, add_special_tokens=False))
-
-    tc = trajectory_coherence(captured)
-    ta = truth_alignment(captured, v_hat) if v_hat is not None else 0.0
-
+    encoded = tokenizer(prompt, return_tensors="pt").to(device)
+    length = encoded["input_ids"].shape[1]
+    started = time.time()
+    steering = condition_hooks(model, method, artifacts, alpha, device) if method else nullcontext()
+    with generation_scope(model, length), steering:
+        handles = []
+        try:
+            if hook_fn is not None:
+                handles.append(layers[L_star].register_forward_hook(hook_fn))
+            if direction is not None:
+                handles.append(layers[L_star].register_forward_hook(capture))
+            with torch.no_grad():
+                output = model.generate(**encoded, max_new_tokens=max_new_tokens,
+                                        do_sample=False, pad_token_id=tokenizer.pad_token_id)
+        finally:
+            for handle in handles:
+                handle.remove()
+    generated = output[0, length:]
+    text = tokenizer.decode(generated, skip_special_tokens=True)
     return ExampleResult(
-        correct=ok,
-        answer_found=found,
-        reasoning_tokens=n_reasoning,
-        total_tokens=int(len(enc['input_ids'][0]) + len(generated)),
-        latency_sec=latency,
-        traj_coherence=tc,
-        truth_align=ta,
+        correct=_score_text(text, gold), answer_found=extract_answer(text) is not None,
+        reasoning_tokens=len(tokenizer.encode(extract_reasoning_span(text), add_special_tokens=False)),
+        total_tokens=length + len(generated), latency_sec=time.time() - started,
+        traj_coherence=trajectory_coherence(captured),
+        truth_align=truth_alignment(captured, direction.cpu()) if direction is not None else 0.0,
+        generated_text=text, question_hash=fingerprint(item["question"]),
     )
 
 
@@ -854,74 +839,6 @@ def compute_full_flip_grid(
 
 # ── Alpha sweep on D_test ──────────────────────────────────────────────────────
 
-def run_alpha_sweep_test(
-    model,
-    tokenizer,
-    D_test: list,
-    v_truth: torch.Tensor,
-    L_star: int,
-    alpha_star: float,
-    device: str,
-    model_tag: str,
-    prompt_fn,
-    boundary_fn,
-    alphas: list = None,
-    n_sub: int | None = None,
-) -> list[dict]:
-    """
-    Diagnostic alpha sweep on all 300 D_test examples. No hyperparameter is changed after this.
-    Uses DoM steering across a grid of alpha values.
-    """
-    if alphas is None:
-        alphas = [0.0, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0]
-
-    n_sub = samples_per_phase() if n_sub is None else n_sub
-    D_sub = D_test[:min(n_sub, len(D_test))]
-    print(f"\n[PH4] alpha sweep on D_test ({len(D_sub)} examples)...")
-
-    sweep = []
-    for a in alphas:
-        c_list = []
-        tc_list = []
-        ta_list = []
-        for item in D_sub:
-            prompt = prompt_fn(item)
-            if a == 0.0:
-                ex = run_steered_with_metrics(
-                    model, tokenizer, prompt, item,
-                    None, L_star, v_truth, device,
-                )
-            else:
-                enc = tokenizer(prompt, return_tensors='pt').to(device)
-                with torch.no_grad():
-                    probe_ids = model.generate(
-                        **enc, do_sample=False, max_new_tokens=128,
-                        pad_token_id=tokenizer.eos_token_id,
-                    )
-                try:
-                    b_idx = boundary_fn(probe_ids, tokenizer)
-                except Exception:
-                    b_idx = max(0, enc['input_ids'].shape[1] - 1)
-                hook_fn = make_dom_hook(b_idx, v_truth, a, device)
-                ex = run_steered_with_metrics(
-                    model, tokenizer, prompt, item,
-                    hook_fn, L_star, v_truth, device,
-                )
-            c_list.append(ex.correct)
-            tc_list.append(ex.traj_coherence)
-            ta_list.append(ex.truth_align)
-
-        acc    = sum(c_list) / len(c_list)
-        coh    = float(np.mean(tc_list)) if tc_list else 0.0
-        aln    = float(np.mean(ta_list)) if ta_list else 0.0
-        marker = " ← α*" if abs(a - alpha_star) < 0.5 else ""
-        print(f"  α={a:>5.1f}  acc={acc:.3f}  align={aln:.4f}  coh={coh:.4f}{marker}")
-        sweep.append({'alpha': a, 'accuracy': acc, 'truth_alignment': aln, 'trajectory_coherence': coh})
-
-    return sweep
-
-
-# ── Reporting tables ───────────────────────────────────────────────────────────
 
 def print_accuracy_table(metrics: dict):
     w = 100
@@ -1059,6 +976,22 @@ def print_paired_ci_table(paired_cis: dict):
 
 # ── Persistence ────────────────────────────────────────────────────────────────
 
+def merge_final_summaries(previous, current):
+    """Preserve completed models when separate model runners share an output directory."""
+    for key in ('eval_dataset', 'training_dataset', 'dataset_fingerprint', 'experiment_version', 'winning_config'):
+        if previous.get('provenance', {}).get(key) != current.get('provenance', {}).get(key):
+            raise RuntimeError(f'Cannot merge final results with different {key}')
+    merged = dict(previous)
+    for key, value in current.items():
+        if key != 'provenance' and isinstance(value, dict):
+            merged[key] = {**previous.get(key, {}), **value}
+        else:
+            merged[key] = value
+    merged['models'] = sorted(set(previous['models']) | set(current['models']))
+    merged['provenance'] = {**current['provenance'], 'models': merged['models']}
+    return merged
+
+
 def save_final_results(
     all_results: dict,
     out_dir: str,
@@ -1068,6 +1001,10 @@ def save_final_results(
     summary = _build_summary(all_results, next(iter(all_results.values()))['metrics']['full_cot'].n_total if all_results else 0)
     if provenance:
         summary = {'provenance': provenance, **summary}
+    summary_path = os.path.join(out_dir, 'summary_test.json')
+    if os.path.exists(summary_path):
+        with open(summary_path) as stream:
+            summary = merge_final_summaries(json.load(stream), summary)
     for model_tag, data in all_results.items():
         out_path = os.path.join(out_dir, f"{model_tag}_test.json")
         def _ser_br(br) -> dict:
@@ -1086,6 +1023,7 @@ def save_final_results(
         serializable = {
             'model_tag':      model_tag,
             'metrics':        {k: asdict(v) for k, v in data['metrics'].items()},
+            'examples':       data.get('examples', {}),
             'flip_matrices':  [
                 _serialize_flip_matrix(fm)
                 for fm in data['flip_matrices']
@@ -1130,428 +1068,153 @@ def save_final_results(
 # ── Main evaluation runner ─────────────────────────────────────────────────────
 
 def run_final_evaluation(
-    D_test: list,
-    cfg: dict,
-    device: str,
-    results_base: str = 'results',
-    vectors_base: str = 'vectors',
-    checkpoints_base: str = 'checkpoints',
-    max_new_tokens: int = 256,
-    model_tags: list[str] | None = None,
-) -> dict:
-    """
-    Single-pass D_test evaluation using locked Phase 3 configs.
-    Must be called exactly once from this file. D_test is never re-loaded.
-    """
+    D_test, cfg, device, results_base="results", vectors_base="vectors",
+    checkpoints_base="checkpoints", max_new_tokens=256, model_tags=None,
+):
     require_exact_count(D_test, "D_test")
-    winning_config = cfg['winning_config']
-    phase3_best = _load_phase3_best_configs(cfg, winning_config, results_base)
-    all_results:  dict = {}
-    golds = [item['answer'].split('####')[1].strip() for item in D_test]
-    model_tags = model_tags or MODEL_TAGS
+    if cfg.get("experiment_version") != EXPERIMENT_VERSION or cfg.get("winning_config") != "S3":
+        raise RuntimeError("Phase 4 requires a full-experiment S3 selection, not legacy/smoke artifacts")
+    selected = _load_phase3_best_configs(cfg, "S3", results_base)
+    all_results = {}
+    golds = [item["answer"].split("####", 1)[1].strip() for item in D_test]
+    for model_tag in model_tags or MODEL_TAGS:
+        base_id = MODEL_ID_MAP[model_tag]
+        results_dir = os.path.join(results_base, "S3", model_tag)
+        vectors_dir = os.path.join(vectors_base, "S3", model_tag)
+        checkpoints_dir = os.path.join(checkpoints_base, "S3", model_tag)
+        _require_phase2_inputs(vectors_dir)
+        meta = _load_meta_file(vectors_dir)
+        best = selected[model_tag]
+        with open(os.path.join(results_dir, "phase3_run_meta.json")) as stream:
+            run_meta = json.load(stream)
+        if not run_meta.get("complete") or best.get("phase3_signature") != run_meta.get("signature"):
+            raise RuntimeError(f"Unlocked or stale Phase 3 selection for {model_tag}")
+        if best.get("phase3_val_sha256") != file_fingerprint(os.path.join(results_dir, "phase3_val.json")):
+            raise RuntimeError("Phase 3 validation results changed after selection")
+        if file_fingerprint(os.path.join(vectors_dir, "phase2_meta.json")) != run_meta["phase2"]:
+            raise RuntimeError("Phase 2 artifacts changed after Phase 3 selection")
+        for name, digest in run_meta["artifacts"].items():
+            if file_fingerprint(os.path.join(vectors_dir, name)) != digest:
+                raise RuntimeError(f"Steering artifact changed after lock: {name}")
+        budget = int(best["latent_tokens"])
+        tag = f"L{budget}"
+        for key, suffix in (("cot", "cot"), ("ccot", f"ccot_{tag}")):
+            if checkpoint_identity(os.path.join(checkpoints_dir, suffix)) != run_meta["checkpoints"][key]:
+                raise RuntimeError(f"Checkpoint changed after lock: {suffix}")
+        source_tag = best.get("vector_source") or "ccot"
+        artifacts = load_source_artifacts(vectors_dir, source_tag, meta)
+        with open(os.path.join(results_dir, "phase3_val.json")) as stream:
+            validation = {row["condition"]: row for row in json.load(stream)}
+        layer = artifacts["dom"]["best_layer"]
+        direction = artifacts["dom"]["v_truth"]
+        metrics, predictions, examples_by_condition = {}, {}, {}
+        full_counts = []
 
-    for model_tag in model_tags:
-        base_model_id = MODEL_ID_MAP[model_tag]
-        results_dir   = os.path.join(results_base, winning_config, model_tag)
-        vectors_dir   = os.path.join(vectors_base, winning_config, model_tag)
-        ckpt_dir      = os.path.join(checkpoints_base, winning_config, model_tag)
-
-        header = f"Phase 4 | {model_tag} | config={winning_config}"
-        print(f"\n{'=' * len(header)}\n{header}\n{'=' * len(header)}")
-
-        # ── Load locked Phase 3 config ─────────────────────────────────────────
-        best_cfg   = phase3_best.get(model_tag) or _load_best_config(results_dir)
-        meta       = _load_meta_file(vectors_dir)
-        latent_tokens = int(best_cfg.get('latent_tokens') or meta.get('best_ccot_latent_tokens') or 4)
-        condition_tag = f"L{latent_tokens}"
-        vector_method = best_cfg.get('vector_method')
-        steering_locked = vector_method in ('dom', 'cpca') and best_cfg.get('vector_source')
-        source     = str(best_cfg.get('vector_source') or 'ccot')
-        alpha_star = float(best_cfg.get('alpha_star') or 0.0) if steering_locked else 0.0
-        r_final    = int(meta.get('ccot_r_final', 10))
-
-        print(
-            f"Locked: L={latent_tokens} latent tokens  src={source}  "
-            f"method={vector_method}  α*={alpha_star:.4f}"
-        )
-
-        all_preds:   dict = {}
-        all_metrics: dict = {}
-        sweep        = []   # default; populated if CCoT checkpoint exists
-        token_budgeting = {}
-        token_budget_log = {}
-        coconut_budget_counts: list[int] = []
-
-        # ── Phase A: CoT model ─────────────────────────────────────────────────
-        cot_ckpt = os.path.join(ckpt_dir, 'cot')
-        cot_model, tok_cot = load_finetuned(cot_ckpt, device)
-        for p in cot_model.parameters():
-            p.requires_grad = False
-        cot_model.eval()
-
-        # Condition: Full CoT
-        print("[PH4] full_cot (recording y = full CoT reasoning tokens)")
-        t0 = time.time()
-        examples = []
-        for item in D_test:
-            t1 = time.time()
-            pred, reasoning = run_cot(cot_model, tok_cot, item, device)
-            gold = item['answer'].split('####')[1].strip()
-            ok   = normalize_answer(pred) == normalize_answer(gold) if pred else False
-            nt   = len(tok_cot.encode(reasoning or '', add_special_tokens=False))
-            examples.append(ExampleResult(
-                correct=ok, answer_found=pred is not None,
-                reasoning_tokens=nt, total_tokens=nt,
-                latency_sec=time.time() - t1,
-            ))
-        full_cot_counts = [e.reasoning_tokens for e in examples]
-        all_metrics['full_cot'] = collect_condition_metrics(
-            examples, full_cot_counts, 'full_cot', model_tag, time.time() - t0
-        )
-        all_preds['full_cot'] = [e.correct for e in examples]
-        print(f"  acc={all_metrics['full_cot'].accuracy:.3f}")
-
-        del cot_model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        # ── Phase B: Base model → No CoT ──────────────────────────────────────
-        print("[PH4] no_cot")
-        base_model, tok_base = load_base_frozen(base_model_id, device)
-        t0 = time.time()
-        examples = []
-        for item in D_test:
-            t1 = time.time()
-            pred, _ = run_no_cot(base_model, tok_base, item, device)
-            gold = item['answer'].split('####')[1].strip()
-            ok   = normalize_answer(pred) == normalize_answer(gold) if pred else False
-            examples.append(ExampleResult(
-                correct=ok, answer_found=pred is not None,
-                reasoning_tokens=0, total_tokens=0,
-                latency_sec=time.time() - t1,
-            ))
-        all_metrics['no_cot'] = collect_condition_metrics(
-            examples, full_cot_counts, 'no_cot', model_tag, time.time() - t0
-        )
-        all_preds['no_cot'] = [e.correct for e in examples]
-        print(f"  acc={all_metrics['no_cot'].accuracy:.3f}")
-        del base_model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        # ── Phase C: CCoT model (locked latent-token budget) ─────────────────
-        ccot_ckpt = os.path.join(ckpt_dir, f'ccot_{condition_tag}')
-        if not (
-            os.path.exists(os.path.join(ccot_ckpt, 'adapter_config.json'))
-            or os.path.exists(os.path.join(ccot_ckpt, 'config.json'))
-        ):
-            print(f"[PH4] CCoT checkpoint missing: {ccot_ckpt} — skipping CCoT conditions")
-        else:
-            ccot_model, tok_ccot = load_finetuned(ccot_ckpt, device)
-            for p in ccot_model.parameters():
-                p.requires_grad = False
-            ccot_model.eval()
-            ccot_prompt_fn = lambda item, n=latent_tokens: latent_prompt(item['question'], n)
-
-            # Load locked-source vector if available. CCoT baseline can still run
-            # without a vector; steering-only conditions require a valid locked vector.
-            try:
-                v_truth = _load_dom(vectors_dir, source).to(device)
-                vector_available = True
-            except FileNotFoundError:
-                print(f"  [SKIP] DoM vector missing for source={source}")
-                v_truth = None
-                vector_available = False
-
-            try:
-                L_star = get_injection_layer(vectors_dir, source)
-            except FileNotFoundError:
-                L_star = meta.get(f'{source}_best_layer', meta.get('ccot_best_layer', 14))
-
-            if steering_locked and vector_available:
-                try:
-                    U_cpca   = _load_cpca(vectors_dir, source, r_final).to(device)
-                    has_cpca = True
-                except FileNotFoundError:
-                    U_cpca   = None
-                    has_cpca = False
-            else:
-                U_cpca = None
-                has_cpca = False
-
-            # Helper: probe-generate boundary, create hook, run + collect
-            def _make_steered_examples(hook_factory, boundary_fn, cond_name):
-                t_inner = time.time()
-                exs = []
-                for item in D_test:
-                    prompt = ccot_prompt_fn(item)
-                    enc = tok_ccot(prompt, return_tensors='pt').to(device)
-                    with torch.no_grad():
-                        probe_ids = ccot_model.generate(
-                            **enc, do_sample=False, max_new_tokens=128,
-                            pad_token_id=tok_ccot.eos_token_id,
-                        )
-                    try:
-                        b_idx = boundary_fn(probe_ids, tok_ccot)
-                    except Exception:
-                        b_idx = max(0, enc['input_ids'].shape[1] - 1)
-                    hook_fn = hook_factory(b_idx)
-                    ex = run_steered_with_metrics(
-                        ccot_model, tok_ccot, prompt, item, hook_fn,
-                        L_star, v_truth, device, max_new_tokens,
-                    )
-                    exs.append(ex)
-                m = collect_condition_metrics(
-                    exs, full_cot_counts, cond_name, model_tag, time.time() - t_inner
-                )
-                return exs, m
-
-            # Condition: CCoT baseline (no hook, but metrics captured)
-            ccot_cond = f'ccot_{condition_tag}'
-            print(f"[PH4] {ccot_cond}")
-            t0 = time.time()
-            examples = []
-            for item in D_test:
-                prompt = ccot_prompt_fn(item)
-                ex = run_steered_with_metrics(
-                    ccot_model, tok_ccot, prompt, item, None,
-                    L_star, v_truth, device, max_new_tokens,
-                )
-                examples.append(ex)
-            all_metrics[ccot_cond] = collect_condition_metrics(
-                examples, full_cot_counts, ccot_cond, model_tag, time.time() - t0
+        def record(name, examples):
+            examples_by_condition[name] = [asdict(example) for example in examples]
+            metrics[name] = collect_condition_metrics(
+                examples, full_counts, name, model_tag, sum(example.latency_sec for example in examples),
             )
-            all_preds[ccot_cond] = [e.correct for e in examples]
-            print(f"  acc={all_metrics[ccot_cond].accuracy:.3f}")
-            coconut_budget_counts = coconut_thinking_token_counts(examples, latent_tokens)
-            full_mean = float(np.mean(full_cot_counts)) if full_cot_counts else 0.0
-            coconut_mean = float(np.mean(coconut_budget_counts)) if coconut_budget_counts else 0.0
-            token_budget_valid = full_mean > 0.0
-            token_budgeting = {
-                "policy": "trim_full_cot_to_best_coconut_token_count",
-                "condition_tag": condition_tag,
-                "latent_tokens": latent_tokens,
-                "x_coconut_tokens_mean": coconut_mean,
-                "y_full_cot_tokens_mean": full_mean,
-                "x_over_y_ratio": coconut_mean / full_mean if token_budget_valid else None,
-                "token_budget_valid": token_budget_valid,
-                "trimmed_condition": f"trimmed_{condition_tag}",
-            }
-            ratio_text = (
-                f"{token_budgeting['x_over_y_ratio']:.4f}"
-                if token_budgeting['x_over_y_ratio'] is not None else "invalid"
-            )
-            print(
-                "  matched trimmed-CoT budget: "
-                f"x_coconut={coconut_mean:.2f} y_full_cot={full_mean:.2f} "
-                f"ratio={ratio_text}"
-            )
-            if not token_budget_valid:
-                print("  [PH4] token budget invalid: full CoT reasoning tokens are zero")
-                coconut_budget_counts = []
+            predictions[name] = [example.correct for example in examples]
+            print(f"[PH4] {model_tag}/{name}: acc={metrics[name].accuracy:.4f} n={len(examples)}")
 
-            if not (steering_locked and vector_available):
-                print("[PH4] locked config has no valid steering vector; skipping steered conditions")
-            else:
-                # Condition: Noise control
-                noise_cond = f'noise_{condition_tag}_{source}'
-                print(f"[PH4] {noise_cond}")
-                exs, m = _make_steered_examples(
-                    lambda b: make_noise_hook(b, alpha_star, device),
-                    find_boundary_idx_ccot,
-                    noise_cond,
-                )
-                all_metrics[noise_cond] = m
-                all_preds[noise_cond]   = [e.correct for e in exs]
-                print(f"  acc={m.accuracy:.3f}")
-
-                # Condition: DoM steering
-                dom_cond = f'dom_{condition_tag}_{source}'
-                print(f"[PH4] {dom_cond}")
-                exs, m = _make_steered_examples(
-                    lambda b: make_dom_hook(b, v_truth, alpha_star, device),
-                    find_boundary_idx_ccot,
-                    dom_cond,
-                )
-                all_metrics[dom_cond] = m
-                all_preds[dom_cond]   = [e.correct for e in exs]
-                print(f"  acc={m.accuracy:.3f}  truth_align={m.truth_alignment:.4f}")
-
-                # Condition: cPCA steering (if vector available)
-                if has_cpca:
-                    cpca_cond = f'cpca_{condition_tag}_{source}'
-                    print(f"[PH4] {cpca_cond}")
-                    exs, m = _make_steered_examples(
-                        lambda b: make_cpca_hook(b, U_cpca, alpha_star, device),
-                        find_boundary_idx_ccot,
-                        cpca_cond,
-                    )
-                    all_metrics[cpca_cond] = m
-                    all_preds[cpca_cond]   = [e.correct for e in exs]
-                    print(f"  acc={m.accuracy:.3f}  truth_align={m.truth_alignment:.4f}")
-
-                # ── Diagnostic alpha sweep on D_test ──────────────────────────
-                sweep = run_alpha_sweep_test(
-                    ccot_model, tok_ccot, D_test,
-                    v_truth, L_star, alpha_star, device, model_tag,
-                    prompt_fn=ccot_prompt_fn,
-                    boundary_fn=find_boundary_idx_ccot,
-                )
-
-            del ccot_model
+        model, tokenizer = load_finetuned(os.path.join(checkpoints_dir, "cot"), device)
+        try:
+            full_examples = [
+                run_steered_with_metrics(model, tokenizer, cot_prompt(item["question"]), item,
+                                         None, layer, None, device, 512)
+                for item in D_test
+            ]
+            full_counts = [example.reasoning_tokens for example in full_examples]
+            record("full_cot", full_examples)
+        finally:
+            del model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-
-        # ── Phase D: Matched-token trimmed CoT ───────────────────────────────
-        # Budget is derived from the actual best-latent Coconut run:
-        #   x = mean(latent_tokens + Coconut visible reasoning tokens)
-        #   y = mean(full CoT reasoning tokens)
-        #   ratio = x / y
-        if coconut_budget_counts:
-            cot_ckpt = os.path.join(ckpt_dir, 'cot')
-            cot_model, tok_cot = load_finetuned(cot_ckpt, device)
-            for p in cot_model.parameters():
-                p.requires_grad = False
-            cot_model.eval()
-
-            trim_cond = f'trimmed_{condition_tag}'
-            print(
-                f"[PH4] {trim_cond} "
-                f"(matched to best Coconut token budget; ratio={token_budgeting.get('x_over_y_ratio', 0.0):.4f})"
-            )
-            t0 = time.time()
-            examples = []
-            for i, item in enumerate(D_test):
-                t1 = time.time()
-                pred, reasoning = run_trimmed_cot(
-                    cot_model, tok_cot, item, coconut_budget_counts[i], device
-                )
-                gold = item['answer'].split('####')[1].strip()
-                ok   = normalize_answer(pred) == normalize_answer(gold) if pred else False
-                nt   = len(tok_cot.encode(reasoning or '', add_special_tokens=False))
-                examples.append(ExampleResult(
-                    correct=ok, answer_found=pred is not None,
-                    reasoning_tokens=nt, total_tokens=nt,
-                    latency_sec=time.time() - t1,
+        model, tokenizer = load_base_frozen(base_id, device)
+        try:
+            direct = [
+                run_steered_with_metrics(model, tokenizer, f"Question: {item['question']}\n\nAnswer:", item,
+                                         None, layer, None, device, 32)
+                for item in D_test
+            ]
+            for example in direct:
+                example.reasoning_tokens = 0
+            record("no_cot", direct)
+        finally:
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        model, tokenizer = load_finetuned(os.path.join(checkpoints_dir, f"ccot_{tag}"), device)
+        try:
+            baseline = [
+                run_steered_with_metrics(model, tokenizer, latent_prompt(item["question"], budget), item,
+                                         None, layer, direction, device, max_new_tokens)
+                for item in D_test
+            ]
+            record(f"ccot_{tag}", baseline)
+            for method in available_methods(artifacts):
+                name = f"{method}_{tag}_{source_tag}"
+                if name not in validation:
+                    raise RuntimeError(f"Condition was not validated before test: {name}")
+                alpha = float(validation[name]["alpha"])
+                torch.manual_seed(int(fingerprint([0, name])[:8], 16))
+                examples = [
+                    run_steered_with_metrics(
+                        model, tokenizer, latent_prompt(item["question"], budget), item,
+                        None, layer, direction, device, max_new_tokens,
+                        method=method, artifacts=artifacts, alpha=alpha,
+                    ) for item in D_test
+                ]
+                record(name, examples)
+        finally:
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        budgets = coconut_thinking_token_counts(baseline, budget)
+        model, tokenizer = load_finetuned(os.path.join(checkpoints_dir, "cot"), device)
+        trimmed = []
+        try:
+            for item, token_budget in zip(D_test, budgets):
+                started = time.time()
+                prediction, reasoning = run_trimmed_cot(model, tokenizer, item, token_budget, device)
+                gold = item["answer"].split("####", 1)[1].strip()
+                text = reasoning + ("\n#### " + prediction if prediction is not None else "")
+                trimmed.append(ExampleResult(
+                    correct=prediction is not None and normalize_answer(prediction) == normalize_answer(gold),
+                    answer_found=prediction is not None,
+                    reasoning_tokens=len(tokenizer.encode(reasoning, add_special_tokens=False)),
+                    total_tokens=len(tokenizer.encode(cot_prompt(item["question"]) + text)),
+                    latency_sec=time.time() - started, generated_text=text,
+                    question_hash=fingerprint(item["question"]),
                 ))
-            all_metrics[trim_cond] = collect_condition_metrics(
-                examples, full_cot_counts, trim_cond, model_tag, time.time() - t0
-            )
-            all_preds[trim_cond] = [e.correct for e in examples]
-            token_budget_log = build_token_budget_log(
-                D_test,
-                full_cot_counts,
-                coconut_budget_counts,
-                examples,
-                model_tag,
-                condition_tag,
-                latent_tokens,
-            )
-            token_budgeting.update({
-                "trimmed_cot_accuracy": all_metrics[trim_cond].accuracy,
-                "trimmed_cot_actual_tokens_mean": token_budget_log["trimmed_cot_actual_tokens_mean"],
-            })
-            print(
-                f"  acc={all_metrics[trim_cond].accuracy:.3f} "
-                f"actual_ratio={all_metrics[trim_cond].actual_ratio_mean:.4f}"
-            )
-
-            # Condition: Trimmed + DoM  (CoT model, base source, base L_star)
-            trim_dom_cond = f'trimmed_dom_{condition_tag}'
-            print(f"[PH4] {trim_dom_cond}")
-            try:
-                v_base_dom  = _load_dom(vectors_dir, 'base').to(device)
-                try:
-                    L_star_base = get_injection_layer(vectors_dir, 'base')
-                except FileNotFoundError:
-                    L_star_base = meta.get('base_best_layer', meta.get('ccot_best_layer', 14))
-                try:
-                    alpha_base = _load_alpha_file(vectors_dir, 'base')
-                except FileNotFoundError:
-                    alpha_base = alpha_star
-
-                cot_prompt_fn = lambda item: f"Question: {item['question']}\n\nReasoning:"
-                t0 = time.time()
-                examples = []
-                for i, item in enumerate(D_test):
-                    prompt = cot_prompt_fn(item)
-                    enc = tok_cot(prompt, return_tensors='pt').to(device)
-                    with torch.no_grad():
-                        probe_ids = cot_model.generate(
-                            **enc, do_sample=False, max_new_tokens=128,
-                            pad_token_id=tok_cot.eos_token_id,
-                        )
-                    try:
-                        b_idx = find_boundary_idx_base(probe_ids, tok_cot)
-                    except Exception:
-                        b_idx = max(0, enc['input_ids'].shape[1] - 1)
-                    hook_fn = make_dom_hook(b_idx, v_base_dom, alpha_base, device)
-                    ex = run_steered_with_metrics(
-                        cot_model, tok_cot, prompt, item, hook_fn,
-                        L_star_base, v_base_dom, device, coconut_budget_counts[i],
-                    )
-                    examples.append(ex)
-                all_metrics[trim_dom_cond] = collect_condition_metrics(
-                    examples, full_cot_counts, trim_dom_cond, model_tag, time.time() - t0
-                )
-                all_preds[trim_dom_cond] = [e.correct for e in examples]
-                print(f"  acc={all_metrics[trim_dom_cond].accuracy:.3f}")
-            except FileNotFoundError as exc:
-                print(f"  [SKIP] {trim_dom_cond}: {exc}")
-
-            del cot_model
+            record(f"trimmed_{tag}", trimmed)
+        finally:
+            del model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-        else:
-            print("[PH4] matched trimmed CoT skipped: no Coconut token counts available")
-
-        # ── Bootstrap CIs (pure numpy, no model) ──────────────────────────────
-        print(f"\n[PH4] Computing bootstrap CIs ({N_BOOTSTRAP} resamples)...")
-        condition_cis = compute_condition_cis(all_preds, seed=CI_SEED)
-        paired_cis    = compute_paired_cis(all_preds, condition_tag, source, seed=CI_SEED)
-
-        # Attach per-condition CIs back to FinalMetrics for inline display
-        for cond, br in condition_cis.items():
-            if cond in all_metrics:
-                all_metrics[cond].ci_lower_95 = br.lower
-                all_metrics[cond].ci_upper_95 = br.upper
-
-        # ── Compute flip matrices and grid ─────────────────────────────────────
-        flip_matrices = compute_all_flip_matrices(
-            all_preds, golds, model_tag, condition_tag, source
-        )
-        flip_grid = compute_full_flip_grid(all_preds, golds, model_tag)
-
-        # ── Reporting ──────────────────────────────────────────────────────────
-        ccot_c  = f'ccot_{condition_tag}'
-        dom_c   = f'dom_{condition_tag}_{source}'
-        noise_c = f'noise_{condition_tag}_{source}'
-
-        print_accuracy_table(all_metrics)
-        print_ci_table(condition_cis)
-        print_paired_ci_table(paired_cis)
-        print_latent_metrics_table(all_metrics)
-        print_primary_flip_summary(flip_matrices)
-        print_mechanism_gain_table(all_metrics, baseline_cond=ccot_c)
-        print_specificity_table(all_metrics, flip_matrices, dom_c, noise_c, ccot_c)
-        print_efficiency_table(all_metrics)
-
+        condition_cis = compute_condition_cis(predictions)
+        paired_cis = compute_paired_cis(predictions, tag, source_tag)
+        for method in ("multilayer_dom", "multilayer_dom_mlp", "iti"):
+            condition = f"{method}_{tag}_{source_tag}"
+            if condition in predictions:
+                point, lower, upper, significant = bootstrap_ci_difference(
+                    predictions[f"ccot_{tag}"], predictions[condition],
+                )
+                paired_cis[f"{method}_vs_ccot"] = BootstrapResult(point, lower, upper, significant)
+        for name, interval in condition_cis.items():
+            metrics[name].ci_lower_95, metrics[name].ci_upper_95 = interval.lower, interval.upper
         all_results[model_tag] = {
-            'metrics':        all_metrics,
-            'flip_matrices':  flip_matrices,
-            'flip_grid':      flip_grid,
-            'alpha_sweep':    sweep,
-            'locked_config':  best_cfg,
-            'condition_cis':  condition_cis,
-            'paired_cis':     paired_cis,
-            'token_budgeting': token_budgeting,
-            'token_budget_log': token_budget_log,
+            "metrics": metrics, "examples": examples_by_condition,
+            "flip_matrices": compute_all_flip_matrices(predictions, golds, model_tag, tag, source_tag),
+            "flip_grid": compute_full_flip_grid(predictions, golds, model_tag),
+            "locked_config": best, "condition_cis": condition_cis, "paired_cis": paired_cis,
+            "token_budgeting": {"latent_tokens": budget, "n_examples": len(D_test),
+                                "mean_coconut_thinking_tokens": float(np.mean(budgets))},
+            "token_budget_log": {"budgets": budgets, "dataset_fingerprint": dataset_fingerprint(D_test)},
         }
-
     return all_results
 
-
-# ── Entry point ────────────────────────────────────────────────────────────────
 
 def _print_transfer_artifact_banner(winning_config: str) -> None:
     bar = '=' * 72
@@ -1571,7 +1234,7 @@ def main():
     )
     parser.add_argument(
         '--results-dir',
-        default='results/final',
+        default=None,
         help='Directory for summary_test.json and <model>_test.json (default: results/final)',
     )
     parser.add_argument(
@@ -1579,40 +1242,75 @@ def main():
         default='all',
         help='Model tag(s): all | qwen25_0.5b | qwen25_math1.5b | llama32_3b,phi2',
     )
-    args, _unknown = parser.parse_known_args()
+    parser.add_argument('--overwrite', action='store_true', help='Explicitly allow repeated test evaluation')
+    parser.add_argument('--training-dataset', choices=('gsm8k', 'svamp', 'prontoqa'),
+                        help='Source of checkpoints and steering settings; defaults to --dataset. Set gsm8k for SVAMP transfer.')
+    args = parser.parse_args()
 
     init_project_dataset(args.dataset, interactive=sys.stdin.isatty())
+    training_dataset = args.training_dataset or get_active_dataset_id()
+    transfer = training_dataset != get_active_dataset_id()
 
+    if args.results_dir is None:
+        args.results_dir = (f'results/final_{get_active_dataset_id()}_transfer' if training_dataset == 'gsm8k' and transfer
+                            else f'results/{training_dataset}_to_{get_active_dataset_id()}/final' if transfer
+                            else os.path.join(artifact_root('results'), 'final'))
+    summary_path = os.path.join(args.results_dir, 'summary_test.json')
+    models_to_run = MODEL_TAGS if args.model == 'all' else args.model.split(',')
+    if os.path.exists(summary_path):
+        with open(summary_path) as stream:
+            previous = json.load(stream)
+        if previous.get('provenance', {}).get('eval_dataset') != get_active_dataset_id():
+            raise RuntimeError('Refusing to mix datasets in one result directory')
+        if previous.get('provenance', {}).get('experiment_version') != EXPERIMENT_VERSION:
+            raise RuntimeError('Legacy test results require a new --results-dir')
+        if previous.get('provenance', {}).get('training_dataset') != training_dataset:
+            raise RuntimeError('Refusing to mix training datasets in one result directory')
+        if not args.overwrite and set(models_to_run) & set(previous.get('models', [])):
+            raise RuntimeError('Test results already exist; --overwrite explicitly permits a repeated evaluation')
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"[PH4] Device: {device}")
 
     torch.manual_seed(0)
     np.random.seed(0)
 
-    cfg = _load_selected_yaml('configs/selected.yaml')
+    cfg = _load_selected_yaml(selected_config_path(training_dataset))
+    if cfg.get('training_dataset', 'gsm8k') != training_dataset:
+        raise RuntimeError('Selected configuration belongs to a different training dataset')
     winning = cfg['winning_config']
     print(f"[PH4] Winning config: {winning}")
     models_to_run = MODEL_TAGS if args.model == 'all' else args.model.split(',')
-    bad_model = [m for m in models_to_run if m not in MODEL_TAGS]
+    bad_model = [m for m in models_to_run if m not in MODEL_ID_MAP]
     if bad_model:
         raise SystemExit(f"Unknown model(s): {bad_model}. Valid: {MODEL_TAGS}")
     print(f"[PH4] Models: {models_to_run}")
 
-    if get_active_dataset_id() != 'gsm8k':
-        _print_transfer_artifact_banner(winning)
+    if transfer:
+        print(f'[TRANSFER] Frozen {training_dataset} artifacts; evaluating {get_active_dataset_id()}')
 
     D_test = load_test_set()
     print(f"[PH4] Loaded D_test: {len(D_test)} examples")
 
-    all_results = run_final_evaluation(D_test, cfg, device, model_tags=models_to_run)
+    vectors_base = artifact_root('vectors', training_dataset)
+    checkpoints_base = artifact_root('checkpoints', training_dataset)
+    all_results = run_final_evaluation(
+        D_test, cfg, device, model_tags=models_to_run,
+        results_base=artifact_root('results', training_dataset),
+        vectors_base=vectors_base, checkpoints_base=checkpoints_base,
+    )
     provenance = {
         'eval_dataset': get_active_dataset_id(),
-        'steering_artifact_policy': 'frozen_from_gsm8k_pipeline',
+        'training_dataset': training_dataset,
+        'steering_artifact_policy': f'frozen_from_{training_dataset}_pipeline',
         'winning_config': winning,
         'models': models_to_run,
         'n_test': len(D_test),
-        'vectors_base': 'vectors',
-        'checkpoints_base': 'checkpoints',
+        'dataset_fingerprint': dataset_fingerprint(D_test),
+        'experiment_version': EXPERIMENT_VERSION,
+        'injection': 'generated_positions_only',
+        'test_tuning': False,
+        'vectors_base': vectors_base,
+        'checkpoints_base': checkpoints_base,
     }
     save_final_results(all_results, args.results_dir, provenance=provenance)
     print(f"\n[PH4] Done. Results saved to {args.results_dir}/")

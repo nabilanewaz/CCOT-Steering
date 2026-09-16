@@ -4,7 +4,7 @@ IFS=$'\n\t'
 
 # One-command setup and execution for the complete core experiment:
 #   dataset: GSM8K
-#   config:  S2 (300 examples per data role)
+#   config:  S3 (full 60/10/30 split: 4484/747/2242; test=1319)
 #   model:   Qwen/Qwen2.5-3B
 #   phases:  environment setup, data setup, Phase 1, Phase 2, Phase 3, Phase 4, Phase 5
 #
@@ -34,7 +34,7 @@ FORCE_PHASE4="${FORCE_PHASE4:-0}"
 RUN_PHASE5="${RUN_PHASE5:-1}"
 
 DATASET="gsm8k"
-CONFIG="S2"
+CONFIG="S3"
 MODEL="qwen25_3b"
 MODEL_ID="Qwen/Qwen2.5-3B"
 RESULTS_DIR="results/$CONFIG/$MODEL"
@@ -282,13 +282,12 @@ run_step "Pre-Phase-4 isolation verification" \
 
 FINAL_MODEL_RESULT="results/final/${MODEL}_test.json"
 FINAL_SUMMARY="results/final/summary_test.json"
-if [[ "$FORCE_PHASE4" == "1" || ! -s "$FINAL_MODEL_RESULT" || ! -s "$FINAL_SUMMARY" ]]; then
-  run_step "PHASE 4/4: Locked final evaluation on D_test" \
-    "$PYTHON" -u pipeline.py --phase 4 "${PIPELINE_ARGS[@]}"
-else
-  printf '\nPHASE 4: existing final results found; skipping sealed test re-evaluation.\n'
-  printf 'Set FORCE_PHASE4=1 only if you intentionally want to rerun Phase 4.\n'
+FINAL_ARGS=(--dataset "$DATASET" --model "$MODEL")
+if [[ "$FORCE_PHASE4" == "1" ]]; then
+  FINAL_ARGS+=(--overwrite)
 fi
+run_step "PHASE 4/4: Locked final evaluation on D_test" \
+  "$PYTHON" -u evaluate_final.py "${FINAL_ARGS[@]}"
 
 if [[ "$RUN_PHASE5" == "1" ]]; then
   if [[ ! -s "svamp/train.jsonl" || ! -s "svamp/test.jsonl" ]]; then
@@ -297,7 +296,7 @@ if [[ "$RUN_PHASE5" == "1" ]]; then
   fi
   run_step "OPTIONAL PHASE 5: Frozen GSM8K-to-SVAMP transfer evaluation" \
     env CCOT_DATASET=svamp "$PYTHON" -u evaluate_final.py \
-      --dataset svamp \
+      --dataset svamp --training-dataset gsm8k \
       --results-dir results/final_svamp_transfer \
       --model "$MODEL"
 fi

@@ -3,7 +3,9 @@ from math import sqrt
 import numpy as np
 import os
 
-from utils.experiment_config import samples_per_phase
+from utils.experiment_config import expected_count, split_counts
+from utils.artifacts import EXPERIMENT_VERSION
+from utils.dataset_paths import selected_config_path, get_active_dataset_id, artifact_root, init_project_dataset, get_train_pool_path
 
 
 def wilson_ci(correct: int, n: int, z: float = 1.96) -> tuple:
@@ -86,7 +88,7 @@ def select_best_config(splits: dict, results_dir: str, model_tags: list) -> tupl
 
     if yaml is not None:
         existing = {}
-        selected_path = 'configs/selected.yaml'
+        selected_path = selected_config_path()
         if os.path.exists(selected_path):
             try:
                 with open(selected_path) as f:
@@ -100,8 +102,9 @@ def select_best_config(splits: dict, results_dir: str, model_tags: list) -> tupl
             'n_train':          _n_items(splits[winner]['D_train']),
             'n_steer':          _n_items(splits[winner]['D_steer']),
             'n_val':            _n_items(splits[winner]['D_val']),
-            'n_test':           samples_per_phase(),
-            'samples_per_phase': samples_per_phase(),
+            'n_test':           expected_count('D_test'),
+            'experiment_version': EXPERIMENT_VERSION,
+            'training_dataset': get_active_dataset_id(),
             'selection_metric': 'mean_wilson_lower_steered_val_accuracy',
             'selection_value':  round(scores[winner]['mean_lower'], 4),
             'flip_rate':        round(scores[winner]['mean_flip'],  4),
@@ -109,7 +112,7 @@ def select_best_config(splits: dict, results_dir: str, model_tags: list) -> tupl
         }
         if existing.get('phase3_best'):
             record['phase3_best'] = existing['phase3_best']
-        os.makedirs('configs', exist_ok=True)
+        os.makedirs(os.path.dirname(selected_path), exist_ok=True)
         with open(selected_path, 'w') as f:
             yaml.safe_dump(record, f, sort_keys=False)
         print('Winner locked -> configs/selected.yaml')
@@ -120,17 +123,18 @@ def select_best_config(splits: dict, results_dir: str, model_tags: list) -> tupl
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--results', default='results')
+    parser.add_argument('--results', default=None)
+    parser.add_argument('--dataset', choices=('gsm8k', 'svamp', 'prontoqa'))
+    parser.add_argument('--models', default='qwen25_0.5b,qwen25_3b,qwen25_math1.5b')
     parser.add_argument('--splits', default=None, help='Path to splits meta json (optional)')
     args = parser.parse_args()
 
+    init_project_dataset(args.dataset, interactive=False)
     if args.splits:
         with open(args.splits) as f:
             splits = json.load(f)
     else:
-        splits = {
-            'S2': {'D_train': 300, 'D_steer': 300, 'D_val': 300},
-        }
+        from scripts.build_splits import build_all_splits
+        splits = build_all_splits(get_train_pool_path())
 
-    MODEL_TAGS = ['llama32_3b', 'phi2', 'qwen25_0.5b', 'qwen25_3b', 'qwen25_math1.5b']
-    select_best_config(splits, args.results, MODEL_TAGS)
+    select_best_config(splits, args.results or artifact_root('results'), args.models.split(','))
